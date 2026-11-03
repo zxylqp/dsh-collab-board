@@ -475,6 +475,10 @@ export async function startHub(opts = {}) {
   /** Hub 内部写一条系统事件：绕过鉴权，但照样过校验器（§6.10.4）。 */
   function systemWrite(partial) {
     const ev = {
+      // 调用方的字段先展开，**信封字段后写** —— 顺序反了就会被 partial 覆盖。
+      // 之前 hub 启动事件把 Hub 的显示名塞进 `name`，正好盖掉「系统」，
+      // 校验器一拦，整个系统写入当场进熔断。名字要记就放 `hubName`。
+      ...partial,
       eventVersion: EVENT_VERSION,
       id: makeEventId(SYSTEM_ORIGIN),
       origin: SYSTEM_ORIGIN,
@@ -482,7 +486,6 @@ export async function startHub(opts = {}) {
       ts: new Date().toISOString(),
       epoch,
       seq: nextSeq(),
-      ...partial,
     };
     try {
       validateSystemEvent(ev);
@@ -1085,7 +1088,8 @@ export async function startHub(opts = {}) {
   try {
     systemWrite({
       kind: 'hub',
-      name: opts.name || 'Hub',
+      // 注意字段名是 hubName 不是 name —— 信封的 name 是保留字段（必须「系统」）
+      hubName: opts.name || 'Hub',
       host: '0.0.0.0',
       port: actualPort,
       needCode: code !== '',
