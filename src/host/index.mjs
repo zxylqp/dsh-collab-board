@@ -131,6 +131,26 @@ export function apply(ctx, rawConfig = {}) {
     hubCode: { kind: 'string', max: 64, def: '' },
     pendingWatch: { kind: 'bool', def: false },
     pendingWatchMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },
+    /**
+     * 自动认领：启动后扫「该我接的活」直接认领。
+     * 默认**开**——这是使用方明确要的行为（电脑一启动就把活接下来）。
+     * 只在连上 Hub 时生效；单机模式没有认领通道。
+     */
+    autoClaim: { kind: 'bool', def: true },
+    autoClaimMs: { kind: 'int', min: 1000, max: 3600000, def: 60000 },
+    /**
+     * 本地隐藏的成员（逗号分隔的 origin）。
+     * **只影响这台机器的视图**，不改事件流、不影响别人 —— 所以能安全地"删人"。
+     */
+    hiddenMembers: { kind: 'string', max: 4000, def: '' },
+    /**
+     * 有新消息时自动唤醒本机 agent（调 `sessionController.prompt`）。
+     *
+     * **默认关**：它会在对话里插一条真消息，而且会等 agent 跑完一整轮才返回。
+     * 要开的时候自己开 —— 别默认就把人的会话点着。
+     */
+    wakeOnMessage: { kind: 'bool', def: false },
+    wakeCooldownMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },
   };
   const SETTINGS_KEYS = Object.keys(SETTINGS_SPEC);
 
@@ -408,6 +428,84 @@ export function apply(ctx, rawConfig = {}) {
     try { writeFileSync(SEEN_FILE, JSON.stringify(seen.slice(-800)), 'utf8'); } catch { /* 下次再写 */ }
   }
 
+  /* ───────────────────── 自动唤醒（有新消息时叫醒本机 agent） ───────────────────── */
+
+  /**
+   * 收到别人的消息 → 调 `sessionController.prompt` 把本机 agent 叫起来。
+   *
+   * 接口形状是从宿主包里核出来的，不是猜的：
+   *     sessionController.prompt({ sessionId, prompt: [{ type: 'text', text }] })
+   *     → { stopReason: 'end_turn' }
+   *
+   * 三条护栏，缺一条都不干：
+   *   1. 只认**别人发的** `msg`（自己发的不算、note 不算）
+   *   2. 同一个 `taskId` / `global` 在冷却期内最多唤醒一次
+   *   3. 正在唤醒时不叠加（`prompt` 会等一整轮跑完，可能几十秒）
+   *
+   * **代价说清楚**：它会往对话里插一条真实消息，而且会等 agent 干完才返回。
+   * 所以默认关，内容里也明写「协作看板自动触发」，不让人以为是凭空冒出来的话。
+   */
+  const wakeState = { lastAt: new Map(), busy: false, lastError: '', lastAtIso: '' };
+
+  async function pickWakeSession() {
+    const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
+    if (!svc || typeof svc.list !== 'function') return '';
+    const out = await svc.list();
+    const items = Array.isArray(out?.items) ? out.items : [];
+    const alive = items.filter((s) => s && typeof s.sessionId === 'string' && s.agentAvailable !== false);
+    alive.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+    return alive[0] ? alive[0].sessionId : '';
+  }
+
+  async function wakeAgent(text) {
+    const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
+    if (!svc || typeof svc.prompt !== 'function') throw new Error('宿主没有 sessionController.prompt');
+    const sessionId = await pickWakeSession();
+    if (!sessionId) throw new Error('找不到可唤醒的会话');
+    const r = await svc.prompt({ sessionId, prompt: [{ type: 'text', text }] });
+    return { sessionId, stopReason: (r && r.stopReason) || '' };
+  }
+
+  function considerWake(events) {
+    if (wakeState.busy) return;
+    const s = getSettings();
+    if (s.wakeOnMessage !== true) return;
+
+    const fresh = (Array.isArray(events) ? events : []).filter(
+      (ev) => ev && ev.kind === 'msg' && typeof ev.origin === 'string' && ev.origin !== identity.origin,
+    );
+    if (fresh.length === 0) return;
+
+    const cooldown = Math.max(60000, Number(s.wakeCooldownMs) || 300000);
+    const now = Date.now();
+    const target = fresh.find((ev) => {
+      const k = ev.taskId || 'global';
+      return now - (wakeState.lastAt.get(k) || 0) >= cooldown;
+    });
+    if (!target) return;
+
+    const key = target.taskId || 'global';
+    wakeState.lastAt.set(key, now);
+    wakeState.busy = true;
+
+    const where = target.taskId ? `任务 ${target.taskId}` : '全局';
+    const text = `【协作看板自动触发】${target.from || target.name || '对方'} 在${where}发了新消息。`
+      + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
+      + '回完就停，不要连续追问。';
+
+    wakeAgent(text)
+      .then((r) => {
+        wakeState.lastAtIso = new Date().toISOString();
+        wakeState.lastError = '';
+        hubLog('info', `已唤醒会话 ${String(r.sessionId).slice(0, 16)}…（${r.stopReason || '?'}）`);
+      })
+      .catch((e) => {
+        wakeState.lastError = e instanceof Error ? e.message : String(e);
+        hubLog('warn', `唤醒失败：${wakeState.lastError}`);
+      })
+      .finally(() => { wakeState.busy = false; });
+  }
+
   /* ───────────────────── Hub 生命周期 ───────────────────── */
 
   const hubLog = (level, msg) => {
@@ -442,6 +540,7 @@ export function apply(ctx, rawConfig = {}) {
    */
   function onPulled(events) {
     let dirty = false;
+    const freshly = [];
     const known = new Set(
       readEvents().map((e) => (e && typeof e.id === 'string' ? e.id : '')).filter(Boolean),
     );
@@ -450,6 +549,7 @@ export function apply(ctx, rawConfig = {}) {
       if (!known.has(ev.id)) {
         appendEvent(ev, { raw: true });
         known.add(ev.id);
+        freshly.push(ev);
       }
       if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq)) {
         seqMap[ev.id] = [ev.epoch, ev.seq];
@@ -458,6 +558,8 @@ export function apply(ctx, rawConfig = {}) {
     }
     if (dirty) persistSeqMap();
     cache = { mtime: -1, size: -1, events: [] };
+    // 只有**真正新落盘的**事件才考虑唤醒（重复拉回来、补序号都不算）
+    if (freshly.length) considerWake(freshly);
   }
 
   /** 挂一个 Hub 客户端。Hub 本机也走这条 —— 一条路径，不分支。 */
@@ -615,6 +717,113 @@ export function apply(ctx, rawConfig = {}) {
     return { ok: true, total: all.length, events: all.slice(since) };
   }
 
+  /* ───────────────────── agent 读看板（增量游标） ───────────────────── */
+
+  /**
+   * 读游标：agent 读到哪了。
+   *
+   * 为什么要有它：agent 每轮读一遍全量事件是几千 token，而绝大多数轮次
+   * 根本没有新消息。存一个游标，默认只给「上次之后」的增量，一轮几十 token。
+   */
+  const CURSOR_FILE = join(dataDir, '.read-cursor.json');
+  let readCursor = 0;
+  try {
+    const raw = JSON.parse(readFileSync(CURSOR_FILE, 'utf8'));
+    if (raw && Number.isFinite(Number(raw.seq))) readCursor = Number(raw.seq);
+  } catch { readCursor = 0; }
+
+  function saveCursor(seq) {
+    if (!Number.isFinite(Number(seq))) return;
+    readCursor = Math.max(readCursor, Number(seq));
+    try { writeAtomic(CURSOR_FILE, JSON.stringify({ seq: readCursor })); } catch { /* 下次再写 */ }
+  }
+
+  /**
+   * 把事件流折成 agent 要看的三块：归我的卡、待认领的卡、未读事件。
+   *
+   * 刻意**只返回摘要**（标题/状态/几百字正文），不返回全量原始事件 ——
+   * 这是给 agent 省 token 的，不是给它做审计的。要全量去调 `/collab-board/state`。
+   */
+  function readBoard(opts = {}) {
+    const all = readEvents();
+    const maxSeq = all.reduce((m, e) => (Number.isFinite(e.seq) ? Math.max(m, e.seq) : m), 0);
+    const from = Number.isFinite(Number(opts.since))
+      ? Number(opts.since)
+      : (opts.full === true ? 0 : readCursor);
+    const limit = Math.max(1, Math.min(100, Number(opts.limit) || 20));
+
+    // 任务表：后写覆盖
+    const tasks = new Map();
+    for (const ev of all) {
+      if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
+      const prev = tasks.get(ev.taskId);
+      if (!prev || compareEvents(ev, prev) > 0) tasks.set(ev.taskId, ev);
+    }
+
+    const mine = [];
+    const pending = [];
+    for (const t of tasks.values()) {
+      if (t.archived) continue;
+      const brief = {
+        taskId: t.taskId,
+        title: t.title,
+        status: t.status,
+        priority: t.priority || 'normal',
+        ...(t.dueAt ? { dueAt: t.dueAt } : {}),
+      };
+      if (t.owner === identity.origin) {
+        if (t.status === 'running' || t.status === 'blocked') mine.push(brief);
+      } else if (t.status === 'pending' && !t.owner) {
+        pending.push(brief);
+      }
+    }
+
+    const unread = [];
+    for (const ev of all) {
+      if (!ev || !Number.isFinite(ev.seq) || ev.seq <= from) continue;
+      if (ev.kind === 'msg') {
+        unread.push({
+          seq: ev.seq,
+          kind: 'msg',
+          from: ev.from || ev.name || '?',
+          ...(ev.taskId ? { taskId: ev.taskId } : {}),
+          text: String(ev.text || '').slice(0, 500),
+        });
+      } else if (ev.kind === 'task') {
+        unread.push({
+          seq: ev.seq,
+          kind: 'task',
+          taskId: ev.taskId,
+          title: ev.title,
+          status: ev.status,
+          owner: ev.owner || '',
+        });
+      } else if (ev.kind === 'artifact') {
+        unread.push({
+          seq: ev.seq,
+          kind: 'artifact',
+          ...(ev.taskId ? { taskId: ev.taskId } : {}),
+          name: (ev.transfer && ev.transfer.name) || ev.path || '(文件)',
+          ...(ev.transfer && ev.transfer.fileId ? { fileId: ev.transfer.fileId } : {}),
+        });
+      } else if (ev.kind === 'note') {
+        unread.push({ seq: ev.seq, kind: 'note', text: String(ev.text || '').slice(0, 200) });
+      }
+    }
+    unread.sort((a, b) => a.seq - b.seq);
+    const shown = unread.slice(-limit);
+
+    return {
+      ok: true,
+      me: { origin: identity.origin, name: displayName() },
+      cursor: { from, to: maxSeq, unreadTotal: unread.length },
+      mine,
+      pending,
+      unread: shown,
+      ...(unread.length > shown.length ? { truncated: unread.length - shown.length } : {}),
+    };
+  }
+
   /* ───────────────────── HTTP 路由 ───────────────────── */
 
   ctx.inject(['webServer'], (scope) => {
@@ -702,12 +911,15 @@ export function apply(ctx, rawConfig = {}) {
           handler: async (req, res) => {
             if (req.method !== 'DELETE') return jsonReply(res, 405, { ok: false, error: 'method' });
             try {
-              writeFileSync(LOG, '', 'utf8');
+              // **保留 member 事件**：成员是谁不该因为「清空聊天记录」一起没了。
+              // 清掉的是任务、对话、进度这些内容；成员名单留着。
+              const kept = readEvents().filter((e) => e && e.kind === 'member');
+              writeFileSync(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '', 'utf8');
               writeFileSync(SEEN_FILE, '[]', 'utf8');
               seen = [];
               lastLanSize = -1;
               cache = { mtime: -1, size: -1, events: [] };
-              return jsonReply(res, 200, { ok: true });
+              return jsonReply(res, 200, { ok: true, keptMembers: kept.length });
             } catch (err) {
               return jsonReply(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
             }
@@ -800,6 +1012,67 @@ export function apply(ctx, rawConfig = {}) {
             // 只清这次运行内的提示；watch 的 warned 仍为 true，不会再刷屏（§12.4.1 幂等）
             try { hubRuntime.server?.clearFork?.(); } catch { /* 没有就算了 */ }
             return jsonReply(res, 200, { ok: true, status: hubStatus() });
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${PANEL_BASE}/probe`,
+          handler: async (req, res) => {
+            if (req.method !== 'GET') return jsonReply(res, 405, { ok: false, error: 'method' });
+            const u = new URL(req.url ?? '/', 'http://panel.local');
+
+            /**
+             * `?call=服务名.方法名` —— 调一个**只读**方法，把结果原样返回。
+             *
+             * 为什么要有：光看方法名不知道参数形状（`schedule.list()` 返回什么、
+             * `sessionController.list()` 里有没有 sessionId），瞎猜就是编。
+             * **白名单只放只读方法**，`create` / `delete` / `prompt` 这些一律不放行 ——
+             * 诊断接口不该成为能写数据的后门。
+             */
+            const call = u.searchParams.get('call');
+            if (call) {
+              const READONLY = new Set(['list', 'inspect', 'catalog', 'history', 'get', 'serialize']);
+              const dot = call.lastIndexOf('.');
+              const svcName = call.slice(0, dot);
+              const method = call.slice(dot + 1);
+              if (!svcName || !method) return jsonReply(res, 400, { ok: false, error: 'call 要写成 服务.方法' });
+              if (!READONLY.has(method)) {
+                return jsonReply(res, 400, { ok: false, error: `只放行只读方法：${[...READONLY].join(' / ')}` });
+              }
+              let svc = null;
+              try { svc = typeof ctx.get === 'function' ? ctx.get(svcName) : null; } catch { svc = null; }
+              if (!svc || typeof svc[method] !== 'function') {
+                return jsonReply(res, 400, { ok: false, error: `没有 ${svcName}.${method}` });
+              }
+              try {
+                const result = await svc[method]();
+                return jsonReply(res, 200, { ok: true, call, result });
+              } catch (e) {
+                return jsonReply(res, 500, { ok: false, call, error: e instanceof Error ? e.message : String(e) });
+              }
+            }
+
+            // 只读诊断：宿主里这些服务到底能不能拿到、暴露了哪些方法。
+            // 用来确认「插件能不能主动唤醒 agent」这类事，**不凭猜测下结论**。
+            const names = ['agents', 'sessionController', 'schedule', 'sessions', 'workspaceRegistry'];
+            const out = {};
+            for (const n of names) {
+              let svc = null;
+              try { svc = typeof ctx.get === 'function' ? ctx.get(n) : null; } catch { svc = null; }
+              if (!svc) { out[n] = null; continue; }
+              const methods = new Set();
+              let proto = svc;
+              for (let i = 0; i < 3 && proto && proto !== Object.prototype; i += 1) {
+                for (const k of Object.getOwnPropertyNames(proto)) {
+                  try {
+                    if (typeof svc[k] === 'function') methods.add(k);
+                  } catch { /* getter 可能抛 */ }
+                }
+                proto = Object.getPrototypeOf(proto);
+              }
+              out[n] = [...methods].sort();
+            }
+            return jsonReply(res, 200, { ok: true, services: out });
           },
         },
         {
@@ -1141,6 +1414,37 @@ export function apply(ctx, rawConfig = {}) {
         },
       }),
 
+      scope.tools.register({
+        name: 'collab_state',
+        description:
+          '读协作看板：哪些卡归我、哪些待认领、有没有新消息。' +
+          '**默认只返回上次读到的之后的增量**（游标存在本机），所以每轮调用很便宜 —— ' +
+          '被定时任务叫醒时先调它，没有新东西就什么都不用做，写一句「无新活」结束。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            since: { type: 'integer', description: '只要序号大于它的；省略 = 用本机游标' },
+            full: { type: 'boolean', description: 'true = 从头看全部（排查时才用）' },
+            limit: { type: 'integer', description: 'unread 最多返回多少条，默认 20' },
+            advance: { type: 'boolean', description: 'false = 不推进游标（想再看一遍时用），默认推进' },
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { ok: { type: 'boolean' }, text: { type: 'string' } },
+          },
+          render: (_args, value) => [{ type: 'text', text: value?.text ?? '读不到。' }],
+        },
+        async execute(args) {
+          const out = readBoard(args || {});
+          if (args?.advance !== false) saveCursor(out.cursor.to);
+          return { ok: true, text: JSON.stringify(out, null, 1) };
+        },
+      }),
+
       ];
       return () => {
         for (const d of disposers) {
@@ -1268,6 +1572,110 @@ export function apply(ctx, rawConfig = {}) {
         return undefined;
     }
   }
+
+  /* ───────────────────── 启动自动认领 ───────────────────── */
+
+  /**
+   * 自动认领：启动后扫「该我接的活」，符合条件的直接认领。
+   *
+   * **它能干什么、不能干什么，别混**：
+   *   - 能：把卡认领到手（owner 写成自己），别的机器抢不走，看板上立刻变「进行中」
+   *   - 不能：叫醒 agent。认领只是标记归属，agent 仍然要在被消息触发时才跑一轮
+   *
+   * 只认这些（少一条都不认）：
+   *   - `pending`、没有 owner、没归档
+   *   - **不是自己建的**（自己建的活该派给别人）
+   *   - 依赖全部 `done` / `cancelled`
+   *   - 任务要求的每个能力标签我都有
+   *
+   * 认失败的（conflict / blocked）也记进 `autoTried`，别每轮重试同一张卡刷日志。
+   */
+  const autoTried = new Set();
+
+  function pickClaimable(events) {
+    const tasks = new Map();
+    for (const ev of events) {
+      if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
+      const prev = tasks.get(ev.taskId);
+      if (!prev || compareEvents(ev, prev) > 0) tasks.set(ev.taskId, ev);
+    }
+    const mine = new Set(capabilityPayload().all.map((c) => String(c).toLowerCase()));
+    const out = [];
+    for (const task of tasks.values()) {
+      if (task.status !== 'pending' || task.owner) continue;
+      if (task.archived) continue;
+      if (task.origin === identity.origin) continue;
+      if (autoTried.has(task.taskId)) continue;
+      const deps = Array.isArray(task.dependsOn) ? task.dependsOn : [];
+      const depsOk = deps.every((d) => {
+        const dep = tasks.get(d);
+        return dep && (dep.status === 'done' || dep.status === 'cancelled');
+      });
+      if (!depsOk) continue;
+      const caps = Array.isArray(task.requiredCapabilities) ? task.requiredCapabilities : [];
+      const capsOk = caps.every((c) => mine.has(String(c).toLowerCase()));
+      if (!capsOk) continue;
+      out.push(task);
+    }
+    return out;
+  }
+
+  ctx.effect(() => {
+    let timer = null;
+    let lastScan = 0;
+    let busy = false;
+
+    const tick = async () => {
+      if (busy) return;
+      try {
+        const s = getSettings();
+        if (s.autoClaim !== true) return;
+        if (!hubRuntime.client) return; // 没连 Hub，没有认领通道
+        const every = Math.max(1000, Number(s.autoClaimMs) || 60000);
+        const now = Date.now();
+        if (now - lastScan < every) return;
+        lastScan = now;
+
+        const list = pickClaimable(readEvents());
+        if (list.length === 0) return;
+
+        busy = true;
+        for (const task of list) {
+          try {
+            await claimTask(task.taskId, {});
+            autoTried.add(task.taskId);
+            const note = buildEvent({
+              kind: 'note',
+              text: `自动认领：${task.taskId} ${task.title}`,
+              level: 'info',
+            });
+            if (note) appendEvent(note);
+            hubLog('info', `自动认领 ${task.taskId}`);
+          } catch (e) {
+            autoTried.add(task.taskId);
+            // conflict（被抢了）/ blocked（依赖没完成）都是正常结果，不刷日志
+            if (e.code !== 'conflict' && e.code !== 'blocked') {
+              hubLog('warn', `自动认领 ${task.taskId} 失败：${e.message}`);
+            }
+          }
+        }
+      } catch { /* 扫描本身炸了不影响下一轮 */ } finally {
+        busy = false;
+      }
+    };
+
+    // 启动 5 秒后先扫一次（等 Hub 连上），之后每 60 秒醒一次看该不该真扫
+    const boot = setTimeout(() => {
+      tick();
+      timer = setInterval(tick, 5000);
+      if (typeof timer.unref === 'function') timer.unref();
+    }, 5000);
+    if (typeof boot.unref === 'function') boot.unref();
+    return () => {
+      clearTimeout(boot);
+      if (timer) clearInterval(timer);
+    };
+  });
 
   /* ───────────────────── 待办提醒（不是「唤醒 agent」） ───────────────────── */
 
