@@ -832,6 +832,31 @@ export async function startHub(opts = {}) {
           return fail(res, 409, 'conflict', '任务已完成');
         }
 
+        /**
+         * 已经是自己的、还在 running、租约没过 → **幂等返回，不写新事件**。
+         *
+         * 不加这道短路，重复调 claim 会一条一条往事件流里堆 `running`，
+         * 每次 claimedAt 新一点 —— 看起来像「续租被写成了重新认领」。
+         * 事件流被它撑大，历史里同一件事出现六七遍。
+         * 租约真过期了才允许重认领（那才是续租）。
+         */
+        if (task.owner === me.origin && task.status === 'running') {
+          const lease = Number(task.leaseMs) || 0;
+          const end = lease > 0 && task.claimedAt ? new Date(task.claimedAt).getTime() + lease : 0;
+          if (!end || end > Date.now()) {
+            return ok(res, {
+              taskId,
+              epoch: Number.isFinite(task.epoch) ? task.epoch : epoch,
+              seq: Number.isFinite(task.seq) ? task.seq : headSeq,
+              leaseMs: lease,
+              warnings: [],
+              matchedMembers: [],
+              idempotent: true,
+              ownedByMe: true,
+            });
+          }
+        }
+
         // 依赖未完成 → blocked（和 conflict 分开，前端提示不同）
         const blockedBy = (Array.isArray(task.dependsOn) ? task.dependsOn : []).filter((dep) => {
           const d = tasks.get(dep);
