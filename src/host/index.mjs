@@ -433,17 +433,27 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  /** 拉回来的事件：别家写的落本机日志；自己写的只补序号，不重复写。 */
+  /**
+   * 拉回来的事件：本机没有的就落盘，有的只补序号。
+   *
+   * **判据是「本机有没有这条 id」，不是 origin。** Hub 替本机写的事件（认领、
+   * 租约释放）origin 也是本机，可本机日志里根本没有这一条 —— 按 origin 判就会
+   * 把它整个丢掉，于是「我自己认领完，我看不见它变成 running」。
+   */
   function onPulled(events) {
     let dirty = false;
+    const known = new Set(
+      readEvents().map((e) => (e && typeof e.id === 'string' ? e.id : '')).filter(Boolean),
+    );
     for (const ev of Array.isArray(events) ? events : []) {
       if (!ev || !ev.id) continue;
-      if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq) && !seqMap[ev.id]) {
+      if (!known.has(ev.id)) {
+        appendEvent(ev, { raw: true });
+        known.add(ev.id);
+      }
+      if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq)) {
         seqMap[ev.id] = [ev.epoch, ev.seq];
         dirty = true;
-      }
-      if (ev.origin !== identity.origin) {
-        appendEvent(ev, { raw: true });
       }
     }
     if (dirty) persistSeqMap();
