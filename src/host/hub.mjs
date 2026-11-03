@@ -539,21 +539,30 @@ export async function startHub(opts = {}) {
 
   /* ─────────────────── 成员 ─────────────────── */
 
+  /**
+   * 成员列表：**按 origin 去重**，同一个人的旧 token 不重复出现。
+   *
+   * 为什么要去重：每次重连（重启、断线）都发一个新 token，旧 token 不会自己消失。
+   * 不去重的话接口里同一个人会出现好几条，内存也一直涨，看起来像「怎么越连人越多」。
+   */
   function memberList() {
     const now = Date.now();
-    const out = [];
+    const byOrigin = new Map();
     for (const [token, m] of members) {
-      out.push({
-        origin: m.origin,
-        name: m.name,
-        capabilities: m.capabilities,
-        status: m.status,
-        lastSeen: m.lastSeen,
-        online: now - m.lastSeen < OFFLINE_MS,
-        token: token.slice(0, 8),
-      });
+      const prev = byOrigin.get(m.origin);
+      if (!prev || (Number(m.lastSeen) || 0) > (Number(prev.lastSeen) || 0)) {
+        byOrigin.set(m.origin, {
+          origin: m.origin,
+          name: m.name,
+          capabilities: m.capabilities,
+          status: m.status,
+          lastSeen: m.lastSeen,
+          online: now - m.lastSeen < OFFLINE_MS,
+          token: token.slice(0, 8),
+        });
+      }
     }
-    return out;
+    return [...byOrigin.values()];
   }
 
   function capabilitiesOf(origin) {
