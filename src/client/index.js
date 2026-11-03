@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 10;
-    const VERSION = '0.9.0';
+    const BUILD = 11;
+    const VERSION = '0.9.1';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -2046,7 +2046,13 @@ window.__ModuleLoader__.load({
           h('div', { className: 'cb-card' },
             h('div', { className: 'cb-card-h' }, '我的连接信息'),
             h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '角色'),
-              h('span', { className: 'cb-kv-v' }, ROLE_LABEL[settings.role])),
+              // 显示**运行态**，不是设置里那个值 —— 否则 Hub 明明在跑，这里却写「单机」
+              h('span', { className: 'cb-kv-v' },
+                runtime && runtime.server
+                  ? 'Hub 主机'
+                  : (runtime && runtime.client && runtime.client.online
+                    ? '成员（已连 Hub）'
+                    : ROLE_LABEL[settings.role]))),
             h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '显示名'),
               h('span', { className: 'cb-kv-v' }, settings.selfName || '本机')),
             h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '能力标签'),
