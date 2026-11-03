@@ -104,12 +104,13 @@ async function main() {
   apply(ctx, { dataDir, syncLanInbox: false });
   check('apply 不抛', true);
   check('注册了路由', routes.length >= 9, `${routes.length} 条`);
-  check('注册了 5 个工具', tools.length === 5, tools.map((t) => t.name).join(', '));
+  check('注册了 6 个工具', tools.length === 6, tools.map((t) => t.name).join(', '));
   check('有 collab_post', Boolean(findTool(tools, 'collab_post')));
   check('有 collab_claim', Boolean(findTool(tools, 'collab_claim')));
   check('有 collab_hub', Boolean(findTool(tools, 'collab_hub')));
   check('有 collab_attach', Boolean(findTool(tools, 'collab_attach')));
   check('有 collab_download', Boolean(findTool(tools, 'collab_download')));
+  check('有 collab_state', Boolean(findTool(tools, 'collab_state')));
 
   console.log('\n2. 设置与状态');
   const settings = await hit(routes, '/collab-board/settings');
@@ -160,6 +161,11 @@ async function main() {
   });
   check('hub/start 200', started.status === 200, JSON.stringify(started.payload).slice(0, 160));
   check('起来后 running=true', started.payload?.status?.running === true);
+  // Hub 启动要写一条 hub 事件（系统 origin）。之前把 Hub 名字塞进信封的 name，
+  // 校验器一拦就进熔断 —— 这里必须盯住。
+  check('Hub 起来后系统写入没熔断',
+    started.payload?.status?.server?.systemBroken === false,
+    JSON.stringify(started.payload?.status?.server?.systemBroken));
   const port = started.payload?.info?.port;
   check('拿到真实端口', Number.isInteger(port) && port > 0, String(port));
 
@@ -187,13 +193,25 @@ async function main() {
     JSON.stringify(claim.payload).slice(0, 160));
   check('返回了 seq', Number.isFinite(claim.payload?.seq));
 
+  // 认领事件是 Hub 替本机写的（origin 是本机，但本机日志里原本没有）。
+  // 等一轮拉取（3 秒）后，它必须落在本机日志里 —— 这是 onPulled 判据的验收。
+  await new Promise((r) => setTimeout(r, 4000));
+  const afterClaimLog = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  check('Hub 替本机写的认领事件落进了本机日志',
+    afterClaimLog.some((e) => e.kind === 'task' && e.taskId === 't1' && e.status === 'running'),
+    `共 ${afterClaimLog.length} 条`);
+
+  const beforeAgain = afterClaimLog.length;
   const claimAgain = await hit(routes, '/collab-board/tasks/claim', {
     method: 'POST',
     body: { taskId: 't1' },
   });
-  // 自己已经认领 → Hub 认为 owner 就是自己，允许重复认领（幂等语义），但会再写一条事件
-  check('重复认领有明确回应', claimAgain.status === 200 || claimAgain.status === 409,
-    String(claimAgain.status));
+  // 已是自己 + running + 租约没过 → 幂等返回，不写新事件（否则事件流被重复认领撑爆）
+  check('重复认领返回幂等', claimAgain.status === 200 && claimAgain.payload?.idempotent === true,
+    JSON.stringify(claimAgain.payload).slice(0, 160));
+  await new Promise((r) => setTimeout(r, 400));
+  const afterAgainLog = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  check('重复认领不写新事件', afterAgainLog.length === beforeAgain, `${beforeAgain} → ${afterAgainLog.length}`);
 
   console.log('\n5b. 文件传输');
   const srcFile = join(dataDir, 'hello.txt');
@@ -217,12 +235,127 @@ async function main() {
       JSON.stringify(art?.transfer));
   }
 
+  console.log('\n7. 自动认领');
+  // 用另一个 origin 以成员身份 join，往 Hub 上写一张「别人建的」待认领卡
+  const hubInfo = await hit(routes, '/collab-board/hub');
+  const hubPort = hubInfo.payload?.server?.port;
+  const otherOrigin = 'abcdef0123456789';
+  const joinRes = await fetch(`http://127.0.0.1:${hubPort}/collab/v1/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ wireProtocol: 1, origin: otherOrigin, name: '另一个成员' }),
+  }).then((r) => r.json());
+  const otherToken = joinRes?.data?.token;
+  check('另一个成员 join 成功', Boolean(otherToken));
+
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_auto01_aaa',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'task',
+        taskId: 'auto1',
+        title: '自动认领测试卡',
+        status: 'pending',
+        priority: 'normal',
+      }],
+    }),
+  });
+
+  // 把这个间隔压到 1 秒，等自动认领跑一轮
+  await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { patch: { autoClaimMs: 1000 } },
+  });
+  await new Promise((r) => setTimeout(r, 8000));
+
+  const afterAuto = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const autoEv = afterAuto.filter((e) => e.taskId === 'auto1' && e.kind === 'task');
+  const autoLatest = autoEv.sort((a, b) => (a.seq || 0) - (b.seq || 0)).pop();
+  check('自动认领了别人建的卡',
+    Boolean(autoLatest) && autoLatest.status === 'running' && autoLatest.owner === identity.origin,
+    JSON.stringify({ status: autoLatest?.status, owner: autoLatest?.owner, n: autoEv.length }));
+  check('写了「自动认领」系统提示',
+    afterAuto.some((e) => e.kind === 'note' && String(e.text).includes('自动认领')));
+
+  // 自己建的卡不该被自己抢（否则「我派给别人的活我自己接了」）
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', id: 'auto2', title: '自己建的卡', status: 'pending' },
+  });
+  await new Promise((r) => setTimeout(r, 7000));
+  const afterSelf = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const selfCard = afterSelf.filter((e) => e.taskId === 'auto2' && e.kind === 'task').pop();
+  check('自己建的卡不被自己抢', Boolean(selfCard) && !selfCard.owner,
+    JSON.stringify({ owner: selfCard?.owner, status: selfCard?.status }));
+
+  console.log('\n8. 增量读看板（collab_state）');
+  const stateTool = findTool(tools, 'collab_state');
+  const stateFirst = JSON.parse((await stateTool.execute({})).text);
+  check('第一次读能拿到游标', Number.isFinite(stateFirst.cursor?.to) && stateFirst.cursor.to > 0, String(stateFirst.cursor?.to));
+  check('第一次读有未读', stateFirst.cursor.unreadTotal > 0, String(stateFirst.cursor.unreadTotal));
+  check('归我的卡在 mine 里', Array.isArray(stateFirst.mine) && stateFirst.mine.length >= 1,
+    JSON.stringify(stateFirst.mine?.map((t) => t.taskId)));
+
+  const stateSecond = JSON.parse((await stateTool.execute({})).text);
+  check('游标推进后再读，未读清零', stateSecond.cursor.unreadTotal === 0, String(stateSecond.cursor.unreadTotal));
+  check('第二次不再重复给 mine 之外的旧事件',
+    Array.isArray(stateSecond.unread) && stateSecond.unread.length === 0);
+
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', from: '测试', text: '游标之后的新消息' },
+  });
+  // 本机写的事件要先推给 Hub 拿到 seq，才会出现在下一轮读里
+  await new Promise((r) => setTimeout(r, 4500));
+  const stateThird = JSON.parse((await stateTool.execute({})).text);
+  check('新消息只出现在下一轮', stateThird.cursor.unreadTotal >= 1
+    && stateThird.unread.some((u) => String(u.text || '').includes('游标之后')), JSON.stringify(stateThird.unread));
+
+  console.log('\n9. 自动唤醒护栏');
+  await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { patch: { wakeOnMessage: true, wakeCooldownMs: 60000 } },
+  });
+  // 用另一个 origin 推一条 msg：会走到唤醒逻辑。测试里没有 sessionController，
+  // 所以应该是「唤醒失败但不崩」，看板主流程还能继续响应。
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_wake01_aaa',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'msg',
+        taskId: 't1',
+        text: '这条应该触发唤醒尝试',
+      }],
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 4000));
+  const afterWake = await hit(routes, '/collab-board/state');
+  check('唤醒逻辑失败不影响看板主流程', afterWake.status === 200 && afterWake.payload?.ok !== false);
+
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', from: '我自己', text: '自己发的不该唤醒自己' },
+  });
+  const settingsAfter = await hit(routes, '/collab-board/settings');
+  check('自己发消息不会卡住唤醒锁', settingsAfter.status === 200);
+
+  console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
   check('hub/stop 200', stop.status === 200 && stop.payload?.stopped === true);
   const hubBack = await hit(routes, '/collab-board/hub');
   check('停了以后 running=false', hubBack.payload?.running === false);
 
-  console.log('\n6. 卸载');
+  console.log('\n10. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
   }
