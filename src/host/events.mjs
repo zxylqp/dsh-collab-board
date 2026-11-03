@@ -259,11 +259,14 @@ export function validateEvent(raw, opts = {}) {
       };
     }
     case 'hub': {
+      // Hub 的显示名走 `hubName`；`name` 是信封保留字段（系统事件必须是「系统」），
+      // 老数据可能把 Hub 名塞在 `name` 里，这里兼容着读出来。
+      const display = isText(raw.hubName) ? raw.hubName : (isText(raw.name) && raw.name !== '系统' ? raw.name : '');
       return {
         ok: true,
         event: {
           ...raw,
-          name: isText(raw.name) ? textOf(raw.name, 64) : '',
+          hubName: textOf(display, 64),
           host: textOf(raw.host, 128),
           port: Number.isInteger(Number(raw.port)) ? Number(raw.port) : 0,
         },
