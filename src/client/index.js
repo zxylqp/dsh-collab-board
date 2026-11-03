@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 5;
-    const VERSION = '0.6.1';
+    const BUILD = 10;
+    const VERSION = '0.9.0';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -49,6 +49,11 @@ window.__ModuleLoader__.load({
       hubCode: '',
       pendingWatch: false,
       pendingWatchMs: 300000,
+      autoClaim: true,
+      autoClaimMs: 60000,
+      hiddenMembers: '',
+      wakeOnMessage: false,
+      wakeCooldownMs: 300000,
     };
 
     const ROLE_LABEL = { solo: '单机', hub: 'Hub', member: '成员' };
@@ -1576,6 +1581,57 @@ window.__ModuleLoader__.load({
               onCommit: (v) => saveSetting('hubAddress', v),
             })),
             h(Field, {
+              label: '自动认领',
+              desc: '启动后定时扫「该我接的活」，符合条件的直接认领。不认自己建的，也不认能力不够的。**认领不等于开干**，agent 还是要被消息触发。',
+              control: h(Toggle, {
+                on: Boolean(settings.autoClaim),
+                onClick: (v) => saveSetting('autoClaim', v),
+              }),
+            }),
+            h(Field, {
+              label: '认领间隔',
+              desc: '多久扫一次（10000～3600000 毫秒，默认 60 秒）。改完立即生效。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 10000,
+                max: 3600000,
+                step: 10000,
+                value: settings.autoClaimMs,
+                onCommit: (v) => saveSetting('autoClaimMs', v),
+              }),
+            }),
+            h(Field, {
+              label: '有新消息自动唤醒',
+              desc: '开着时，别人在这个看板发了新消息，就把本机 agent 叫起来读一轮。**会在对话里插一条「协作看板自动触发」**，而且要等它跑完。两台都想自动对话就都开。',
+              control: h(Toggle, {
+                on: Boolean(settings.wakeOnMessage),
+                onClick: (v) => saveSetting('wakeOnMessage', v),
+              }),
+            }),
+            h(Field, {
+              label: '唤醒冷却',
+              desc: '同一条任务多久内最多唤醒一次（60000～3600000 毫秒，默认 5 分钟）。防两个人互相叫个没完。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 60000,
+                max: 3600000,
+                step: 60000,
+                value: settings.wakeCooldownMs,
+                onCommit: (v) => saveSetting('wakeCooldownMs', v),
+              }),
+            }),
+            settings.hiddenMembers
+              ? h(Field, {
+                label: '隐藏的成员',
+                desc: '被你隐藏的成员只在你这台不显示 —— 不改事件流、不影响别人。',
+                control: h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                  h('span', { className: 'cb-hint' },
+                    String(settings.hiddenMembers).split(',').filter(Boolean).length + ' 位'),
+                  h(Btn, { small: true, onClick: () => saveSetting('hiddenMembers', '') }, '全部恢复'),
+                ),
+              })
+              : null,
+            h(Field, {
               label: '待办提醒',
               desc: '开着时定时扫「该我接的活」，发现了在动态里写一条。不会自动认领，也不会替你叫醒 agent。',
               control: h(Toggle, {
@@ -1732,6 +1788,7 @@ window.__ModuleLoader__.load({
       /** 宿主回报的 Hub 运行态（`GET /hub`）。跟事件流里那张 `hub` 卡片不是一回事。 */
       const runtime = props.runtime || null;
       const onHubAction = props.onHubAction;
+      const onHideMember = props.onHideMember;
       const [joinAddress, setJoinAddress] = useState('');
       const [hubBusy, setHubBusy] = useState('');
       const [ignoredFork, setIgnoredFork] = useState(false);
@@ -1773,7 +1830,12 @@ window.__ModuleLoader__.load({
         });
       }, [model.members, model.senders, settings.selfName, caps.all]);
 
-      const online = members.filter((m) => m.self || isOnline(m.status)).length;
+      /** 本地隐藏的成员（只影响这台机器的视图，不改事件流）。 */
+      const hiddenSet = new Set(
+        String(settings.hiddenMembers || '').split(',').map((s) => s.trim()).filter(Boolean),
+      );
+      const visibleMembers = members.filter((m) => !hiddenSet.has(m.origin));
+      const online = visibleMembers.filter((m) => m.self || isOnline(m.status)).length;
       const hub = model.hub;
       // Hub 地址：优先宿主回报的（正在跑 / 已连上），再退到事件流里的 hub 卡片
       const livePort = runtime && runtime.server ? runtime.server.port : 0;
@@ -1825,7 +1887,7 @@ window.__ModuleLoader__.load({
             h('span', { className: 'cb-hint' }, online + ' 在线 · ' + members.length + ' 位'),
           ),
           h('div', { className: 'cb-scroll', style: { paddingTop: 2 } },
-            members.map((m) => h('div', { key: m.origin, className: 'cb-member' },
+            visibleMembers.map((m) => h('div', { key: m.origin, className: 'cb-member' },
               h(Avatar, { name: m.name, seed: m.origin }),
               h('div', { className: 'cb-member-main' },
                 h('div', { className: 'cb-member-name' },
@@ -1845,10 +1907,26 @@ window.__ModuleLoader__.load({
                     : null,
                 ),
               ),
+              m.self
+                ? null
+                : h('button', {
+                  type: 'button',
+                  className: 'cb-linkish',
+                  style: { fontSize: '10px', flex: 'none', opacity: 0.65 },
+                  title: '只在你这台隐藏，不改事件流、不影响别人。设置里能恢复。',
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    if (typeof onHideMember !== 'function') return;
+                    onHideMember([...hiddenSet, m.origin].join(','));
+                    toast('已隐藏 ' + m.name);
+                  },
+                }, '隐藏'),
             )),
-            members.length <= 1
+            visibleMembers.length <= 1
               ? h('div', { className: 'cb-hint', style: { padding: '8px 8px' } },
-                '还没有别的成员。等第二台设备连上 Hub 就会出现。')
+                hiddenSet.size > 0
+                  ? '还有 ' + hiddenSet.size + ' 位被你隐藏了。设置 → 连接 → 恢复隐藏的成员。'
+                  : '还没有别的成员。等第二台设备连上 Hub 就会出现。')
               : null,
           ),
         ),
@@ -2425,6 +2503,7 @@ window.__ModuleLoader__.load({
                     onCopy: copyText,
                     runtime: hub,
                     onHubAction: hubAction,
+                    onHideMember: (csv) => saveSetting('hiddenMembers', csv),
                   })
                   : null,
               ),
