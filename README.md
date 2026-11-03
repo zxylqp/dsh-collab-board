@@ -51,7 +51,12 @@
 ## 安装
 
 ```bash
-# 把插件装进 DSH 的 profile（把路径换成你自己的）
+# 方式一：从 GitHub 拉下来装
+git clone https://github.com/zxylqp/dsh-collab-board.git
+cd dsh-collab-board
+dsh plugin --profile desktop add "file:$(pwd)"
+
+# 方式二：已经有本地副本
 dsh plugin --profile desktop add "file:C:/path/to/dsh-collab-board"
 ```
 
