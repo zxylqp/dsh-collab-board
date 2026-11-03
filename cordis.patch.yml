@@ -1,0 +1,19 @@
+# 协作看板 —— 多台机器之间的任务、对话、产出，一屏看得见。
+#
+# ⚠️ 这个文件必须是**顶层 YAML 数组**，否则 loader 会直接抛错。
+# `id` 是设置项命名空间；`name` 必须等于 package.json 的 name。
+# patch 的 config 是**整体替换、不深合并**：只写你想改的键是安全的。
+
+- insert:
+    - id: collab-board
+      name: 'dsh-collab-board'
+      config:
+        # 数据目录。留空 = ~/.dsh/collab（每台机器各自一份，不互相覆盖）
+        dataDir: ''
+        # 把 dsh-lan-share 收到的消息自动搬进看板日志。
+        # 关掉的话，就只剩 agent 自己写的那部分。
+        syncLanInbox: true
+        # 轮询间隔（毫秒）。lan-share 的 state.json 每 2 秒看一次。
+        syncIntervalMs: 2000
+        # 日志保留条数上限（超过按行裁剪，只留最近这些）
+        maxEvents: 5000
