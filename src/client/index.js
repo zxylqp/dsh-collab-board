@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 16;
-    const VERSION = '0.10.3';
+    const BUILD = 17;
+    const VERSION = '0.10.4';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -88,19 +88,21 @@ window.__ModuleLoader__.load({
     const CSS = `
 .cb-root{position:relative;display:flex;flex-direction:column;height:100%;min-height:420px;box-sizing:border-box;
   color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);
-  font-family:inherit;font-size:13px;line-height:1.55;-webkit-font-smoothing:antialiased;}
-.cb-wrap{display:flex;flex-direction:column;flex:1;min-height:0;width:100%;max-width:820px;margin:0 auto;
-  padding:12px 16px 10px;box-sizing:border-box;gap:10px;}
+  font-family:inherit;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;}
+.cb-wrap{display:flex;flex-direction:column;flex:1;min-height:0;width:100%;
+  padding:16px 22px 12px;box-sizing:border-box;gap:12px;}
 .cb-head{display:flex;align-items:center;gap:10px;flex:none;min-height:32px;}
 .cb-head-icon{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;flex:none;
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-secondary);}
 .cb-head-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}
-.cb-title{font-size:15px;font-weight:600;letter-spacing:.2px;line-height:1.3;}
-.cb-sub{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary);
+.cb-title{font-size:17px;font-weight:600;letter-spacing:.2px;line-height:1.3;}
+.cb-title-ver{font-size:11px;font-weight:500;letter-spacing:0;color:var(--dsw-alias-label-tertiary);
+  margin-left:7px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-bg-overlay);vertical-align:middle;}
+.cb-sub{font-size:12px;line-height:1.4;color:var(--dsw-alias-label-tertiary);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-seg{display:inline-flex;gap:2px;padding:2px;border-radius:9px;background:var(--dsw-alias-bg-overlay);flex:none;}
 .cb-seg-btn{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-secondary);
-  font:inherit;font-size:11.5px;line-height:22px;padding:0 9px;border-radius:7px;cursor:pointer;white-space:nowrap;}
+  font:inherit;font-size:13px;line-height:26px;padding:0 11px;border-radius:7px;cursor:pointer;white-space:nowrap;}
 .cb-seg-btn:hover{color:var(--dsw-alias-label-primary);}
 .cb-seg-btn[data-on]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-weight:600;
   box-shadow:0 1px 2px var(--dsw-alias-border-l2);}
@@ -118,7 +120,7 @@ window.__ModuleLoader__.load({
 .cb-banner-actions{display:flex;gap:4px;flex:none;}
 .cb-body{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;}
 .cb-board{flex:1;min-height:0;display:flex;}
-.cb-col-list{display:flex;flex-direction:column;min-height:0;width:38%;min-width:238px;max-width:330px;flex:none;}
+.cb-col-list{display:flex;flex-direction:column;min-height:0;width:34%;min-width:300px;max-width:440px;flex:none;}
 .cb-col-detail{display:flex;flex-direction:column;min-height:0;flex:1;min-width:0;
   padding-left:14px;border-left:1px solid var(--dsw-alias-border-l1);}
 .cb-narrow .cb-col-list{width:100%;max-width:none;}
@@ -126,10 +128,10 @@ window.__ModuleLoader__.load({
 .cb-narrow[data-detail="1"] .cb-col-list{display:none;}
 .cb-narrow[data-detail="1"] .cb-col-detail{display:flex;}
 .cb-toolbar{display:flex;align-items:center;gap:4px;flex:none;padding-bottom:6px;}
-.cb-toolbar-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);flex:none;margin-right:2px;}
+.cb-toolbar-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-secondary);flex:none;margin-right:2px;}
 .cb-toolbar .cb-grow{flex:1;min-width:0;}
 .cb-filter{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;
-  font-size:11px;line-height:19px;padding:0 7px;border-radius:999px;cursor:pointer;white-space:nowrap;}
+  font-size:12px;line-height:22px;padding:0 8px;border-radius:999px;cursor:pointer;white-space:nowrap;}
 .cb-filter:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);}
 .cb-filter[data-on]{background:var(--dsw-alias-button-ghost-active-fill);color:var(--dsw-alias-label-primary);font-weight:600;}
 .cb-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;
@@ -138,7 +140,7 @@ window.__ModuleLoader__.load({
 .cb-scroll::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-bg-l2);border-radius:3px;}
 .cb-scroll::-webkit-scrollbar-thumb:hover{background:var(--dsw-alias-scrollbar-hover-l2);}
 .cb-scroll::-webkit-scrollbar-track{background:transparent;}
-.cb-task{position:relative;display:flex;flex-direction:column;gap:3px;padding:8px 9px 8px 11px;border-radius:10px;
+.cb-task{position:relative;display:flex;flex-direction:column;gap:4px;padding:10px 11px 10px 13px;border-radius:10px;
   cursor:pointer;border:1px solid transparent;transition:background .12s,border-color .12s;box-sizing:border-box;}
 .cb-task:hover{background:var(--dsw-alias-interactive-bg-hover);}
 .cb-task[data-on]{background:var(--dsw-alias-button-ghost-active-fill);border-color:var(--dsw-alias-border-l1);}
@@ -147,19 +149,19 @@ window.__ModuleLoader__.load({
 .cb-task[data-pri="high"]:not([data-on])::before{background:var(--dsw-alias-state-error-primary);}
 .cb-task[data-archived]{opacity:.62;}
 .cb-row{display:flex;align-items:center;gap:6px;min-width:0;}
-.cb-task-title{flex:1;min-width:0;font-size:12.5px;font-weight:500;line-height:1.45;
+.cb-task-title{flex:1;min-width:0;font-size:13.5px;font-weight:500;line-height:1.45;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-task[data-done] .cb-task-title{color:var(--dsw-alias-label-tertiary);text-decoration:line-through;
   text-decoration-color:var(--dsw-alias-border-l4);}
 .cb-task[data-pri="low"] .cb-task-title{color:var(--dsw-alias-label-secondary);}
-.cb-meta{display:flex;align-items:center;gap:6px;min-width:0;font-size:10.5px;line-height:16px;
+.cb-meta{display:flex;align-items:center;gap:6px;min-width:0;font-size:11.5px;line-height:17px;
   color:var(--dsw-alias-label-tertiary);}
 .cb-meta-id{flex:none;font-variant-numeric:tabular-nums;letter-spacing:.2px;}
 .cb-meta-text{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-meta-right{flex:none;display:flex;align-items:center;gap:4px;}
 .cb-bar{width:46px;height:3px;border-radius:2px;background:var(--dsw-alias-bg-overlay);overflow:hidden;flex:none;}
 .cb-bar i{display:block;height:100%;background:var(--dsw-alias-state-business-primary);border-radius:2px;}
-.cb-pill{display:inline-flex;align-items:center;gap:4px;flex:none;font-size:10.5px;line-height:17px;padding:0 7px;
+.cb-pill{display:inline-flex;align-items:center;gap:4px;flex:none;font-size:11px;line-height:18px;padding:0 8px;
   border-radius:999px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-secondary);white-space:nowrap;}
 .cb-pill[data-tone="run"]{color:var(--dsw-alias-state-business-primary);
   background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 13%,transparent);}
@@ -185,21 +187,21 @@ window.__ModuleLoader__.load({
   padding:26px 14px;text-align:center;color:var(--dsw-alias-label-tertiary);min-height:0;}
 .cb-empty-icon{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;margin-bottom:2px;
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-tertiary);}
-.cb-empty-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary);}
-.cb-empty-desc{font-size:11px;line-height:17px;max-width:280px;}
+.cb-empty-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-secondary);}
+.cb-empty-desc{font-size:12px;line-height:18px;max-width:280px;}
 .cb-card{border-radius:12px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
   padding:12px 13px;box-sizing:border-box;flex:none;box-shadow:0 1px 2px var(--dsw-alias-border-l1);}
-.cb-card-h{display:flex;align-items:center;gap:6px;margin:0 0 2px;font-size:12px;font-weight:600;line-height:1.5;}
+.cb-card-h{display:flex;align-items:center;gap:6px;margin:0 0 2px;font-size:13px;font-weight:600;line-height:1.5;}
 .cb-card-h .cb-grow{flex:1;min-width:0;}
 .cb-card-sub{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:0;}
 .cb-detail{flex:1;min-height:0;display:flex;flex-direction:column;}
 .cb-detail-scroll{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:1px 2px 10px;}
 .cb-detail-top{display:flex;align-items:flex-start;gap:10px;}
 .cb-detail-top-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px;}
-.cb-detail-title{font-size:15px;font-weight:600;line-height:1.35;margin:0;word-break:break-word;}
+.cb-detail-title{font-size:18px;font-weight:600;line-height:1.35;margin:0;word-break:break-word;}
 .cb-detail-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
 .cb-actions{display:flex;gap:6px;flex:none;align-items:center;}
-.cb-btn{appearance:none;font:inherit;font-size:11.5px;line-height:16px;height:28px;padding:0 11px;border-radius:8px;
+.cb-btn{appearance:none;font:inherit;font-size:12px;line-height:16px;height:30px;padding:0 12px;border-radius:8px;
   cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
   color:var(--dsw-alias-label-primary);display:inline-flex;align-items:center;justify-content:center;gap:4px;
   white-space:nowrap;transition:background .12s,border-color .12s,opacity .12s;}
@@ -246,7 +248,7 @@ window.__ModuleLoader__.load({
 .cb-msg-body{max-width:80%;min-width:0;display:flex;flex-direction:column;gap:2px;}
 .cb-msg[data-me] .cb-msg-body{align-items:flex-end;}
 .cb-msg-name{font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);}
-.cb-msg-bubble{font-size:12px;line-height:1.55;padding:6px 9px;border-radius:10px;
+.cb-msg-bubble{font-size:13px;line-height:1.55;padding:7px 10px;border-radius:10px;
   background:var(--dsw-alias-bg-overlay);white-space:pre-wrap;word-break:break-word;}
 .cb-msg[data-me] .cb-msg-bubble{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 15%,transparent);}
 .cb-sys{font-size:10.5px;line-height:1.55;color:var(--dsw-alias-label-tertiary);text-align:center;
@@ -277,7 +279,7 @@ window.__ModuleLoader__.load({
 .cb-sw[data-on]::after{transform:translateX(16px);}
 .cb-sw[disabled]{opacity:.45;cursor:not-allowed;}
 .cb-settings{flex:1;min-height:0;display:flex;gap:14px;}
-.cb-settings-nav{width:124px;flex:none;display:flex;flex-direction:column;gap:2px;padding-top:2px;}
+.cb-settings-nav{width:150px;flex:none;display:flex;flex-direction:column;gap:2px;padding-top:2px;}
 .cb-navitem{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-secondary);
   font:inherit;font-size:12px;line-height:18px;text-align:left;padding:7px 9px;border-radius:8px;cursor:pointer;}
 .cb-navitem:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);}
@@ -300,7 +302,7 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-state-success-primary);}
 .cb-cap[data-manual]::before{background:var(--dsw-alias-state-warn-primary);}
 .cb-members{flex:1;min-height:0;display:flex;gap:14px;}
-.cb-members-list{width:258px;flex:none;display:flex;flex-direction:column;min-height:0;}
+.cb-members-list{width:300px;flex:none;display:flex;flex-direction:column;min-height:0;}
 .cb-members-detail{flex:1;min-width:0;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:10px;}
 .cb-narrow .cb-members{flex-direction:column;gap:10px;}
 .cb-narrow .cb-members-list{width:auto;flex:none;max-height:210px;}
@@ -308,9 +310,9 @@ window.__ModuleLoader__.load({
 .cb-member{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:10px;min-width:0;}
 .cb-member:hover{background:var(--dsw-alias-interactive-bg-hover);}
 .cb-member-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}
-.cb-member-name{display:flex;align-items:center;gap:5px;font-size:12px;line-height:17px;min-width:0;}
+.cb-member-name{display:flex;align-items:center;gap:5px;font-size:13px;line-height:18px;min-width:0;}
 .cb-member-name span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.cb-member-sub{display:flex;align-items:center;gap:4px;min-width:0;font-size:10px;line-height:15px;
+.cb-member-sub{display:flex;align-items:center;gap:4px;min-width:0;font-size:11px;line-height:16px;
   color:var(--dsw-alias-label-tertiary);}
 .cb-narrow .cb-settings{flex-direction:column;gap:8px;}
 .cb-narrow .cb-settings-nav{width:auto;flex-direction:row;overflow-x:auto;padding:0 0 2px;}
@@ -330,7 +332,7 @@ window.__ModuleLoader__.load({
   font:inherit;font-size:11.5px;line-height:18px;text-align:left;width:100%;padding:5px 8px;border-radius:6px;cursor:pointer;}
 .cb-menu button:hover{background:var(--dsw-alias-interactive-bg-hover);}
 .cb-menu button[data-danger]{color:var(--dsw-alias-label-error);}
-.cb-foot{display:flex;align-items:center;gap:8px;flex:none;padding:2px 0 0;font-size:10px;line-height:16px;
+.cb-foot{display:flex;align-items:center;gap:8px;flex:none;padding:2px 0 0;font-size:11px;line-height:16px;
   color:var(--dsw-alias-label-quaternary);}
 .cb-foot .cb-grow{flex:1;}
 .cb-skel{height:12px;border-radius:6px;background:var(--dsw-alias-bg-skeleton);animation:cb-pulse 1.4s ease-in-out infinite;}
@@ -1168,11 +1170,11 @@ window.__ModuleLoader__.load({
           /* 4. 评论 */
           h('div', { className: 'cb-card' },
             h('div', { className: 'cb-card-h' }, '任务评论', h('span', { className: 'cb-grow' }),
-              h('span', { className: 'cb-hint' }, comments.length ? comments.length + ' 条' : '只在本任务可见')),
+              h('span', { className: 'cb-hint' }, comments.length ? comments.length + ' 条 · 最新在上' : '只在本任务可见')),
             comments.length === 0
               ? h('div', { className: 'cb-hint', style: { padding: '4px 0' } }, '还没有人在这条任务下说话。')
               : h('div', { style: { display: 'flex', flexDirection: 'column' } },
-                comments.map((m, i) => h(Message, { key: 'c-' + i, msg: m, me, timeMode: settings.timeFormat }))),
+                comments.slice().reverse().map((m, i) => h(Message, { key: 'c-' + i, msg: m, me, timeMode: settings.timeFormat }))),
             h('div', { className: 'cb-composer', style: { marginTop: 8 } },
               h(CommentBox, {
                 placeholder: '在这条任务下回复…（自动带上 ' + task.taskId + '）',
@@ -1622,8 +1624,8 @@ window.__ModuleLoader__.load({
             }),
             settings.hiddenMembers
               ? h(Field, {
-                label: '隐藏的成员',
-                desc: '被你隐藏的成员只在你这台不显示 —— 不改事件流、不影响别人。',
+                label: '已移除的成员',
+                desc: '被你移除的成员只在你这台不显示 —— 不改事件流、不影响别人。',
                 control: h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
                   h('span', { className: 'cb-hint' },
                     String(settings.hiddenMembers).split(',').filter(Boolean).length + ' 位'),
@@ -1912,20 +1914,20 @@ window.__ModuleLoader__.load({
                 : h('button', {
                   type: 'button',
                   className: 'cb-linkish',
-                  style: { fontSize: '10px', flex: 'none', opacity: 0.65 },
-                  title: '只在你这台隐藏，不改事件流、不影响别人。设置里能恢复。',
+                  style: { fontSize: '11px', flex: 'none', opacity: 0.85 },
+                  title: '从这台机器的看板移除（不改事件流、不影响别人；设置 → 连接里能恢复）',
                   onClick: (e) => {
                     e.stopPropagation();
                     if (typeof onHideMember !== 'function') return;
                     onHideMember([...hiddenSet, m.origin].join(','));
-                    toast('已隐藏 ' + m.name);
+                    toast('已移除 ' + m.name + '（只影响这台机器）');
                   },
-                }, '隐藏'),
+                }, '移除'),
             )),
             visibleMembers.length <= 1
               ? h('div', { className: 'cb-hint', style: { padding: '8px 8px' } },
                 hiddenSet.size > 0
-                  ? '还有 ' + hiddenSet.size + ' 位被你隐藏了。设置 → 连接 → 恢复隐藏的成员。'
+                  ? '还有 ' + hiddenSet.size + ' 位被你移除了。设置 → 连接 → 全部恢复。'
                   : '还没有别的成员。等第二台设备连上 Hub 就会出现。')
               : null,
           ),
@@ -2437,7 +2439,9 @@ window.__ModuleLoader__.load({
           h('div', { className: 'cb-head' },
             h('div', { className: 'cb-head-icon' }, h(Icon, { name: 'board', size: 15 })),
             h('div', { className: 'cb-head-text' },
-              h('div', { className: 'cb-title' }, '协作看板'),
+              h('div', { className: 'cb-title' }, '协作看板',
+                h('span', { className: 'cb-title-ver', title: '插件版本 · 构建号（客户端半边的版本）' },
+                  'v' + VERSION + ' · b' + BUILD)),
               h('div', { className: 'cb-sub' }, headerSub),
             ),
             h('nav', { className: 'cb-seg', role: 'tablist' },
