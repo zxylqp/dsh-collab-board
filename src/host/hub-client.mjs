@@ -53,6 +53,14 @@ export function createHubClient(opts = {}) {
   let capabilities = Array.isArray(opts.capabilities) ? opts.capabilities : [];
   let online = false;
   let lastError = '';
+  /**
+   * Hub 明确拒过的事件 id。
+   *
+   * 为什么必须记：Hub 的 `/events` 是**整批**校验，一条不过就整批 403，
+   * 而客户端不标记失败项 —— 那条脏事件会每轮重推、每轮连坐，
+   * 整台机器的同步从此停摆。所以被拒的拉黑，剩下的继续走。
+   */
+  const rejected = new Set();
 
   async function call(path, { method = 'GET', body, needToken = true, timeout = 8000 } = {}) {
     const t = withTimeout(timeout);
@@ -181,7 +189,10 @@ export function createHubClient(opts = {}) {
     if (!token || typeof opts.pending !== 'function') return [];
     const list = opts.pending();
     if (!Array.isArray(list) || list.length === 0) return [];
-    const batch = list.slice(0, 100);
+    // 被 Hub 明确拒过的不再重推 —— 一条脏事件能把整批连坐，队列会永久卡住
+    const alive = list.filter((e) => e && e.id && !rejected.has(e.id));
+    if (alive.length === 0) return [];
+    const batch = alive.slice(0, 100);
     try {
       const data = await call('/events', { method: 'POST', body: { events: batch } });
       const accepted = Array.isArray(data.accepted) ? data.accepted : [];
@@ -189,8 +200,29 @@ export function createHubClient(opts = {}) {
       epoch = Number(data.epoch) || epoch;
       return accepted;
     } catch (e) {
-      log('warn', `推送失败：${e.message}`);
-      return [];
+      // 只有「这批里有东西不对」才值得逐条拆开；网络错误拆了也是白拆
+      const isRejection = e.code === 'forbidden' || e.code === 'bad-param'
+        || e.code === 'too-large' || e.code === 'cycle' || e.status === 400;
+      if (!isRejection) {
+        log('warn', `推送失败：${e.message}`);
+        return [];
+      }
+      log('warn', `整批被拒（${e.message}），逐条重发定位`);
+      const ok = [];
+      for (const ev of batch) {
+        try {
+          const data = await call('/events', { method: 'POST', body: { events: [ev] } });
+          const accepted = Array.isArray(data.accepted) ? data.accepted : [];
+          if (typeof opts.onPushed === 'function') opts.onPushed(accepted, [ev]);
+          epoch = Number(data.epoch) || epoch;
+          ok.push(...accepted);
+        } catch (one) {
+          // 单条也不认 —— 拉黑，别再让它拖累别人
+          rejected.add(ev.id);
+          log('warn', `这条 Hub 不认，已跳过：${ev.id} —— ${one.message}`);
+        }
+      }
+      return ok;
     }
   }
 
