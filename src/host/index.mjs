@@ -96,12 +96,13 @@ export function apply(ctx, rawConfig = {}) {
   const store = createStore({
     logPath: LOG,
     seqFile: join(dataDir, '.synced.json'),
+    rejectedFile: join(dataDir, '.rejected.json'),
     origin: () => identity.origin,
     nameOf: () => getSettings().selfName || '',
     maxEventsOf: () => getSettings().maxEvents,
     localIso,
   });
-  const { readEvents, appendEvent, pendingEvents, markSynced, invalidate } = store;
+  const { readEvents, appendEvent, pendingEvents, markSynced, invalidate, markRejected } = store;
 
   /* ───────────────────── 身份与 Hub ───────────────────── */
 
@@ -257,6 +258,8 @@ export function apply(ctx, rawConfig = {}) {
        */
       onRejected: (ev, err) => {
         if (!ev || ev.kind === 'note') return; // note 自己不再生 note，防递归
+        // 落盘拉黑：重启后不要再推一次、别再落一条一样的 note、别一直算在「待同步」里
+        markRejected(ev.id);
         const what = ev.kind === 'task' && ev.taskId ? `task ${ev.taskId}` : String(ev.kind || '事件');
         const note = buildEvent({
           kind: 'note',
