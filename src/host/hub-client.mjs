@@ -217,9 +217,13 @@ export function createHubClient(opts = {}) {
           epoch = Number(data.epoch) || epoch;
           ok.push(...accepted);
         } catch (one) {
-          // 单条也不认 —— 拉黑，别再让它拖累别人
+          // 单条也不认 —— 拉黑，别再让它拖累别人。
+          // **但必须让它出声**：静默丢弃等于让人以为写成功了（汐汐 2026-11-04 的原话）。
           rejected.add(ev.id);
           log('warn', `这条 Hub 不认，已跳过：${ev.id} —— ${one.message}`);
+          if (typeof opts.onRejected === 'function') {
+            try { opts.onRejected(ev, one); } catch { /* 回调失败不该停同步 */ }
+          }
         }
       }
       return ok;
