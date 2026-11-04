@@ -354,6 +354,12 @@ async function main() {
   check('合法消息没被脏事件连坐（拿到了 Hub 的 seq）',
     Boolean(legitMsg && syncedMap[legitMsg.id]), JSON.stringify({ id: legitMsg?.id }));
   check('脏事件被跳过（不在 seqMap 里）', !syncedMap[dirtyId], JSON.stringify({ dirty: syncedMap[dirtyId] }));
+  // 跳过可以，但必须出声 —— 静默丢弃等于让人以为写成功了
+  const rejectNote = afterDirty.find(
+    (e) => e.kind === 'note' && e.level === 'warn' && String(e.text || '').includes('被 Hub 拒了'),
+  );
+  check('被拒事件落了 warn note（面板和 agent 都看得见）',
+    Boolean(rejectNote), String(rejectNote?.text || '').slice(0, 90));
 
   console.log('\n8. 增量读看板（collab_state）');
   const stateTool = findTool(tools, 'collab_state');
