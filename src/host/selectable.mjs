@@ -25,7 +25,24 @@ export function latestTasks(events) {
   for (const ev of Array.isArray(events) ? events : []) {
     if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
     const prev = out.get(ev.taskId);
-    if (!prev || compareEvents(ev, prev) > 0) out.set(ev.taskId, ev);
+    if (!prev) {
+      out.set(ev.taskId, ev);
+      continue;
+    }
+    if (compareEvents(ev, prev) > 0) {
+      /**
+       * `owner` 缺省 = 不动它。Hub 收下时会按当前值补回来，但本地日志只追加，
+       * 推上去的那条原件仍然没有 owner 键；`onPulled` 又按 id 判「已知」整条跳过，
+       * Hub 补的字段回不来本机。
+       *
+       * 结果就是「别人看到的对，自己看到的错」：本机看板显示无主、
+       * `collab_state` 的 mine 漏掉自己认领的卡、别人那台还以为这张卡能接。
+       * 折叠时把上一版的 owner 带过来 —— 只有显式写了 owner（含 ""）才算变更。
+       */
+      out.set(ev.taskId, Object.prototype.hasOwnProperty.call(ev, 'owner')
+        ? ev
+        : { ...ev, owner: prev.owner });
+    }
   }
   return out;
 }
