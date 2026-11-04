@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 18;
-    const VERSION = '0.10.5';
+    const BUILD = 20;
+    const VERSION = '0.10.6';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -633,6 +633,8 @@ window.__ModuleLoader__.load({
         if (kind === 'member') {
           const target = String(ev.target || ev.origin || ev.name || '').trim();
           if (!target) continue;
+          // 离开就删掉，别留成「离线成员」——0.10.5 刚清完幽灵，别再养一只。
+          if (ev.action === 'leave') { members.delete(target); continue; }
           const prev = members.get(target) || { origin: target, name: target, status: 'offline', capabilities: [], seenAt: ev.ts };
           const caps = Array.isArray(ev.capabilities) ? textList(ev.capabilities, 20) : prev.capabilities;
           const status = ev.status === 'idle' || ev.status === 'busy' || ev.status === 'offline' ? ev.status : prev.status;
@@ -2083,6 +2085,14 @@ window.__ModuleLoader__.load({
       const [ready, setReady] = useState(false);
       /** Hub 运行态。null = 老宿主没有这个接口（或还没读到）。 */
       const [hub, setHub] = useState(null);
+      /**
+       * 宿主包版本（`/collab-board/version`）。
+       *   null    = 还没读到
+       *   'legacy'= 宿主没有这个路由（< 0.10.6）
+       *   {version,...} = 宿主进程实际加载的包版本
+       * 客户端常量只能证明「浏览器加载了哪份 bundle」，判不了宿主，所以单开一项。
+       */
+      const [hostVer, setHostVer] = useState(null);
 
       const rootRef = useRef(null);
       const settingsRef = useRef(settings);
@@ -2162,6 +2172,10 @@ window.__ModuleLoader__.load({
             const h = await fetchJson('/hub');
             if (alive && h && h.ok !== false) setHub(h);
           } catch { /* 老宿主没有 /hub，按单机画 */ }
+          try {
+            const v = await fetchJson('/version');
+            if (alive) setHostVer(v && v.ok !== false ? v : 'legacy');
+          } catch { if (alive) setHostVer('legacy'); }
         })();
         return () => { alive = false; };
       }, []);
@@ -2297,27 +2311,27 @@ window.__ModuleLoader__.load({
       const selectedTask = selectedId ? model.byId.get(selectedId) : null;
 
       const createTask = useCallback(async (title) => {
-        const numeric = model.tasks
-          .map((t) => /^t(\d+)$/.exec(t.taskId))
-          .filter(Boolean)
-          .map((m) => Number(m[1]));
-        const next = numeric.length ? Math.max.apply(null, numeric) + 1 : 1;
+        // 不再从共享视图里「取最大 tN + 1」—— 两台机器在同一个轮询窗口里
+        // 会数到同一个 N，发出同一个 taskId，后推的那条把前一张卡整条覆盖
+        // （R5 真机撞号：两边各建一张 t10，板上只剩后到的那张）。
+        // 改成随机短 id：不依赖板上已有卡片，撞号概率可忽略。
+        const id = 't-' + Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 4);
         try {
           await post({
             kind: 'task',
-            id: 't' + next,
-            taskId: 't' + next,
+            id,
+            taskId: id,
             title,
             status: 'pending',
             priority: 'normal',
           });
           setCreating(false);
-          setSelectedId('t' + next);
-          toast('已创建 t' + next);
+          setSelectedId(id);
+          toast('已创建 ' + id);
         } catch (e) {
           toast('没创建成功：' + e.message, 'error');
         }
-      }, [model.tasks, post, toast]);
+      }, [post, toast]);
 
       const openTask = useCallback((id) => {
         setSelectedId(id);
@@ -2439,8 +2453,9 @@ window.__ModuleLoader__.load({
             h('div', { className: 'cb-head-icon' }, h(Icon, { name: 'board', size: 15 })),
             h('div', { className: 'cb-head-text' },
               h('div', { className: 'cb-title' }, '协作看板',
-                h('span', { className: 'cb-title-ver', title: '插件版本 · 构建号（客户端半边的版本）' },
-                  'v' + VERSION + ' · b' + BUILD)),
+                h('span', { className: 'cb-title-ver', title: 'v/b 是客户端常量（浏览器加载的 bundle）；「宿主」是宿主进程实际加载的包版本，来自 /collab-board/version' },
+                  'v' + VERSION + ' · b' + BUILD
+                  + (hostVer ? ' · 宿主 ' + (typeof hostVer === 'string' ? '<0.10.6' : (hostVer.version || '?')) : ''))),
               h('div', { className: 'cb-sub' }, headerSub),
             ),
             h('nav', { className: 'cb-seg', role: 'tablist' },
