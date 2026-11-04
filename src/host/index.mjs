@@ -3,7 +3,7 @@
  *
  * 三件事：
  *   1. 守着 `events.jsonl`（唯一事实源，只追加）
- *   2. 每 2 秒把 dsh-lan-share 收到的消息搬进来 —— **没人调 inbox 也看得见**
+ *   2. 起 / 连 Hub，把本机事件推上去、把别人的拉下来
  *   3. 给面板和 agent 各开一条写入口（HTTP 路由 + collab_post 工具）
  *
  * 为什么要有这个插件：之前是几个散装脚本 + 一个自己起的 7788 端口，
@@ -13,20 +13,16 @@
  */
 import {
   readFileSync,
-  appendFileSync,
   existsSync,
   mkdirSync,
   writeFileSync,
-  renameSync,
-  statSync,
 } from 'node:fs';
 import { join, resolve, basename, dirname, sep } from 'node:path';
 import { homedir, hostname } from 'node:os';
-import { execFile } from 'node:child_process';
 import { loadIdentity } from './identity.mjs';
 import { createHubClient } from './hub-client.mjs';
 import { startHub } from './hub.mjs';
-import { compareEvents, dedupeById, hasSyncStamp, makeEventId, stampLocal } from './events.mjs';
+import { claimableOnly, claimableTasks, latestTasks, missingCapabilities } from './selectable.mjs';
 
 export const name = 'collab-board';
 /** 不依赖任何服务就能活；webServer / tools 都是有了才注册。 */
@@ -48,38 +44,14 @@ function localIso(date = new Date()) {
   );
 }
 
-function jsonReply(res, status, payload) {
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.setHeader('cache-control', 'no-store');
-  res.end(JSON.stringify(payload));
-}
-
-/** 把请求体读成对象，限制大小，坏 JSON 直接拒。 */
-function readBody(req, limit = 256 * 1024) {
-  return new Promise((ok, no) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) {
-        no(new Error('请求体过大'));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      try {
-        const text = Buffer.concat(chunks).toString('utf8');
-        ok(text.trim() === '' ? {} : JSON.parse(text));
-      } catch {
-        no(new Error('不是合法 JSON'));
-      }
-    });
-    req.on('error', no);
-  });
-}
+/**
+ * HTTP 小工具在 http-util.mjs，和 Hub 半边共用一份。
+ * 面板侧历史上把它叫 `jsonReply`，这里就保留这个别名，省得改 50 多处调用。
+ */
+import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
+import { createSettings } from './settings.mjs';
+import { createCapabilities } from './capabilities.mjs';
+import { createStore } from './store.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -87,13 +59,7 @@ export function apply(ctx, rawConfig = {}) {
   const custom = typeof cfg.dataDir === 'string' ? cfg.dataDir.trim() : '';
   const dataDir = custom === '' ? join(home, 'collab') : resolve(custom);
   const LOG = join(dataDir, 'events.jsonl');
-  const SEEN_FILE = join(dataDir, '.inbox-synced.json');
-  const LAN_STATE = join(home, 'lan-share', 'state.json');
 
-  const syncLanInbox = cfg.syncLanInbox !== false;
-  const intervalMs = Number.isFinite(Number(cfg.syncIntervalMs))
-    ? Math.max(500, Number(cfg.syncIntervalMs))
-    : 2000;
   const maxEvents = Number.isFinite(Number(cfg.maxEvents))
     ? Math.max(100, Number(cfg.maxEvents))
     : 5000;
@@ -103,192 +69,33 @@ export function apply(ctx, rawConfig = {}) {
   /* ───────────────────── 设置（settings.json） ───────────────────── */
 
   const SETTINGS_FILE = join(dataDir, 'settings.json');
-
-  /**
-   * 面板能改的设置项。
-   *
-   * 规矩（UI-BRIEF §3.3）：**只有这一版真能生效的才进来**。
-   * Hub 那一组（地址 / 端口 / 口令）宿主侧已经真生效了 —— 起 Hub、加入、重连都读它；
-   * 界面输入框下一轮接，所以这一轮它们只能通过 PATCH /settings 或 cordis config 改。
-   *
-   * 为什么存这儿而不写回 cordis.patch.yml：改 config 要重启 DSH，
-   * 调个轮询间隔不该把整个应用重启一遍。
-   */
-  const SETTINGS_SPEC = {
-    selfName: { kind: 'string', max: 64, def: '' },
-    role: { kind: 'enum', values: ['solo', 'hub', 'member'], def: 'solo' },
-    pollIntervalMs: { kind: 'int', min: 1000, max: 60000, def: 3000 },
-    showSystemEvents: { kind: 'bool', def: true },
-    showArtifacts: { kind: 'bool', def: true },
-    autoScroll: { kind: 'bool', def: true },
-    timeFormat: { kind: 'enum', values: ['clock', 'relative'], def: 'clock' },
-    maxReplay: { kind: 'int', min: 50, max: 5000, def: 500 },
-    capabilityDetect: { kind: 'bool', def: true },
-    capabilitiesExtra: { kind: 'string', max: 2000, def: '' },
-    maxEvents: { kind: 'int', min: 100, max: 200000, def: maxEvents },
-    hubAddress: { kind: 'string', max: 200, def: '' },
-    hubPort: { kind: 'int', min: 1, max: 65535, def: 48910 },
-    hubCode: { kind: 'string', max: 64, def: '' },
-    pendingWatch: { kind: 'bool', def: false },
-    pendingWatchMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },
-    /**
-     * 自动认领：启动后扫「该我接的活」直接认领。
-     * 默认**开**——这是使用方明确要的行为（电脑一启动就把活接下来）。
-     * 只在连上 Hub 时生效；单机模式没有认领通道。
-     */
-    autoClaim: { kind: 'bool', def: true },
-    autoClaimMs: { kind: 'int', min: 1000, max: 3600000, def: 60000 },
-    /**
-     * 本地隐藏的成员（逗号分隔的 origin）。
-     * **只影响这台机器的视图**，不改事件流、不影响别人 —— 所以能安全地"删人"。
-     */
-    hiddenMembers: { kind: 'string', max: 4000, def: '' },
-    /**
-     * 有新消息时自动唤醒本机 agent（调 `sessionController.prompt`）。
-     *
-     * **默认关**：它会在对话里插一条真消息，而且会等 agent 跑完一整轮才返回。
-     * 要开的时候自己开 —— 别默认就把人的会话点着。
-     */
-    wakeOnMessage: { kind: 'bool', def: false },
-    wakeCooldownMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },
-  };
-  const SETTINGS_KEYS = Object.keys(SETTINGS_SPEC);
-
-  function settingsDefaults() {
-    const out = {};
-    for (const k of SETTINGS_KEYS) out[k] = SETTINGS_SPEC[k].def;
-    return out;
-  }
-
-  /** 校验单个设置值。坏值返回 ok:false + 人话，绝不悄悄写进去。 */
-  function coerceSetting(key, raw) {
-    const spec = SETTINGS_SPEC[key];
-    if (!spec) return { ok: false, reason: '不认识的设置项' };
-    if (spec.kind === 'bool') {
-      if (typeof raw !== 'boolean') return { ok: false, reason: '要 true / false' };
-      return { ok: true, value: raw };
-    }
-    if (spec.kind === 'enum') {
-      if (typeof raw !== 'string' || !spec.values.includes(raw)) {
-        return { ok: false, reason: `只能是 ${spec.values.join(' / ')}` };
-      }
-      return { ok: true, value: raw };
-    }
-    if (spec.kind === 'int') {
-      const n = Number(raw);
-      if (!Number.isFinite(n) || !Number.isInteger(n)) return { ok: false, reason: '要是整数' };
-      if (n < spec.min || n > spec.max) return { ok: false, reason: `范围 ${spec.min}～${spec.max}` };
-      return { ok: true, value: n };
-    }
-    if (typeof raw !== 'string') return { ok: false, reason: '要字符串' };
-    const text = raw.trim();
-    if (text.length > spec.max) return { ok: false, reason: `最长 ${spec.max} 字符` };
-    return { ok: true, value: text };
-  }
-
-  function writeAtomic(file, text) {
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, text, 'utf8');
-    renameSync(tmp, file);
-  }
-
-  let settingsCache = { mtime: -1, size: -1, data: null };
-
-  function getSettings() {
-    let st;
-    try { st = statSync(SETTINGS_FILE); } catch { return settingsDefaults(); }
-    if (settingsCache.data && st.mtimeMs === settingsCache.mtime && st.size === settingsCache.size) {
-      return settingsCache.data;
-    }
-    let raw = {};
-    try { raw = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8')); } catch { raw = {}; }
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
-    const out = settingsDefaults();
-    for (const k of SETTINGS_KEYS) {
-      if (!(k in raw)) continue;
-      const r = coerceSetting(k, raw[k]);
-      if (r.ok) out[k] = r.value;
-    }
-    settingsCache = { mtime: st.mtimeMs, size: st.size, data: out };
-    return out;
-  }
-
-  function patchSettings(patch) {
-    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
-      throw new Error('patch 要是个对象');
-    }
-    const next = { ...getSettings() };
-    const ignored = [];
-    for (const [k, v] of Object.entries(patch)) {
-      if (!SETTINGS_SPEC[k]) { ignored.push(k); continue; }
-      const r = coerceSetting(k, v);
-      if (!r.ok) throw new Error(`${k}：${r.reason}`);
-      next[k] = r.value;
-    }
-    writeAtomic(SETTINGS_FILE, JSON.stringify(next, null, 2) + '\n');
-    settingsCache = { mtime: -1, size: -1, data: null };
-    return { settings: getSettings(), ignored };
-  }
+  // 设置项定义、校验、读写都在 settings.mjs；这里只拿到需要的那几个。
+  const {
+    SETTINGS_SPEC, getSettings, patchSettings,
+  } = createSettings({ file: SETTINGS_FILE, maxEventsDefault: maxEvents });
 
   /* ───────────────────── 能力自检（§6.8） ───────────────────── */
 
-  const CAP_FILE = join(dataDir, 'capabilities.json');
-  /** 内置探测表：只写标签，绝不写绝对路径。`node` 故意不探 —— 插件自己就是 node。 */
-  const PROBE_BINS = [
-    ['ffmpeg', 'ffmpeg'],
-    ['python', 'python'],
-    ['soffice', 'soffice'],
-    ['gpu', 'nvidia-smi'],
-  ];
-  const CHROME_PATHS = [
-    join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-    join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-  ];
+  // 探测表、chrome 路径、手填标签的合并全在 capabilities.mjs。
+  const { detectCapabilities, capabilityPayload } = createCapabilities({
+    dataDir, getSettings, localIso,
+  });
 
-  let capRuntime = { status: 'idle', detected: [], at: null };
+  /* ───────────────────── 本地事件库 ───────────────────── */
 
-  function whichBin(bin) {
-    const finder = process.platform === 'win32' ? 'where' : 'which';
-    return new Promise((ok) => {
-      execFile(finder, [bin], { timeout: 2500, windowsHide: true }, (err) => ok(!err));
-    });
-  }
-
-  async function detectCapabilities() {
-    capRuntime = { ...capRuntime, status: 'running' };
-    const found = new Set();
-    await Promise.all(
-      PROBE_BINS.map(async ([tag, bin]) => {
-        try {
-          if (await whichBin(bin)) found.add(tag);
-        } catch { /* 探测失败 = 没有 */ }
-      }),
-    );
-    for (const p of CHROME_PATHS) {
-      try { if (existsSync(p)) { found.add('chrome'); break; } } catch { /* ignore */ }
-    }
-    const detected = [...found].sort();
-    capRuntime = { status: 'done', detected, at: localIso() };
-    try { writeAtomic(CAP_FILE, JSON.stringify({ detected, at: capRuntime.at }) + '\n'); } catch { /* 下次再说 */ }
-    return capRuntime;
-  }
-
-  function manualCapabilities() {
-    return (getSettings().capabilitiesExtra || '')
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-
-  function capabilityPayload() {
-    const manual = manualCapabilities();
-    const all = [...new Set([...capRuntime.detected, ...manual])].sort();
-    return { ok: true, status: capRuntime.status, detected: capRuntime.detected, manual, all, at: capRuntime.at };
-  }
-
-  /* ───────────────────── 日志 ───────────────────── */
-
-  let cache = { mtime: -1, size: -1, events: [] };
+  /**
+   * 事件读写全在 store.mjs。`origin` 用 getter 传：identity 在它之后建
+   * （恢复 groupId 要读日志，而日志在 store 里 —— 互相引用只能延迟求值）。
+   */
+  const store = createStore({
+    logPath: LOG,
+    seqFile: join(dataDir, '.synced.json'),
+    origin: () => identity.origin,
+    nameOf: () => getSettings().selfName || '',
+    maxEventsOf: () => getSettings().maxEvents,
+    localIso,
+  });
+  const { readEvents, appendEvent, pendingEvents, markSynced, invalidate } = store;
 
   /* ───────────────────── 身份与 Hub ───────────────────── */
 
@@ -298,135 +105,8 @@ export function apply(ctx, rawConfig = {}) {
    */
   const identity = loadIdentity({ dir: dataDir, logPath: LOG, readLog: () => readEvents() });
 
-  /**
-   * 推送成功后的 `(epoch, seq)` 回写表。
-   *
-   * 为什么不直接改 events.jsonl：那是只追加的事实源，回写就得重写整个文件，
-   * 断电那一刻整个日志都可能碎。用一个 sidecar 记 `id → [epoch, seq]`，
-   * 读的时候补上，代价是偶尔丢一条映射（重推一遍，幂等兜住）。
-   */
-  const SEQ_FILE = join(dataDir, '.synced.json');
-  let seqMap = {};
-  try {
-    const raw = JSON.parse(readFileSync(SEQ_FILE, 'utf8'));
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) seqMap = raw;
-  } catch { seqMap = {}; }
-
-  function persistSeqMap() {
-    try { writeAtomic(SEQ_FILE, JSON.stringify(seqMap)); } catch { /* 丢了就重推，幂等 */ }
-  }
-
   /** Hub 运行态。`role` 跟着 settings 走，但真正起没起看 server/client。 */
   const hubRuntime = { role: 'solo', server: null, client: null, error: '', startedAt: '' };
-
-
-  /** 读全量事件。坏行（并发写撕裂、半行）跳过，绝不让一行坏 JSON 弄死面板。 */
-  function readEvents() {
-    if (!existsSync(LOG)) return [];
-    let st;
-    try { st = statSync(LOG); } catch { return []; }
-    if (st.mtimeMs === cache.mtime && st.size === cache.size) return cache.events;
-    let text = '';
-    try { text = readFileSync(LOG, 'utf8'); } catch { return cache.events; }
-    const out = [];
-    for (const line of text.split(/\r?\n/)) {
-      const t = line.trim();
-      if (t === '') continue;
-      try {
-        const e = JSON.parse(t);
-        if (e && typeof e === 'object') out.push(e);
-      } catch { /* 半行，跳过 */ }
-    }
-    for (const e of out) {
-      // 推给 Hub 成功后拿到的 (epoch, seq) 存在 sidecar 里，读的时候补上
-      const stamp = e && e.id && seqMap[e.id];
-      if (stamp && Array.isArray(stamp) && !hasSyncStamp(e)) {
-        e.epoch = stamp[0];
-        e.seq = stamp[1];
-      }
-    }
-    cache = { mtime: st.mtimeMs, size: st.size, events: out };
-    return out;
-  }
-
-  /**
-   * 追加一条事件。
-   *
-   * 三件事：
-   *   1. 补信封（eventVersion / id / origin / name / ts）—— **本地写的时候不补，
-   *      推给 Hub 时校验器一定会拒**（origin 缺失）
-   *   2. 同 id 只留第一条（§6.5）：重投、拉回来又写一遍都不该翻倍
-   *   3. 超过上限按行裁最老的
-   *
-   * 注意 `task` 事件的 `id`：信封的 id 是 `ev_...`，任务标识只看 `taskId`。
-   * 老数据（0.1.0）反过来把任务 id 放在 `id` 里，面板那边已经兼容，这里不迁就。
-   */
-  function appendEvent(ev, opts = {}) {
-    const all = readEvents();
-    if (ev && ev.id && all.some((e) => e.id === ev.id)) return ev;
-
-    let stamped = ev;
-    if (!opts.raw) {
-      const hasEventId = typeof ev.id === 'string' && ev.id.startsWith('ev_');
-      stamped = {
-        eventVersion: 2,
-        origin: identity.origin,
-        name: getSettings().selfName || '',
-        ...ev,
-        id: hasEventId ? ev.id : makeEventId(identity.origin),
-      };
-      if (!stamped.ts) stamped.ts = localIso();
-    }
-
-    appendFileSync(LOG, JSON.stringify(stamped) + '\n', 'utf8');
-    cache = { mtime: -1, size: -1, events: [] };
-    const after = readEvents();
-    const limit = getSettings().maxEvents;
-    if (after.length > limit) {
-      const kept = after.slice(-limit);
-      writeFileSync(LOG, kept.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
-      cache = { mtime: -1, size: -1, events: [] };
-    }
-    return stamped;
-  }
-
-  /** 本机还没拿到序号的事件（要推给 Hub）。 */
-  function pendingEvents() {
-    return readEvents().filter((e) => e && e.id && !hasSyncStamp(e) && e.origin === identity.origin);
-  }
-
-  /* ─────────────── lan-share 收件 → 日志 ─────────────── */
-
-  let seen = [];
-  try { seen = JSON.parse(readFileSync(SEEN_FILE, 'utf8')); } catch { seen = []; }
-  if (!Array.isArray(seen)) seen = [];
-  let lastLanSize = -1;
-
-  function syncInbox() {
-    if (!syncLanInbox || !existsSync(LAN_STATE)) return;
-    let raw;
-    try { raw = readFileSync(LAN_STATE, 'utf8'); } catch { return; }
-    if (raw.length === lastLanSize) return;
-    lastLanSize = raw.length;
-
-    let st;
-    try { st = JSON.parse(raw); } catch { return; }
-    const inbox = Array.isArray(st?.inbox) ? st.inbox : [];
-    const fresh = [];
-    for (const e of inbox) {
-      if (!e || typeof e.id !== 'string' || seen.includes(e.id)) continue;
-      const ts = e.receivedAt ? localIso(new Date(e.receivedAt)) : localIso();
-      if (e.kind === 'text' || typeof e.text === 'string') {
-        fresh.push({ ts, kind: 'msg', from: e.peerName || '对方', text: String(e.text || ''), via: 'lan-share' });
-      } else {
-        fresh.push({ ts, kind: 'artifact', path: e.name || '(文件)', note: `来自 ${e.peerName || '对方'} 的文件` });
-      }
-      seen.push(e.id);
-    }
-    if (fresh.length === 0) return;
-    for (const ev of fresh) appendEvent(ev);
-    try { writeFileSync(SEEN_FILE, JSON.stringify(seen.slice(-800)), 'utf8'); } catch { /* 下次再写 */ }
-  }
 
   /* ───────────────────── 自动唤醒（有新消息时叫醒本机 agent） ───────────────────── */
 
@@ -517,18 +197,7 @@ export function apply(ctx, rawConfig = {}) {
 
   /** 推送成功：把 Hub 分的 `(epoch, seq)` 记进 sidecar，读取时补上。 */
   function onPushed(accepted) {
-    let dirty = false;
-    for (const row of Array.isArray(accepted) ? accepted : []) {
-      if (!row || !row.id || row.duplicate) continue;
-      if (Number.isFinite(row.epoch) && Number.isFinite(row.seq)) {
-        seqMap[row.id] = [row.epoch, row.seq];
-        dirty = true;
-      }
-    }
-    if (dirty) {
-      persistSeqMap();
-      cache = { mtime: -1, size: -1, events: [] };
-    }
+    markSynced(accepted);
   }
 
   /**
@@ -539,8 +208,8 @@ export function apply(ctx, rawConfig = {}) {
    * 把它整个丢掉，于是「我自己认领完，我看不见它变成 running」。
    */
   function onPulled(events) {
-    let dirty = false;
     const freshly = [];
+    const synced = [];
     const known = new Set(
       readEvents().map((e) => (e && typeof e.id === 'string' ? e.id : '')).filter(Boolean),
     );
@@ -551,13 +220,10 @@ export function apply(ctx, rawConfig = {}) {
         known.add(ev.id);
         freshly.push(ev);
       }
-      if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq)) {
-        seqMap[ev.id] = [ev.epoch, ev.seq];
-        dirty = true;
-      }
+      if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq)) synced.push(ev);
     }
-    if (dirty) persistSeqMap();
-    cache = { mtime: -1, size: -1, events: [] };
+    if (synced.length) markSynced(synced);
+    invalidate();
     // 只有**真正新落盘的**事件才考虑唤醒（重复拉回来、补序号都不算）
     if (freshly.length) considerWake(freshly);
   }
@@ -752,13 +418,15 @@ export function apply(ctx, rawConfig = {}) {
       : (opts.full === true ? 0 : readCursor);
     const limit = Math.max(1, Math.min(100, Number(opts.limit) || 20));
 
-    // 任务表：后写覆盖
-    const tasks = new Map();
-    for (const ev of all) {
-      if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
-      const prev = tasks.get(ev.taskId);
-      if (!prev || compareEvents(ev, prev) > 0) tasks.set(ev.taskId, ev);
-    }
+    // 任务表：后写覆盖（判据在 selectable.mjs，别在这儿再写一遍）
+    const tasks = latestTasks(all);
+    const verdicts = new Map(
+      claimableTasks(all, {
+        selfOrigin: identity.origin,
+        capabilities: capabilityPayload().all,
+        includeArchived: true,
+      }).map((row) => [row.task.taskId, row]),
+    );
 
     const mine = [];
     const pending = [];
@@ -774,7 +442,17 @@ export function apply(ctx, rawConfig = {}) {
       if (t.owner === identity.origin) {
         if (t.status === 'running' || t.status === 'blocked') mine.push(brief);
       } else if (t.status === 'pending' && !t.owner) {
-        pending.push(brief);
+        // 待认领池：把它「为什么还不能接」一起给出去。
+        // 只有 taskId 和标题的话，agent 会以为每张 pending 它都能接。
+        const v = verdicts.get(t.taskId);
+        pending.push({
+          ...brief,
+          claimable: Boolean(v && v.ok),
+          ...(v && !v.ok && v.reason ? { blockedBy: v.reason } : {}),
+          ...(missingCapabilities(t, capabilityPayload().all).length
+            ? { missingCapabilities: missingCapabilities(t, capabilityPayload().all) }
+            : {}),
+        });
       }
     }
 
@@ -915,10 +593,7 @@ export function apply(ctx, rawConfig = {}) {
               // 清掉的是任务、对话、进度这些内容；成员名单留着。
               const kept = readEvents().filter((e) => e && e.kind === 'member');
               writeFileSync(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '', 'utf8');
-              writeFileSync(SEEN_FILE, '[]', 'utf8');
-              seen = [];
-              lastLanSize = -1;
-              cache = { mtime: -1, size: -1, events: [] };
+              invalidate();
               return jsonReply(res, 200, { ok: true, keptMembers: kept.length });
             } catch (err) {
               return jsonReply(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -1593,31 +1268,12 @@ export function apply(ctx, rawConfig = {}) {
   const autoTried = new Set();
 
   function pickClaimable(events) {
-    const tasks = new Map();
-    for (const ev of events) {
-      if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
-      const prev = tasks.get(ev.taskId);
-      if (!prev || compareEvents(ev, prev) > 0) tasks.set(ev.taskId, ev);
-    }
-    const mine = new Set(capabilityPayload().all.map((c) => String(c).toLowerCase()));
-    const out = [];
-    for (const task of tasks.values()) {
-      if (task.status !== 'pending' || task.owner) continue;
-      if (task.archived) continue;
-      if (task.origin === identity.origin) continue;
-      if (autoTried.has(task.taskId)) continue;
-      const deps = Array.isArray(task.dependsOn) ? task.dependsOn : [];
-      const depsOk = deps.every((d) => {
-        const dep = tasks.get(d);
-        return dep && (dep.status === 'done' || dep.status === 'cancelled');
-      });
-      if (!depsOk) continue;
-      const caps = Array.isArray(task.requiredCapabilities) ? task.requiredCapabilities : [];
-      const capsOk = caps.every((c) => mine.has(String(c).toLowerCase()));
-      if (!capsOk) continue;
-      out.push(task);
-    }
-    return out;
+    // 判据只有一份，在 selectable.mjs。这里只加「这轮已经试过就别再试」。
+    const list = claimableOnly(events, {
+      selfOrigin: identity.origin,
+      capabilities: capabilityPayload().all,
+    });
+    return list.filter((task) => !autoTried.has(task.taskId));
   }
 
   ctx.effect(() => {
@@ -1703,25 +1359,14 @@ export function apply(ctx, rawConfig = {}) {
         if (now - lastScanAt < every) return;
         lastScanAt = now;
 
-        const tasks = new Map();
-        for (const ev of readEvents()) {
-          if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
-          const prev = tasks.get(ev.taskId);
-          if (!prev || compareEvents(ev, prev) > 0) tasks.set(ev.taskId, ev);
-        }
-
-        const mine = new Set(capabilityPayload().all.map((c) => String(c).toLowerCase()));
-        for (const task of tasks.values()) {
-          if (task.status !== 'pending' || task.owner) continue;
-          if (task.archived) continue;
-          const depsOk = (Array.isArray(task.dependsOn) ? task.dependsOn : []).every((d) => {
-            const dep = tasks.get(d);
-            return dep && (dep.status === 'done' || dep.status === 'cancelled');
-          });
-          if (!depsOk) continue;
-          const capsOk = (Array.isArray(task.requiredCapabilities) ? task.requiredCapabilities : [])
-            .every((c) => mine.has(String(c).toLowerCase()));
-          if (!capsOk) continue;
+        // 和自动认领同一份判据：**自己建的卡不喊**。之前这里漏了排除，
+        // 于是同一张卡「认领不接、提醒却喊」，两个信号互相打脸。
+        const rows = claimableTasks(readEvents(), {
+          selfOrigin: identity.origin,
+          capabilities: capabilityPayload().all,
+        });
+        for (const { task, ok } of rows) {
+          if (!ok) continue;
           if (wakeNotified.get(task.taskId) === task.status) continue;
           wakeNotified.set(task.taskId, task.status);
           const ev = buildEvent({
@@ -1783,17 +1428,6 @@ export function apply(ctx, rawConfig = {}) {
       hubRuntime.client = null;
       hubRuntime.server = null;
     };
-  });
-
-  /* ───────────────────── 启动收件同步 ───────────────────── */
-
-  ctx.effect(() => {
-    syncInbox();
-    const timer = setInterval(() => {
-      try { syncInbox(); } catch { /* 单次失败不拖垮循环 */ }
-    }, intervalMs);
-    if (typeof timer.unref === 'function') timer.unref();
-    return () => clearInterval(timer);
   });
 
   /* ───────────────────── 启动能力自检 ───────────────────── */
