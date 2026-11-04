@@ -139,6 +139,14 @@ async function main() {
   const state = await hit(routes, '/collab-board/state');
   check('/state 读得到', state.payload?.total === 1, String(state.payload?.total));
 
+  const ver = await hit(routes, '/collab-board/version');
+  check('/version 200', ver.status === 200);
+  check('/version 报的是宿主包版本', /^\d+\.\d+\.\d+$/.test(String(ver.payload?.version)), String(ver.payload?.version));
+  check('/version 带 origin / role / headSeq',
+    /^[0-9a-f]{16}$/.test(String(ver.payload?.origin))
+    && typeof ver.payload?.role === 'string'
+    && 'headSeq' in (ver.payload || {}));
+
   const identityFile = join(dataDir, 'identity.json');
   check('生成了 identity.json', existsSync(identityFile));
   const identity = JSON.parse(readFileSync(identityFile, 'utf8'));
