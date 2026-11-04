@@ -37,6 +37,22 @@ export const inject = [];
 /** 面板与数据接口的根路径。改它要同步改 src/client/index.js 的 API。 */
 const PANEL_BASE = '/collab-board';
 
+/**
+ * 宿主包版本：启动时从 package.json 读一次。
+ *
+ * 为什么不手写常量：客户端那串 `v0.10.6 · b19` 是浏览器加载的 bundle，
+ * 页面不刷新就一直是旧的；宿主进程又是启动时加载的。两者都可能落后。
+ * 面板要判「宿主到底加载了哪版」，只能问宿主自己 —— 这个常量就是回答。
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+    return String(pkg.version || '0.0.0');
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 /** 本地时间的 ISO 串，带 +08:00 这类偏移 —— 看板直接显示，不用再换算。 */
 function localIso(date = new Date()) {
   const p = (n) => String(n).padStart(2, '0');
@@ -542,6 +558,47 @@ export function apply(ctx, rawConfig = {}) {
             const u = new URL(req.url ?? '/', 'http://panel.local');
             const since = Number(u.searchParams.get('since') ?? 0);
             return jsonReply(res, 200, panelState(Number.isFinite(since) && since > 0 ? since : 0));
+          },
+        },
+        {
+          /**
+           * 宿主版本探针（0.10.6）。
+           *
+           * 存在的理由：面板标题那串 `v0.10.6 · b19` 是客户端常量，页面不刷新就一直
+           * 是旧的；宿主体又是进程启动时加载的。两边都可能落后，光看数字判不出
+           * 「宿主到底加载了哪版」。这个接口问的是宿主进程自己 —— 它报什么，
+           * 就是它启动时加载的那份 package.json。
+           */
+          kind: 'exact',
+          path: `${PANEL_BASE}/version`,
+          handler: async (req, res) => {
+            if (req.method !== 'GET') return jsonReply(res, 405, { ok: false, error: 'method' });
+            let serverInfo = null;
+            try { serverInfo = hubRuntime.server ? hubRuntime.server.info() : null; } catch { serverInfo = null; }
+            return jsonReply(res, 200, {
+              ok: true,
+              plugin: 'dsh-collab-board',
+              version: PLUGIN_VERSION,
+              role: hubRuntime.role,
+              origin: identity.origin,
+              name: displayName(),
+              hostStartedAt: hubRuntime.startedAt || '',
+              hubStartedAt: serverInfo?.startedAt || '',
+              epoch: Number.isFinite(Number(serverInfo?.epoch)) ? Number(serverInfo.epoch) : null,
+              headSeq: Number.isFinite(Number(serverInfo?.headSeq)) ? Number(serverInfo.headSeq) : null,
+              /**
+               * 唤醒链路状态。没有它，「没叫醒」就只能猜：是开关没开、
+               * 没有活会话，还是 prompt 报错了 —— 三种都表现为「没反应」。
+               * 报出来之后，另一台机器（或人）一眼能分出是哪一种。
+               */
+              wake: {
+                on: getSettings().wakeOnMessage === true,
+                busy: wakeState.busy,
+                lastAt: wakeState.lastAtIso || '',
+                lastError: wakeState.lastError || '',
+              },
+              dataDir,
+            });
           },
         },
         {
