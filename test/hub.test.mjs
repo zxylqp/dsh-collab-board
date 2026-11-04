@@ -289,6 +289,106 @@ async function main() {
   const t3CountAfter = pullAgain.data.events.filter((e) => e.taskId === 't3').length;
   check('重复 done 不重复解锁（条件二）', t3CountAfter === t3CountBefore, `${t3CountBefore} → ${t3CountAfter}`);
 
+  console.log('\n5d. owner 旁路：普通写不许抢已认领的卡');
+  // 认领本来走 /tasks/claim 的串行 CAS，但普通 task 事件也能写 owner ——
+  // 不堵住的话，任何人推一条事件就能把别人的卡抢走。
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00009_ooo',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own1',
+        title: 'owner 旁路测试卡',
+        status: 'pending',
+      }],
+    },
+  });
+  const claimOwn = await call(base, '/tasks/claim', {
+    method: 'POST',
+    token: tokenB,
+    body: { taskId: 'own1', claimId: 'cl_own_b' },
+  });
+  check('B 认领了 own1', claimOwn.ok === true, JSON.stringify(claimOwn.error));
+
+  const steal = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00010_sss',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own1',
+        title: '抢过来',
+        status: 'running',
+        owner: ORIGIN_A,
+      }],
+    },
+  });
+  check('普通写抢别人认领的卡 → 403', steal.status === 403 && steal.error.code === 'forbidden',
+    JSON.stringify(steal.error));
+  check('403 带 field=owner', steal.error.field === 'owner');
+
+  // 改标题时不该被迫带上 owner，也不该因为没带就被当成「释放」
+  const editNoOwner = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00011_ttt',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own1',
+        title: '改了标题',
+        status: 'running',
+      }],
+    },
+  });
+  check('不带 owner 的改标题：放行', editNoOwner.ok === true, JSON.stringify(editNoOwner.error));
+  const pullOwn = await call(base, '/events?since=0', { token: tokenC });
+  const ownLatest = pullOwn.data.events
+    .filter((e) => e.taskId === 'own1')
+    .sort((a, b) => a.seq - b.seq)
+    .pop();
+  check('owner 被继承，没被清掉', ownLatest && ownLatest.owner === ORIGIN_B, ownLatest && ownLatest.owner);
+
+  const releaseOther = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00012_uuu',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own1',
+        title: '改了标题',
+        status: 'running',
+        owner: '',
+      }],
+    },
+  });
+  check('替别人释放 → 403', releaseOther.status === 403);
+
+  const releaseSelf = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00013_vvv',
+        origin: ORIGIN_B,
+        kind: 'task',
+        taskId: 'own1',
+        title: '改了标题',
+        status: 'pending',
+        owner: '',
+      }],
+    },
+  });
+  check('自己释放自己认领的卡：放行', releaseSelf.ok === true, JSON.stringify(releaseSelf.error));
+
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;
   const beforeEpoch = hub.controller.info().epoch;
