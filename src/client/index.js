@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 17;
-    const VERSION = '0.10.4';
+    const BUILD = 18;
+    const VERSION = '0.10.5';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -303,7 +303,9 @@ window.__ModuleLoader__.load({
 .cb-cap[data-manual]::before{background:var(--dsw-alias-state-warn-primary);}
 .cb-members{flex:1;min-height:0;display:flex;gap:14px;}
 .cb-members-list{width:300px;flex:none;display:flex;flex-direction:column;min-height:0;}
-.cb-members-detail{flex:1;min-width:0;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:10px;}
+.cb-members-detail{flex:1;min-width:0;min-height:0;overflow-y:auto;display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(360px,1fr));align-content:start;gap:12px;}
+.cb-members-detail>.cb-banner{grid-column:1/-1;}
 .cb-narrow .cb-members{flex-direction:column;gap:10px;}
 .cb-narrow .cb-members-list{width:auto;flex:none;max-height:210px;}
 .cb-narrow .cb-members-detail{overflow-y:auto;}
@@ -1810,27 +1812,20 @@ window.__ModuleLoader__.load({
             self: false,
             inferred: false,
           }));
-        // 只出现在消息里的人（老数据没有 member 事件），标成「离线 · 仅名字」
-        for (const [name, ts] of model.senders) {
-          if (name === self.name) continue;
-          if (others.some((m) => m.name === name)) continue;
-          others.push({
-            origin: 'name:' + name,
-            name,
-            status: 'offline',
-            capabilities: [],
-            seenAt: ts,
-            inferred: true,
-            self: false,
-          });
-        }
+        /**
+         * 这里**不再**把「只在消息里出现过的名字」折成成员。
+         * 以前这么干过：两台机器的 member 事件名和消息里的发言名对不上
+         * （比如机器名 DESKTOP-… 和 涟涟），于是列表里多出一排
+         * 「离线 · 只在消息里见过」的幽灵，删不掉也认不出是谁。
+         * 成员只认 member 事件 + 本机自己，看不出谁是谁是发包方的责任，不是这里猜。
+         */
         return [self, ...others].sort((a, b) => {
           const oa = a.self ? -1 : (isOnline(a.status) ? 0 : 1);
           const ob = b.self ? -1 : (isOnline(b.status) ? 0 : 1);
           if (oa !== ob) return oa - ob;
           return a.name.localeCompare(b.name);
         });
-      }, [model.members, model.senders, settings.selfName, caps.all]);
+      }, [model.members, settings.selfName, caps.all]);
 
       /** 本地隐藏的成员（只影响这台机器的视图，不改事件流）。 */
       const hiddenSet = new Set(
@@ -2330,11 +2325,15 @@ window.__ModuleLoader__.load({
       }, []);
 
       const memberCount = useMemo(() => {
-        const names = new Set([settings.selfName || '本机']);
-        for (const m of model.members) names.add(m.name);
-        for (const name of model.senders.keys()) names.add(name);
-        return names.size;
-      }, [model.members, model.senders, settings.selfName]);
+        // 只数真实成员（member 事件）+ 本机自己；消息里出现过的名字不算人 ——
+        // 否则「本机」「涟涟」「汐汐（自测）」这些历史发言会把人数撑成 5 位。
+        const selfName = settings.selfName || '本机';
+        const origins = new Set();
+        for (const m of model.members) {
+          if (m.name !== selfName) origins.add(m.origin);
+        }
+        return origins.size + 1;
+      }, [model.members, settings.selfName]);
 
       const roleLabel = hub && hub.server
         ? 'Hub 主机'
