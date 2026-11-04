@@ -25,7 +25,7 @@ import { writeAtomic } from './http-util.mjs';
  * @param {()=>number} opts.maxEventsOf 日志上限
  * @param {()=>string} opts.localIso  时间戳格式
  */
-export function createStore({ logPath, seqFile, origin, nameOf, maxEventsOf, localIso }) {
+export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, maxEventsOf, localIso }) {
   let cache = { mtime: -1, size: -1, events: [] };
 
   /** id → [epoch, seq]。推给 Hub 成功后回写，读日志时补上。 */
@@ -34,6 +34,32 @@ export function createStore({ logPath, seqFile, origin, nameOf, maxEventsOf, loc
     const raw = JSON.parse(readFileSync(seqFile, 'utf8'));
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) seqMap = raw;
   } catch { seqMap = {}; }
+
+  /**
+   * 被 Hub 明确拒绝过、不再重推的事件 id。
+   *
+   * 之前只放在客户端内存里：重启一轮就忘，那条脏事件会再被重推一次、
+   * 再被拒一次、再落一条 warn note —— 而且它还会一直算在「待同步」里，
+   * 面板上永远挂着一个灰点。落到磁盘，一次拒绝管到底。
+   */
+  let rejectedIds = new Set();
+  try {
+    const raw = rejectedFile ? JSON.parse(readFileSync(rejectedFile, 'utf8')) : [];
+    if (Array.isArray(raw)) rejectedIds = new Set(raw.filter((x) => typeof x === 'string' && x));
+  } catch { rejectedIds = new Set(); }
+
+  function persistRejected() {
+    if (!rejectedFile) return;
+    try { writeAtomic(rejectedFile, JSON.stringify([...rejectedIds])); } catch { /* 丢了下次重推，幂等 */ }
+  }
+
+  /** 标记一条事件「Hub 不认」，从看板/待同步里摘掉（文件里仍保留原文）。 */
+  function markRejected(id) {
+    if (typeof id !== 'string' || id === '' || rejectedIds.has(id)) return;
+    rejectedIds.add(id);
+    persistRejected();
+    invalidate();
+  }
 
   function persistSeqMap() {
     try { writeAtomic(seqFile, JSON.stringify(seqMap)); } catch { /* 丢了就重推，幂等 */ }
@@ -69,8 +95,10 @@ export function createStore({ logPath, seqFile, origin, nameOf, maxEventsOf, loc
         e.seq = stamp[1];
       }
     }
-    cache = { mtime: st.mtimeMs, size: st.size, events: out };
-    return out;
+    // 被 Hub 拒掉的不进视图：文件里保留原文（事实源不改），但看板/待同步/折叠都不该再看它
+    const kept = out.filter((e) => !(e && e.id && rejectedIds.has(e.id)));
+    cache = { mtime: st.mtimeMs, size: st.size, events: kept };
+    return kept;
   }
 
   /**
@@ -138,5 +166,5 @@ export function createStore({ logPath, seqFile, origin, nameOf, maxEventsOf, loc
     }
   }
 
-  return { readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate, markSynced };
+  return { readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate, markSynced, markRejected };
 }
