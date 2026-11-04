@@ -22,7 +22,13 @@ import { homedir, hostname } from 'node:os';
 import { loadIdentity } from './identity.mjs';
 import { createHubClient } from './hub-client.mjs';
 import { startHub } from './hub.mjs';
-import { claimableOnly, claimableTasks, latestTasks, missingCapabilities } from './selectable.mjs';
+import {
+  claimableOnly,
+  claimableTasks,
+  latestTasks,
+  missingCapabilities,
+  ownerTransitionError,
+} from './selectable.mjs';
 
 export const name = 'collab-board';
 /** 不依赖任何服务就能活；webServer / tools 都是有了才注册。 */
@@ -526,10 +532,12 @@ export function apply(ctx, rawConfig = {}) {
               const body = await readBody(req);
               const ev = buildEvent(body);
               if (!ev) return jsonReply(res, 400, { ok: false, error: 'kind 不认识' });
+              assertOwnerTransition(body, ev);
               appendEvent(ev);
               return jsonReply(res, 200, { ok: true, event: ev });
             } catch (err) {
-              return jsonReply(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+              const status = err?.code === 'forbidden' ? 403 : 400;
+              return jsonReply(res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
             }
           },
         },
@@ -878,6 +886,8 @@ export function apply(ctx, rawConfig = {}) {
         async execute(args) {
           const ev = buildEvent(args ?? {});
           if (!ev) throw new Error('kind 不认识：' + String(args?.kind));
+          // 本地先挡：抢别人认领的卡这种事件推上去必被拒，写进日志只会堵住队列
+          assertOwnerTransition(args ?? {}, ev);
           appendEvent(ev);
           return { ok: true, text: '已写进看板：' + JSON.stringify(ev).slice(0, 200) };
         },
@@ -1245,6 +1255,39 @@ export function apply(ctx, rawConfig = {}) {
         };
       default:
         return undefined;
+    }
+  }
+
+  /**
+   * 写之前的本地预检 —— 只查 `task` 的 owner 迁移。
+   *
+   * 为什么非查不可：Hub 拒事件时是**整批**拒（`validateBatch` 一失败，一趟请求全废），
+   * 而客户端不标记失败项。一条非法事件留在本地日志里，就会每 3 秒重推一次、
+   * 每次都把整批连坐 —— 这台机器的同步从此停摆，看板上再也收不到新东西。
+   *
+   * 本地视图可能落后（别人刚认领、这边还没拉到），所以这里过了**不代表** Hub 会过；
+   * 但能挡住「明知是别人的卡还写自己」这一类 —— 那种推上去一定被拒。
+   *
+   * 判据和 Hub 共用 `selectable.mjs` 的 `ownerTransitionError()`。
+   */
+  function assertOwnerTransition(input, ev) {
+    if (!ev || ev.kind !== 'task') return;
+    const tasks = latestTasks(readEvents());
+    const prev = tasks.get(ev.taskId);
+    // buildEvent 会把缺失的 owner 补成空串，那样「没传 owner」就变成了「释放」。
+    // 所以要看原始入参里到底有没有这个字段。
+    const explicitOwner = input && typeof input === 'object' && 'owner' in input;
+    const nextOwner = explicitOwner ? ev.owner : (prev ? prev.owner : '');
+    const err = ownerTransitionError({
+      nextOwner,
+      prevOwner: prev ? prev.owner : '',
+      writer: identity.origin,
+      hasTask: Boolean(prev),
+    });
+    if (err) {
+      const e = new Error(err.message);
+      e.code = 'forbidden';
+      throw e;
     }
   }
 
