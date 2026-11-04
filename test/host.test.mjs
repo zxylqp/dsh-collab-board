@@ -7,7 +7,7 @@
  *
  * 跑：node test/host.test.mjs
  */
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
@@ -293,6 +293,56 @@ async function main() {
   const selfCard = afterSelf.filter((e) => e.taskId === 'auto2' && e.kind === 'task').pop();
   check('自己建的卡不被自己抢', Boolean(selfCard) && !selfCard.owner,
     JSON.stringify({ owner: selfCard?.owner, status: selfCard?.status }));
+
+  console.log('\n7b. 本地预检：抢卡在写日志之前就被挡掉');
+  // 为什么要本地挡：Hub 拒事件时整批拒，脏事件留在日志里会每轮重推、连坐整批。
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', id: 'guard1', title: '本地预检测试卡', status: 'pending' },
+  });
+  const postTool = findTool(tools, 'collab_post');
+  let stealErr = null;
+  try {
+    await postTool.execute({
+      kind: 'task', id: 'guard1', taskId: 'guard1',
+      title: '想抢', status: 'running', owner: otherOrigin,
+    });
+  } catch (e) { stealErr = e; }
+  check('抢卡被本地预检拒掉', Boolean(stealErr) && /别人认领|不能把 owner 写成别人/.test(String(stealErr.message)),
+    String(stealErr && stealErr.message));
+  const logAfterSteal = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  check('脏事件没写进日志', !logAfterSteal.some((e) => e.taskId === 'guard1' && e.owner === otherOrigin));
+
+  console.log('\n7c. 脏事件不堵队列（整批被拒时的逐条降级）');
+  // 手工往日志里塞一条 Hub 必拒的事件：新建任务却写着别人的 owner。
+  // 模拟旧版本客户端、或者直接改日志写进来的数据 —— 它不该让这台机器失去同步。
+  const dirtyId = 'ev_dirty_00001_zzz';
+  appendFileSync(logPath, JSON.stringify({
+    eventVersion: 2,
+    id: dirtyId,
+    origin: identity.origin,
+    name: '',
+    ts: new Date().toISOString(),
+    kind: 'task',
+    taskId: 'dirty1',
+    title: 'Hub 一定不认的一条',
+    status: 'pending',
+    owner: 'ffffeeeeddddcccc',
+  }) + '\n');
+  const msgRes = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', from: '测试', text: '这条必须推得上去' },
+  });
+  check('合法消息写进日志了', msgRes.status === 200 && msgRes.payload?.ok === true);
+  await new Promise((r) => setTimeout(r, 6000));
+  const afterDirty = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const legitMsg = afterDirty.find((e) => e.kind === 'msg' && String(e.text || '').includes('这条必须推得上去'));
+  // Hub 分的 seq 不回写 events.jsonl（那是只追加的事实源），存在 .synced.json 里。
+  // 所以「推上去了没有」看 sidecar，不看日志。
+  const syncedMap = JSON.parse(readFileSync(join(dataDir, '.synced.json'), 'utf8'));
+  check('合法消息没被脏事件连坐（拿到了 Hub 的 seq）',
+    Boolean(legitMsg && syncedMap[legitMsg.id]), JSON.stringify({ id: legitMsg?.id }));
+  check('脏事件被跳过（不在 seqMap 里）', !syncedMap[dirtyId], JSON.stringify({ dirty: syncedMap[dirtyId] }));
 
   console.log('\n8. 增量读看板（collab_state）');
   const stateTool = findTool(tools, 'collab_state');
