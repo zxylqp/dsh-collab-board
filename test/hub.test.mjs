@@ -255,7 +255,7 @@ async function main() {
       }],
     },
   });
-  check('B 把 t1 标完成', doneT1.ok === true);
+  check('B 把 t1 标完成', doneT1.ok === true, JSON.stringify(doneT1.error || doneT1).slice(0, 300));
 
   const pullAfterDone = await call(base, '/events?since=0', { token: tokenC });
   const t3Events = pullAfterDone.data.events
@@ -388,6 +388,76 @@ async function main() {
     },
   });
   check('自己释放自己认领的卡：放行', releaseSelf.ok === true, JSON.stringify(releaseSelf.error));
+
+  console.log('\n5b. 身份撞号：taskId 归创建者');
+  const mkOwn2 = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00014_www',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own2',
+        title: 'A 的卡',
+        detail: '原描述',
+        status: 'pending',
+      }],
+    },
+  });
+  check('A 建 own2', mkOwn2.ok === true, JSON.stringify(mkOwn2.error));
+
+  const clobber = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00015_xxx',
+        origin: ORIGIN_B,
+        kind: 'task',
+        taskId: 'own2',
+        title: 'B 想整条覆盖',
+        status: 'pending',
+      }],
+    },
+  });
+  check('非创建者改标题 → 409 conflict', clobber.status === 409 && clobber.error.code === 'conflict',
+    JSON.stringify(clobber.error));
+  check('409 带 field=taskId', clobber.error.field === 'taskId');
+
+  const doneByB = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00016_yyy',
+        origin: ORIGIN_B,
+        kind: 'task',
+        taskId: 'own2',
+        title: 'A 的卡',
+        detail: '原描述',
+        status: 'done',
+      }],
+    },
+  });
+  check('非创建者标完成（标题没动）→ 放行', doneByB.ok === true, JSON.stringify(doneByB.error));
+
+  const renameByA = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00017_zzz',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own2',
+        title: 'A 改了标题',
+        detail: '原描述',
+        status: 'done',
+      }],
+    },
+  });
+  check('创建者改自己的卡 → 放行', renameByA.ok === true, JSON.stringify(renameByA.error));
 
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;
