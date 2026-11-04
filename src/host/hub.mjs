@@ -31,6 +31,7 @@ import {
 import { SYSTEM_ORIGIN } from './identity.mjs';
 import { createDiscovery, createHubWatch } from './discovery.mjs';
 import { json, readBody, writeAtomic } from './http-util.mjs';
+import { ownerTransitionError } from './selectable.mjs';
 
 /** 心跳 15 秒一次，45 秒无响应视为离线（§13 成员态）。 */
 export const HEARTBEAT_MS = 15000;
@@ -636,15 +637,16 @@ export async function startHub(opts = {}) {
    */
   function checkOwnerWrite(ev, writer) {
     const prev = tasks.get(ev.taskId);
-    const next = typeof ev.owner === 'string' ? ev.owner : '';
-    if (!prev) {
-      if (next && next !== writer) return { message: `新建任务不能把 owner 写成别人（${next.slice(0, 8)}…）` };
-      return null;
-    }
-    const cur = typeof prev.owner === 'string' ? prev.owner : '';
-    if (next === cur) return null;
-    if (cur === '' && next === writer) return null;
-    if (cur === writer && next === '') return null;
+    // 规则本体在 selectable.mjs —— 宿主本地预检用的也是同一份，别在这儿再抄一遍。
+    const err = ownerTransitionError({
+      nextOwner: ev.owner,
+      prevOwner: prev ? prev.owner : '',
+      writer,
+      hasTask: Boolean(prev),
+    });
+    if (!err) return null;
+    const cur = typeof prev?.owner === 'string' ? prev.owner : '';
+    if (!cur) return err;
     const ownerName = [...members.values()].find((m) => m.origin === cur)?.name || `${cur.slice(0, 6)}…`;
     return { message: `不能改别人认领的任务（当前是 ${ownerName}）；要抢先用 /tasks/claim` };
   }
