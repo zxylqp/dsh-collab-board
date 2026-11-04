@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
+import { claimableTasks, earliestByTask } from '../src/host/selectable.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -301,6 +302,12 @@ async function main() {
   check('归我的卡在 mine 里', Array.isArray(stateFirst.mine) && stateFirst.mine.length >= 1,
     JSON.stringify(stateFirst.mine?.map((t) => t.taskId)));
 
+  // 待认领池要带上「为什么还不能接」——否则 agent 以为每张 pending 都能接
+  const auto2Pending = stateFirst.pending.find((t) => t.taskId === 'auto2');
+  check('自己建的卡在 pending 里标了不可接',
+    Boolean(auto2Pending) && auto2Pending.claimable === false && auto2Pending.blockedBy === 'own',
+    JSON.stringify(auto2Pending));
+
   const stateSecond = JSON.parse((await stateTool.execute({})).text);
   check('游标推进后再读，未读清零', stateSecond.cursor.unreadTotal === 0, String(stateSecond.cursor.unreadTotal));
   check('第二次不再重复给 mine 之外的旧事件',
@@ -348,6 +355,30 @@ async function main() {
   });
   const settingsAfter = await hit(routes, '/collab-board/settings');
   check('自己发消息不会卡住唤醒锁', settingsAfter.status === 200);
+
+  console.log('\n9b. 可认领判据（唯一一份，在 selectable.mjs）');
+  const A_ORIGIN = 'aaaaaaaaaaaaaaaa';
+  const B_ORIGIN = 'bbbbbbbbbbbbbbbb';
+  const mk = (o) => ({ kind: 'task', epoch: 1, ...o });
+  const cards = [
+    mk({ taskId: 's1', title: 'B 建的空卡', status: 'pending', owner: '', origin: B_ORIGIN, seq: 1, id: 'ev_s1' }),
+    mk({ taskId: 's2', title: 'A 建的空卡', status: 'pending', owner: '', origin: A_ORIGIN, seq: 2, id: 'ev_s2' }),
+    mk({ taskId: 's3', title: '已经有主', status: 'pending', owner: B_ORIGIN, origin: B_ORIGIN, seq: 3, id: 'ev_s3' }),
+    mk({ taskId: 's4', title: '要 gpu', status: 'pending', owner: '', origin: B_ORIGIN, requiredCapabilities: ['gpu'], seq: 4, id: 'ev_s4' }),
+    mk({ taskId: 's5', title: '依赖没完成', status: 'pending', owner: '', origin: B_ORIGIN, dependsOn: ['s2'], seq: 5, id: 'ev_s5' }),
+  ];
+  // s2 被别人改过标题：最新那条事件的 origin 是 B，但建卡人还是 A
+  cards.push(mk({ taskId: 's2', title: 'A 建的（被 B 改过）', status: 'pending', owner: '', origin: B_ORIGIN, seq: 6, id: 'ev_s6' }));
+
+  const selRows = claimableTasks(cards, { selfOrigin: A_ORIGIN, capabilities: ['ffmpeg'] });
+  const reasonOf = new Map(selRows.map((r) => [r.task.taskId, r.reason]));
+  check('别人建的空卡可接', reasonOf.get('s1') === '', String(reasonOf.get('s1')));
+  check('自己建的卡不可接（哪怕被别人改过标题）', reasonOf.get('s2') === 'own', String(reasonOf.get('s2')));
+  check('有主的卡不可接', reasonOf.get('s3') === 'owned');
+  check('缺能力不可接', reasonOf.get('s4') === 'caps');
+  check('依赖没完成不可接', reasonOf.get('s5') === 'deps');
+  check('建卡人看的是最早那条的 origin', earliestByTask(cards).get('s2') === A_ORIGIN,
+    String(earliestByTask(cards).get('s2')));
 
   console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
