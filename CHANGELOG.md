@@ -4,6 +4,51 @@
 
 ---
 
+## 0.10.0
+
+**一次结构整理，不是加功能。** 起因是通读代码时发现：行数不是最大问题，**同一个判断写了五遍、
+已经分叉**才是。四条改动，两条是修人看得见的错。
+
+### 修
+
+- **`owner` 旁路**：认领本来走 `/tasks/claim` 的串行 CAS，但任何人推一条普通 `task` 事件
+  就能把 `owner` 改成自己 —— CAS 只对守规矩的调用方成立。现在 Hub 在写入口拦：
+  `owner` 只许三种迁移（不变 / 空→自己 / 自己→空），其余 403 `forbidden`。
+  想抢别人的卡只能走 claim。**代价**：改标题不再被迫带 `owner`（Hub 会继承当前值），
+  但显式写别人的 `owner` 会被拒 —— 自己造事件的调用方要检查一下。
+- **「该我接的活」判据分叉**：这条判据原来在五处各写一遍。最明显的一处 ——
+  自动认领排除「自己建的卡」，待办提醒没排除，于是同一张卡一个说「我不接」、
+  一个喊「有人接一下」。现在统一到 `selectable.mjs`，三处宿主消费方都调它。
+- **建卡人判错**：`pickClaimable` 用最新一条 `task` 事件的 `origin` 判「谁建的卡」，
+  别人改一次标题 origin 就换人 —— A 建卡、B 改标题，A 会去认领自己建的卡。
+  现在看**最早那条**（`earliestByTask()`）。
+
+### 删
+
+- **lan-share 收件搬运**（`syncLanInbox` / `syncIntervalMs` / `.inbox-synced.json`）。
+  这条路早就废弃了，但 `cfg.syncLanInbox !== false` 默认还是**开**的，
+  每 2 秒读一次 `~/.dsh/lan-share/state.json`。设置里没有开关，面板关不掉。
+  **代价**：cordis config 里传这两个字段不再有任何效果（不会报错，静默忽略）。
+
+### 拆
+
+- `index.mjs` 从 **1811 → 1455**，拆出五个模块：
+  `settings.mjs`（设置 spec / 校验 / 读写）、`capabilities.mjs`（能力探测）、
+  `store.mjs`（事件读写 + seq sidecar）、`selectable.mjs`（可认领判据）、
+  `http-util.mjs`（json / readBody / writeAtomic，和 Hub 共用）。
+  顺带把散在 4 处的缓存失效点收进 `store.invalidate()`。
+- `index.mjs` 里两处 HTTP 小工具的副本删掉了 —— 之前宿主和 Hub 各写一份，
+  差异已经在长（错误消息不同、错误码一个有一个人没有、一个漏了 `req.on('error')`）。
+
+### 变
+
+- `collab_state` 的 `pending` 每条多了 `claimable`，不能接的还带 `blockedBy`
+  （`own` / `owned` / `deps` / `caps`）。之前只给 taskId + 标题，
+  agent 会以为每张 pending 都能接。
+- 测试 **113 → 127 项**（host 57→64，hub 56→63）。
+
+---
+
 ## 0.9.1
 
 **修：Hub 一启动就熔断。**
