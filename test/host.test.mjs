@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, appendFileSync, exist
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
-import { claimableTasks, earliestByTask } from '../src/host/selectable.mjs';
+import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -361,6 +361,18 @@ async function main() {
   check('被拒事件落了 warn note（面板和 agent 都看得见）',
     Boolean(rejectNote), String(rejectNote?.text || '').slice(0, 90));
 
+  // 落盘拉黑：不再算待同步、不进看板视图、重启后也不该再推
+  const hubAfterDirty = await hit(routes, '/collab-board/hub');
+  check('被拒事件不再算「待同步」', Number(hubAfterDirty.payload?.pending) === 0,
+    String(hubAfterDirty.payload?.pending));
+  const rejectedFile = join(dataDir, '.rejected.json');
+  const rejectedIds = existsSync(rejectedFile) ? JSON.parse(readFileSync(rejectedFile, 'utf8')) : null;
+  check('被拒 id 落盘（重启后不再重推）',
+    Array.isArray(rejectedIds) && rejectedIds.includes(dirtyId), JSON.stringify(rejectedIds));
+  const stateAfterDirty = await hit(routes, '/collab-board/state');
+  check('被拒事件不进制看板的视图',
+    !(stateAfterDirty.payload?.events || []).some((e) => e.id === dirtyId));
+
   console.log('\n8. 增量读看板（collab_state）');
   const stateTool = findTool(tools, 'collab_state');
   const stateFirst = JSON.parse((await stateTool.execute({})).text);
@@ -446,6 +458,24 @@ async function main() {
   check('依赖没完成不可接', reasonOf.get('s5') === 'deps');
   check('建卡人看的是最早那条的 origin', earliestByTask(cards).get('s2') === A_ORIGIN,
     String(earliestByTask(cards).get('s2')));
+
+  console.log('\n9c. 折叠时继承 owner（改标题不带 owner 的本机视图）');
+  const fold = [
+    mk({ taskId: 'o1', title: '建卡', status: 'pending', origin: A_ORIGIN, seq: 1, id: 'ev_o1' }),
+    mk({ taskId: 'o1', title: '认领', status: 'running', owner: A_ORIGIN, seq: 2, id: 'ev_o2' }),
+    mk({ taskId: 'o1', title: '改标题（没有 owner 键）', status: 'pending', seq: 3, id: 'ev_o3' }),
+  ];
+  check('最新一条缺 owner → 沿用上一版（本机不再显示无主）',
+    latestTasks(fold).get('o1').owner === A_ORIGIN, JSON.stringify(latestTasks(fold).get('o1').owner));
+  const foldReleased = fold.concat([
+    mk({ taskId: 'o1', title: '显式释放', status: 'running', owner: '', seq: 4, id: 'ev_o4' }),
+  ]);
+  check('显式 owner:"" → 真的变空（释放不被继承挡住）',
+    latestTasks(foldReleased).get('o1').owner === '', JSON.stringify(latestTasks(foldReleased).get('o1').owner));
+  const foldClaimable = claimableTasks(fold, { selfOrigin: A_ORIGIN, capabilities: [] });
+  check('继承后的卡不会被判成可接（有主）',
+    foldClaimable.find((r) => r.task.taskId === 'o1')?.reason === 'owned',
+    String(foldClaimable.find((r) => r.task.taskId === 'o1')?.reason));
 
   console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
