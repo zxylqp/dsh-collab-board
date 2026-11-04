@@ -142,3 +142,46 @@ export function unmetDependencies(task, tasks) {
     return !dep || (dep.status !== 'done' && dep.status !== 'cancelled');
   });
 }
+
+/**
+ * `owner` 迁移规则 —— Hub（权威）和宿主（本地预检）共用这一份。
+ *
+ * 认领本来走 `/tasks/claim` 的串行 CAS，但普通 `task` 事件也能写 owner。
+ * 不管就只有一种结果：谁都能推一条事件把别人的卡抢走。
+ *
+ * 允许三种迁移，其余一律拒：
+ *   1. 不变（改标题 / 状态 / 标签，owner 跟着走）
+ *   2. 空 → 自己（接手一张没人认领的卡）
+ *   3. 自己 → 空（主动释放）
+ *
+ * **为什么本地也要查**：Hub 拒一条事件时，客户端是整批推、整批失败。
+ * 脏事件留在本地日志里会一直重推，把后面的合法事件全堵住。
+ * 所以在写进日志之前先挡一道 —— 本地视图可能落后，这里放过、Hub 拒掉的，
+ * 由客户端逐条降级兜底（hub-client 的 pushOnce）。
+ *
+ * @returns {null|{message: string}} null = 允许
+ */
+export function ownerTransitionError({ nextOwner, prevOwner, writer, hasTask }) {
+  const next = typeof nextOwner === 'string' ? nextOwner : '';
+  const cur = typeof prevOwner === 'string' ? prevOwner : '';
+  const me = typeof writer === 'string' ? writer : '';
+
+  if (!hasTask) {
+    // 新建：不许一出生就写着别人的 owner
+    if (next && next !== me) {
+      return { message: `新建任务不能把 owner 写成别人（${next.slice(0, 8)}…）` };
+    }
+    return null;
+  }
+  if (next === cur) return null;
+  if (cur === '' && next === me) return null;
+  if (cur === me && next === '') return null;
+  if (!cur) {
+    return { message: `不能把 owner 写成别人（${next.slice(0, 8)}…）—— 要么写自己，要么走 /tasks/claim` };
+  }
+  return {
+    message: cur
+      ? `不能改别人认领的任务（当前是 ${cur.slice(0, 8)}…）；要抢先用 /tasks/claim`
+      : 'owner 只能按「不变 / 空→自己 / 自己→空」迁移',
+  };
+}
