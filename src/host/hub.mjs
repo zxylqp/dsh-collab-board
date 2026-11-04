@@ -30,6 +30,7 @@ import {
 } from './events.mjs';
 import { SYSTEM_ORIGIN } from './identity.mjs';
 import { createDiscovery, createHubWatch } from './discovery.mjs';
+import { json, readBody, writeAtomic } from './http-util.mjs';
 
 /** 心跳 15 秒一次，45 秒无响应视为离线（§13 成员态）。 */
 export const HEARTBEAT_MS = 15000;
@@ -38,54 +39,13 @@ export const OFFLINE_MS = 45000;
 export const DEFAULT_LEASE_MS = 10 * 60 * 1000;
 export const MAX_LEASE_MS = 86400000;
 
-const MAX_BODY = MAX_BATCH_BYTES + 256 * 1024;
-
-function json(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.setHeader('cache-control', 'no-store');
-  res.end(body);
-}
-
+/** Hub 的响应外壳：成功带 `data`，失败带 `error` —— 和面板侧的平铺响应不是一回事。 */
 function fail(res, httpStatus, code, message, extra = {}) {
   json(res, httpStatus, { ok: false, error: { code, message, ...extra } });
 }
 
 function ok(res, data) {
   json(res, 200, { ok: true, data });
-}
-
-function readBody(req, limit = MAX_BODY) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > limit) {
-        reject(Object.assign(new Error('请求体太大'), { httpStatus: 413, code: 'too-large' }));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      if (chunks.length === 0) return resolve({});
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        reject(Object.assign(new Error('JSON 解析失败'), { httpStatus: 400, code: 'bad-param' }));
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-/** 写文件用「临时 + rename」，崩溃时不留半截文件。 */
-function writeAtomic(file, text) {
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, text, 'utf8');
-  renameSync(tmp, file);
 }
 
 /**
@@ -658,6 +618,37 @@ export async function startHub(opts = {}) {
     return new URL(req.url || '/', 'http://hub.local');
   }
 
+  /**
+   * 普通写路径的 owner 迁移规则 —— 认领 CAS 的补口（§6.3）。
+   *
+   * 认领本来走 `/tasks/claim` 的串行 CAS，谁也抢不走。但成员还能直接推一条
+   * `kind:task` 的普通事件，把 `owner` 改成自己 —— 那就等于从旁边绕过 CAS。
+   * `HUB_ONLY_FIELDS` 只拦了 `claimedAt` / `leaseMs`，拦不住 `owner`。
+   *
+   * 允许三种迁移，其余一律 403：
+   *   1. 不变（改标题 / 状态 / 标签，owner 跟着走）
+   *   2. 空 → 自己（接手一张没人认领的卡）
+   *   3. 自己 → 空（主动释放）
+   *
+   * 「空 → 自己」不走 CAS，严格说仍是并发窗口；但空卡本来就没有归属可抢，
+   * 两个人的最后一条谁先落盘谁赢，和直接 claim 的结果一致。要真正原子认领
+   * 还是得调 `/tasks/claim`。
+   */
+  function checkOwnerWrite(ev, writer) {
+    const prev = tasks.get(ev.taskId);
+    const next = typeof ev.owner === 'string' ? ev.owner : '';
+    if (!prev) {
+      if (next && next !== writer) return { message: `新建任务不能把 owner 写成别人（${next.slice(0, 8)}…）` };
+      return null;
+    }
+    const cur = typeof prev.owner === 'string' ? prev.owner : '';
+    if (next === cur) return null;
+    if (cur === '' && next === writer) return null;
+    if (cur === writer && next === '') return null;
+    const ownerName = [...members.values()].find((m) => m.origin === cur)?.name || `${cur.slice(0, 6)}…`;
+    return { message: `不能改别人认领的任务（当前是 ${ownerName}）；要抢先用 /tasks/claim` };
+  }
+
   async function handle(req, res) {
     const u = urlOf(req);
     const path = u.pathname.replace(/\/+$/, '') || '/';
@@ -756,7 +747,21 @@ export async function startHub(opts = {}) {
           return fail(res, e.httpStatus || 400, e.code || 'bad-param', e.message);
         }
         const list = Array.isArray(body) ? body : body.events;
-        const r = validateBatch(list, { expectedOrigin: me.origin });
+        /**
+         * owner 继承：改标题时不该被迫把 owner 一起带上，更不该因为没带就被
+         * 当成「释放」。**没显式给 owner 就沿用当前值**；显式给了（包括空串）
+         * 才按 checkOwnerWrite 的迁移规则判。
+         */
+        const prepped = Array.isArray(list)
+          ? list.map((raw) => {
+            if (!raw || raw.kind !== 'task') return raw;
+            const id = String(raw.taskId || raw.id || '').trim();
+            const prev = id ? tasks.get(id) : null;
+            if (prev && !('owner' in raw)) return { ...raw, owner: prev.owner };
+            return raw;
+          })
+          : list;
+        const r = validateBatch(prepped, { expectedOrigin: me.origin });
         if (!r.ok) {
           const httpStatus = r.error.code === 'forbidden' ? 403 : r.error.code === 'too-large' ? 413 : 400;
           return fail(res, httpStatus, r.error.code, r.error.message, r.error.field ? { field: r.error.field } : {});
@@ -769,6 +774,11 @@ export async function startHub(opts = {}) {
           if (dup) {
             accepted.push({ id: ev.id, duplicate: true });
             continue;
+          }
+          // owner 迁移：普通写路径不许抢别人已认领的卡（CAS 的补口）
+          if (ev.kind === 'task') {
+            const blocked = checkOwnerWrite(ev, me.origin);
+            if (blocked) return fail(res, 403, 'forbidden', blocked.message, { field: 'owner' });
           }
           // 依赖环：写进去之前拦，别让自锁的任务落盘（§6.9）
           if (ev.kind === 'task' && Array.isArray(ev.dependsOn) && ev.dependsOn.length > 0) {
