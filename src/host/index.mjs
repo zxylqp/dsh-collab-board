@@ -532,7 +532,7 @@ export function apply(ctx, rawConfig = {}) {
               const body = await readBody(req);
               const ev = buildEvent(body);
               if (!ev) return jsonReply(res, 400, { ok: false, error: 'kind 不认识' });
-              assertOwnerTransition(body, ev);
+              assertOwnerTransition(ev);
               appendEvent(ev);
               return jsonReply(res, 200, { ok: true, event: ev });
             } catch (err) {
@@ -887,7 +887,7 @@ export function apply(ctx, rawConfig = {}) {
           const ev = buildEvent(args ?? {});
           if (!ev) throw new Error('kind 不认识：' + String(args?.kind));
           // 本地先挡：抢别人认领的卡这种事件推上去必被拒，写进日志只会堵住队列
-          assertOwnerTransition(args ?? {}, ev);
+          assertOwnerTransition(ev);
           appendEvent(ev);
           return { ok: true, text: '已写进看板：' + JSON.stringify(ev).slice(0, 200) };
         },
@@ -1193,11 +1193,20 @@ export function apply(ctx, rawConfig = {}) {
           ...base,
           taskId,
           title: isText(input.title) ? input.title.trim().slice(0, 200) : taskId,
-          owner: typeof input.owner === 'string' ? input.owner.trim() : '',
           status: ['pending', 'running', 'blocked', 'done', 'cancelled'].includes(input.status)
             ? input.status
             : 'pending',
         };
+        /**
+         * `owner` 只在调用方**显式**给了的时候写。
+         *
+         * 无条件写 `owner: ''` 会把「改标题」变成「释放」—— 推给 Hub 之后
+         * 会被 owner 迁移规则当成「替别人释放」拒掉（403），
+         * 而且那条事件从此堵在本地队列里。没给 = 沿用 Hub 上的当前值。
+         */
+        if (input && typeof input === 'object' && 'owner' in input) {
+          ev.owner = typeof input.owner === 'string' ? input.owner.trim() : '';
+        }
         if (isText(input.detail)) ev.detail = input.detail.trim().slice(0, 4000);
         const dependsOn = textList(input.dependsOn, 20, 64);
         if (dependsOn.length) ev.dependsOn = dependsOn;
@@ -1270,16 +1279,14 @@ export function apply(ctx, rawConfig = {}) {
    *
    * 判据和 Hub 共用 `selectable.mjs` 的 `ownerTransitionError()`。
    */
-  function assertOwnerTransition(input, ev) {
+  function assertOwnerTransition(ev) {
     if (!ev || ev.kind !== 'task') return;
+    // 没写 owner = 不动它（Hub 会沿用当前值），不用校验
+    if (!Object.prototype.hasOwnProperty.call(ev, 'owner')) return;
     const tasks = latestTasks(readEvents());
     const prev = tasks.get(ev.taskId);
-    // buildEvent 会把缺失的 owner 补成空串，那样「没传 owner」就变成了「释放」。
-    // 所以要看原始入参里到底有没有这个字段。
-    const explicitOwner = input && typeof input === 'object' && 'owner' in input;
-    const nextOwner = explicitOwner ? ev.owner : (prev ? prev.owner : '');
     const err = ownerTransitionError({
-      nextOwner,
+      nextOwner: ev.owner,
       prevOwner: prev ? prev.owner : '',
       writer: identity.origin,
       hasTask: Boolean(prev),
