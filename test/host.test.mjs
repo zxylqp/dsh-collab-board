@@ -313,6 +313,17 @@ async function main() {
   const logAfterSteal = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   check('脏事件没写进日志', !logAfterSteal.some((e) => e.taskId === 'guard1' && e.owner === otherOrigin));
 
+  // 改标题但不传 owner：必须放行，而且事件里**不能带** owner 字段
+  // （带了空串就等于「释放」，推给 Hub 会被当成越权拒掉）
+  const editRes = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', id: 'guard1', taskId: 'guard1', title: '改了标题', status: 'pending' },
+  });
+  check('改标题不传 owner：放行', editRes.status === 200, JSON.stringify(editRes.payload));
+  check('落盘事件里没有 owner 字段（让 Hub 沿用当前值）',
+    Boolean(editRes.payload?.event) && !('owner' in editRes.payload.event),
+    JSON.stringify(editRes.payload?.event));
+
   console.log('\n7c. 脏事件不堵队列（整批被拒时的逐条降级）');
   // 手工往日志里塞一条 Hub 必拒的事件：新建任务却写着别人的 owner。
   // 模拟旧版本客户端、或者直接改日志写进来的数据 —— 它不该让这台机器失去同步。
