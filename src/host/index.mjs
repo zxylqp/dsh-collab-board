@@ -248,6 +248,24 @@ export function apply(ctx, rawConfig = {}) {
       pending: pendingEvents,
       onPushed,
       onEvents: onPulled,
+      /**
+       * Hub 明确拒了一条事件 → 写一条 warn note。
+       *
+       * **不能静默丢弃**：事件被跳过之后，面板上看不出「我刚写的那条没上去」，
+       * agent 那边 collab_post 还返回 ok。人只会觉得数据莫名其妙少了一条。
+       * 落一条 note，面板和 agent 都看得见。
+       */
+      onRejected: (ev, err) => {
+        if (!ev || ev.kind === 'note') return; // note 自己不再生 note，防递归
+        const what = ev.kind === 'task' && ev.taskId ? `task ${ev.taskId}` : String(ev.kind || '事件');
+        const note = buildEvent({
+          kind: 'note',
+          level: 'warn',
+          text: `一条事件被 Hub 拒了（${what}）：${err && err.message ? err.message : '原因不明'}。`
+            + '已跳过，不会堵住后面的同步；这条要补就重新发。',
+        });
+        if (note) appendEvent(note);
+      },
       log: hubLog,
       status: () => 'idle',
       // 连上之后由**本机**写一条 member 事件：§6.10.4 禁止系统 origin 写 member
