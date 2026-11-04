@@ -179,6 +179,22 @@ export async function startHub(opts = {}) {
   let events = [];
   /** taskId → 最新的那条 task 事件（按 (epoch,seq,id) 取最大）。 */
   let tasks = new Map();
+  /**
+   * taskId → 创建者 origin（第一条 task 事件的 origin）。
+   *
+   * 为什么要有它：taskId 是各机器本地生成的，两台机器可能发出同一个 id。
+   * 只按 taskId 折叠的话，后到的那条会把别人的卡整条覆盖（R5 真机撞号）。
+   * 有了 creator 才能把「认领 / 完成」和「整条改写」分开判。
+   */
+  let creators = new Map();
+  /**
+   * taskId → 折叠后的任务视图（缺省字段沿用上一版）。
+   *
+   * `tasks` 存的是「最新那条原始事件」，认领 / 完成这类事件不带 title/detail，
+   * 直接拿原始事件比字段会把「没带」误判成「改了」。撞号检查要的是语义变更，
+   * 所以单开一份折叠视图。
+   */
+  let folded = new Map();
   /** token → { origin, name, capabilities, status, lastSeen } */
   let members = new Map();
   /** capability → Set<origin>（从 member 事件重建，§28） */
@@ -228,6 +244,8 @@ export async function startHub(opts = {}) {
   /** 重建任务表 / 能力索引 / 幂等表。顺序：按权威序逐条应用。 */
   function rebuild() {
     tasks = new Map();
+    creators = new Map();
+    folded = new Map();
     capIndex = new Map();
     dependents = new Map();
     for (const ev of events) applyIndex(ev);
@@ -236,6 +254,16 @@ export async function startHub(opts = {}) {
   function applyIndex(ev) {
     if (!ev || typeof ev !== 'object') return;
     if (ev.kind === 'task' && ev.taskId) {
+      // 第一条落盘的 task 事件定创建者；后面的认领 / 完成 / 评论都归它管。
+      if (!creators.has(ev.taskId)) creators.set(ev.taskId, ev.origin);
+      const prevF = folded.get(ev.taskId) || {};
+      folded.set(ev.taskId, {
+        ...prevF,
+        ...ev,
+        title: 'title' in ev ? ev.title : prevF.title,
+        detail: 'detail' in ev ? ev.detail : prevF.detail,
+        dependsOn: 'dependsOn' in ev ? ev.dependsOn : prevF.dependsOn,
+      });
       const prev = tasks.get(ev.taskId);
       if (!prev || compareEvents(ev, prev) > 0) {
         tasks.set(ev.taskId, ev);
@@ -776,6 +804,26 @@ export async function startHub(opts = {}) {
           if (dup) {
             accepted.push({ id: ev.id, duplicate: true });
             continue;
+          }
+          // 身份撞号：taskId 归创建者。别人可以认领 / 完成 / 评论，但不能把
+          // 标题、描述、依赖整条改写 —— 那正是 R5 真机撞号的样子：两张本地编号
+          // 相同的卡被折叠成一张，后推的赢，前一张凭空消失。
+          if (ev.kind === 'task') {
+            const creator = creators.get(ev.taskId);
+            const prevTask = folded.get(ev.taskId);
+            if (prevTask && creator && ev.origin !== creator) {
+              // detail 只比「有内容的变更」：validateBatch 会把缺省字段归一成空串，
+              // 认领 / 完成这类事件本来就不带 detail，空串 ≠ 改描述。
+              const changed = ('title' in ev && ev.title !== prevTask.title)
+                || ('detail' in ev && ev.detail !== '' && ev.detail !== prevTask.detail)
+                || ('dependsOn' in ev
+                  && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || []));
+              if (changed) {
+                return fail(res, 409, 'conflict',
+                  `任务 ${ev.taskId} 是 ${creator.slice(0, 6)}… 创建的，别的成员不能改标题/描述/依赖；认领走 /tasks/claim，完成改 status`,
+                  { field: 'taskId' });
+              }
+            }
           }
           // owner 迁移：普通写路径不许抢别人已认领的卡（CAS 的补口）
           if (ev.kind === 'task') {
