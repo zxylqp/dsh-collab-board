@@ -43,6 +43,7 @@ export function createDelivery({
   retries = () => DEFAULT_RETRIES,
   delayMs = RETRY_DELAY_MS,
   onGiveUp = () => {},
+  onDelivered = () => {},
   log = () => {},
   doneLimit = DONE_LIMIT,
 } = {}) {
@@ -122,6 +123,8 @@ export function createDelivery({
       same.text = typeof item.text === 'string' ? item.text : same.text;
       same.from = typeof item.from === 'string' ? item.from : same.from;
       same.deferred = item.deferred === true || same.deferred === true;
+      // 正常消息并进「自动续跑」项时以消息为准：续跑是自己的空转，消息才是人要说的话。
+      if (item.kind !== 'self') same.kind = '';
       same.at = Date.now();
       // 只往晚里推，不往早里拉：合并不能让一条还得重试的项插队
       if (notBefore > 0 && (Number(same.nextAt) || 0) < notBefore) same.nextAt = notBefore;
@@ -135,6 +138,13 @@ export function createDelivery({
       taskId,
       from: typeof item.from === 'string' ? item.from : '',
       text: typeof item.text === 'string' ? item.text : '',
+      /**
+       * 唤醒由什么触发：
+       *   - 缺省 / '' 别人发来的消息
+       *   - 'self'   任务还没完成，插件自己排的续跑（见 index.mjs 的 maybeSelfContinue）
+       * send 靠它决定用账本里现成的 text，还是按 attempts/deferred 重新生成。
+       */
+      kind: item.kind === 'self' ? 'self' : '',
       deferred: item.deferred === true,
       attempts: 0,
       at: Date.now(),
@@ -190,6 +200,16 @@ export function createDelivery({
         rememberDone(item.eventId);
         lastError = '';
         persist();
+        /**
+         * 投递**完全结束**之后才回调（账已摘、已落盘）。
+         *
+         * 别在 `send` 里做这件事：那时这一条还在 `state.items` 上，
+         * 回调里再 `offer` 一条同 taskId 的，会被合并逻辑当成「另一条」并进来，
+         * 然后跟着本条一起被摘掉 —— 排了等于没排。
+         */
+        try { onDelivered(item); } catch (e) {
+          log('warn', `投递后回调炸了：${e instanceof Error ? e.message : String(e)}`);
+        }
       } catch (e) {
         item.lastError = e instanceof Error ? e.message : String(e);
         lastError = item.lastError;
