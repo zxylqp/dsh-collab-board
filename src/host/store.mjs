@@ -154,7 +154,15 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
   function markSynced(accepted) {
     let dirty = false;
     for (const row of Array.isArray(accepted) ? accepted : []) {
-      if (!row || !row.id || row.duplicate) continue;
+      /**
+       * `duplicate` 也要记，别跳过。
+       *
+       * Hub 回 `{id, duplicate:true}` 的意思是「这条我早收过了」—— 本来就是同步成功，
+       * 只是不重复编号。以前跳过它，结果这条在本地 sidecar 里永远没有 stamp，
+       * `pendingEvents()` 一直把它当待同步，面板永久显示「待同步」（R10 真机实测）。
+       * 0.10.8 起 Hub 在 duplicate 里一并回 epoch/seq，这里就能正常记上。
+       */
+      if (!row || !row.id) continue;
       if (Number.isFinite(row.epoch) && Number.isFinite(row.seq)) {
         seqMap[row.id] = [row.epoch, row.seq];
         dirty = true;

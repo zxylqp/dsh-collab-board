@@ -799,10 +799,12 @@ export async function startHub(opts = {}) {
         const accepted = [];
         const appended = [];
         for (const ev of r.events) {
-          // 幂等：同 id 已经收过就不重复编号（重投不该让 seq 涨）
-          const dup = events.some((e) => e.id === ev.id);
+          // 幂等：同 id 已经收过就不重复编号（重投不该让 seq 涨）。
+          // **但要把已存在的 epoch/seq 一起回给客户端** —— 否则对方拿不到序号，
+          // 在它本地的 sidecar 里这条永远算「没同步」，面板永久显示待同步（R10 真机实测）。
+          const dup = events.find((e) => e.id === ev.id);
           if (dup) {
-            accepted.push({ id: ev.id, duplicate: true });
+            accepted.push({ id: ev.id, duplicate: true, epoch: dup.epoch, seq: dup.seq });
             continue;
           }
           // 身份撞号：taskId 归创建者。别人可以认领 / 完成 / 评论，但不能把

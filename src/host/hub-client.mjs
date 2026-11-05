@@ -201,8 +201,17 @@ export function createHubClient(opts = {}) {
       return accepted;
     } catch (e) {
       // 只有「这批里有东西不对」才值得逐条拆开；网络错误拆了也是白拆
+      /**
+       * 哪些拒绝要「拆开逐条定位、把坏的那条拉黑」。
+       *
+       * **`conflict` 必须在名单里**（0.10.8 修）：它是 409，比如改别人建的任务卡标题。
+       * 以前漏了它，于是 409 走进「网络错误」分支：整批原样留着、只打一行 warn，
+       * 下一轮重试还是同一条 409，**该机器的同步队列就此永久卡死**
+       * （R10 真机实测：汐汐 18:39 改标题被 409 之后，后续消息全推不上去）。
+       */
       const isRejection = e.code === 'forbidden' || e.code === 'bad-param'
-        || e.code === 'too-large' || e.code === 'cycle' || e.status === 400;
+        || e.code === 'too-large' || e.code === 'cycle' || e.code === 'conflict'
+        || e.status === 400;
       if (!isRejection) {
         log('warn', `推送失败：${e.message}`);
         return [];

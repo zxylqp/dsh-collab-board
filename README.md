@@ -6,7 +6,7 @@
 一台机器当 Hub，其它机器连上来。任务卡同步、串行认领、租约、文件传输、依赖自动解锁，
 全部在一个插件里，不用额外跑服务。
 
-> 这是一个完整的实现，不是设计稿。153 项自动化测试（含真实 HTTP 和真实 UDP 收发）全绿。
+> 这是一个完整的实现，不是设计稿。158 项自动化测试（含真实 HTTP 和真实 UDP 收发）全绿。
 
 ---
 
@@ -116,10 +116,10 @@ TCP 48910 必须放行，否则连不上。
 
 ```bash
 # 宿主集成测试：假 ctx 加载真的 apply()，不重启 DSH
-node test/host.test.mjs       # 85 项
+node test/host.test.mjs       # 88 项
 
 # Hub 端到端：起真服务、走真 HTTP、真实 UDP
-node test/hub.test.mjs        # 68 项
+node test/hub.test.mjs        # 70 项
 ```
 
 注意 `node` 可能不在 PATH 上（DSH 自带的运行时在

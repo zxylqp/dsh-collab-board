@@ -390,6 +390,36 @@ async function main() {
   check('被拒事件不进制看板的视图',
     !(stateAfterDirty.payload?.events || []).some((e) => e.id === dirtyId));
 
+  // ── 409 毒丸：改别人建的卡标题（0.10.8 修） ──
+  // 以前 `conflict` 不在 isRejection 名单里，409 会走进「网络错误」分支：
+  // 整批原样留着、只打一行 warn，下一轮重试还是同一条 409
+  // —— 该机器的同步队列就此永久卡死（R10 真机实测，汐汐 18:39 踩中）。
+  const beforeRejected = new Set(Array.isArray(rejectedIds) ? rejectedIds : []);
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2, id: 'ev_abcdef_oc409_aaa', origin: otherOrigin, name: '另一个成员',
+        kind: 'task', taskId: 'othercard409', title: '别人建的卡', status: 'pending',
+      }],
+    }),
+  });
+  // 等本机拉到这张卡：没有 prevTask 就触发不了 409（判据要「卡已存在」）
+  await new Promise((r) => setTimeout(r, 6000));
+  const clobberPost = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 'othercard409', title: '本机想改别人卡的标题', status: 'pending' },
+  });
+  check('改别人卡标题先写进了本地日志', clobberPost.status === 200);
+  await new Promise((r) => setTimeout(r, 6000));
+  const rejectedAfter409 = existsSync(rejectedFile) ? JSON.parse(readFileSync(rejectedFile, 'utf8')) : [];
+  const fresh409 = rejectedAfter409.filter((id) => !beforeRejected.has(id));
+  check('409 被逐条拉黑，没有卡住整批', fresh409.length >= 1, JSON.stringify(fresh409));
+  const hubAfter409 = await hit(routes, '/collab-board/hub');
+  check('409 之后队列没卡死（pending=0）',
+    Number(hubAfter409.payload?.pending) === 0, String(hubAfter409.payload?.pending));
+
   console.log('\n8. 增量读看板（collab_state）');
   const stateTool = findTool(tools, 'collab_state');
   const stateFirst = JSON.parse((await stateTool.execute({})).text);

@@ -4,6 +4,28 @@
 
 ---
 
+## 0.10.8
+
+**两条真机挖出来的 bug，都是「一条坏事件拖垮整台机器」。**
+
+R10 真机（汐汐那台，18:39）踩中的：
+
+- **409 把整台机器的同步队列永久卡死（P0）。** `pushOnce` 的 `isRejection` 名单里有
+  `forbidden / bad-param / too-large / cycle / 400`，**唯独没有 `conflict`**。改别人建的卡
+  标题被 Hub 回 409 之后，它走进「网络错误」分支：整批原样留着、只打一行 warn、
+  `return []`。下一轮重试还是同一条 409 —— 该机器之后**任何消息都推不上去**。
+  修法：`conflict` 进名单。409 会和 403 一样走「整批被拒 → 逐条重发定位 → 把坏的那条
+  拉黑」，其余事件照常推进。
+- **duplicate 让事件永久「待同步」（P1）。** `markSynced()` 里遇到 `row.duplicate` 就
+  `continue`，而 Hub 对重投只回 `{id, duplicate:true}`、不给序号 —— 这条在本地 sidecar
+  里永远没有 stamp，`pendingEvents()` 一直把它算作待同步，面板永久显示「待同步」。
+  修法：Hub 在 duplicate 里一并回原事件的 `epoch/seq`；`markSynced` 不再跳过 duplicate。
+
+测试 153 → **158**（hub 68 → 70，host 85 → 88）。两条都做了反向验证：
+把 `conflict` 从名单里摘掉，测试当场变红，`pending` 停在被拒的那批（=2）。
+
+---
+
 ## 0.10.7
 
 **自动唤醒真的能叫醒了。**

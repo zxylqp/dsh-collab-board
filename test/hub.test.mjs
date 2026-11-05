@@ -130,6 +130,14 @@ async function main() {
   // 幂等重投
   const repush = await call(base, '/events', { method: 'POST', token: tokenA, body: { events: [taskEv] } });
   check('同 id 重投不重复编号', repush.data.accepted[0].duplicate === true);
+  // duplicate 必须把原来的 epoch/seq 一起回 —— 否则客户端拿不到序号，
+  // 在它的本地 sidecar 里这条永远是「待同步」（R10 真机实测的第二个 bug）
+  check('duplicate 带回 epoch/seq',
+    Number.isFinite(repush.data.accepted[0].epoch) && Number.isFinite(repush.data.accepted[0].seq),
+    JSON.stringify(repush.data.accepted[0]));
+  check('duplicate 回的 seq 是原事件的，不是新编号',
+    repush.data.accepted[0].seq === pushA.data.accepted[0].seq,
+    `${repush.data.accepted[0].seq} vs ${pushA.data.accepted[0].seq}`);
 
   console.log('\n3. 认领串行');
   const claimB = await call(base, '/tasks/claim', {
