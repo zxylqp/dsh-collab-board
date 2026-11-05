@@ -4,6 +4,34 @@
 
 ---
 
+## 0.10.7
+
+**自动唤醒真的能叫醒了。**
+
+`sessionController.prompt` 的签名是 `(request, signal)` **两个参数**，0.10.6 只传了 request。
+宿主内部第一句就是 `signal.throwIfAborted()` —— 读到 undefined 直接抛
+`Cannot read properties of undefined (reading 'throwIfAborted')`，被 `.catch()` 收成一条
+`lastError` 就没了。表现是「叫不醒，也不报错」：`wake.on = true`，`lastAt` 永远是空串。
+
+R10 真机实测挖出来的：Hub 宿主的 `/collab-board/version` 自报就是这个值。
+**0.10.6 的唤醒探针第一次派上用场** —— 三个值一眼分出「开关没开 / 没有活会话 / 调用报错」，
+这次是第三种，不再是猜。
+
+- `prompt` 改成传 `(request, signal)`：
+  - `requestId`（SessionRequestId，必填，原来根本没给）
+  - `sessionId`
+  - `mode: 'queue'` —— 看板消息不该打断正在跑的轮次
+  - `content` —— **字段名从 `prompt` 改成 `content`**，宿主要的是 `SessionPromptRequest.content`
+  - 第二参 `new AbortController().signal`
+- **测试补上成功路径**：以前只测「没有 sessionController 时唤醒失败但不崩」，
+  真实调用**一次都没走过**。所以 149 项全绿而 P0 功能是死的 —— 这是假绿。
+  新增 4 项（host 81 → 85）：假宿主复刻 `signal.throwIfAborted()` 这第一句，
+  回退成旧签名时测试当场变红，报的就是真机上那条错误，复现路径钉死。
+
+测试 149 → **153**（hub 68 + host 85）。
+
+---
+
 ## 0.10.6
 
 **任务卡不再撞号。**

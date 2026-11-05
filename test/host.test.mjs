@@ -27,11 +27,19 @@ function check(name, cond, detail = '') {
 }
 
 /** 假 ctx：只实现 apply 真正用到的那几个点。 */
-function makeCtx() {
+function makeCtx(services = {}) {
   const routes = [];
   const tools = [];
   const cleanups = [];
   const ctx = {
+    /**
+     * 假宿主服务表。默认空 —— 唤醒会走「宿主没有 sessionController.prompt」，
+     * 这正是 9 节要验的失败路径。9c 在**运行时**往里塞 sessionController，
+     * 才能验成功路径（信号要真传给 prompt）。
+     */
+    get(name) {
+      return Object.prototype.hasOwnProperty.call(services, name) ? services[name] : undefined;
+    },
     effect(fn) {
       const d = fn();
       if (typeof d === 'function') cleanups.push(d);
@@ -99,7 +107,8 @@ function findTool(tools, name) {
 
 async function main() {
   const dataDir = mkdtempSync(join(tmpdir(), 'collab-host-'));
-  const { ctx, routes, tools, cleanups } = makeCtx();
+  const services = {};
+  const { ctx, routes, tools, cleanups } = makeCtx(services);
 
   console.log('1. 加载');
   apply(ctx, { dataDir, syncLanInbox: false });
@@ -484,6 +493,48 @@ async function main() {
   check('继承后的卡不会被判成可接（有主）',
     foldClaimable.find((r) => r.task.taskId === 'o1')?.reason === 'owned',
     String(foldClaimable.find((r) => r.task.taskId === 'o1')?.reason));
+
+  console.log('\n9d. 唤醒调用签名（prompt 必须收到 signal）');
+  // 0.10.6 死在这：只传了 request，宿主内部 signal.throwIfAborted() 读 undefined。
+  // 这个假 prompt 复刻真宿主的第一句 —— signal 缺失就在这里抛，等于把那天的现场搬进测试。
+  const wakeCalls = [];
+  services.sessionController = {
+    list: async () => ({ items: [{ sessionId: 'sess-wake-1', updatedAt: Date.now(), agentAvailable: true }] }),
+    prompt: async (request, signal) => {
+      wakeCalls.push({ request, signal });
+      signal.throwIfAborted();
+      return { accepted: true };
+    },
+  };
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_wake02_bbb',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'msg',
+        taskId: 'wake2',
+        text: '这条必须把 AbortSignal 带上',
+      }],
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 4000));
+  check('唤醒真的调到 prompt', wakeCalls.length === 1, `calls=${wakeCalls.length}`);
+  check('第二个参数是 AbortSignal',
+    Boolean(wakeCalls[0]?.signal) && typeof wakeCalls[0].signal.throwIfAborted === 'function',
+    String(wakeCalls[0]?.signal));
+  check('request 带 requestId / mode / content',
+    Boolean(wakeCalls[0]?.request?.requestId)
+    && wakeCalls[0].request.mode === 'queue'
+    && wakeCalls[0].request.content?.[0]?.type === 'text',
+    JSON.stringify(wakeCalls[0]?.request));
+  const verAfterWake = await hit(routes, '/collab-board/version');
+  check('唤醒成功后 lastAt 有值',
+    Boolean(verAfterWake.payload?.wake?.lastAt) && verAfterWake.payload?.wake?.lastError === '',
+    JSON.stringify(verAfterWake.payload?.wake));
 
   console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });

@@ -17,6 +17,7 @@ import {
   mkdirSync,
   writeFileSync,
 } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join, resolve, basename, dirname, sep } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { loadIdentity } from './identity.mjs';
@@ -136,9 +137,14 @@ export function apply(ctx, rawConfig = {}) {
   /**
    * 收到别人的消息 → 调 `sessionController.prompt` 把本机 agent 叫起来。
    *
-   * 接口形状是从宿主包里核出来的，不是猜的：
-   *     sessionController.prompt({ sessionId, prompt: [{ type: 'text', text }] })
-   *     → { stopReason: 'end_turn' }
+   * 接口形状是从宿主包里核出来的，不是猜的（`cordis_inspect_query` → Service
+   * `sessionController`，2026-11-05 核）：
+   *     prompt(request: SessionPromptRequest, signal: AbortSignal)
+   *     → { accepted: true }
+   *
+   * **两个参数都要传**。0.10.6 只传了 request，宿主内部 `signal.throwIfAborted()`
+   * 读到 undefined，报 `Cannot read properties of undefined (reading 'throwIfAborted')`。
+   * 表现是「叫不醒但也不报错」：`wake.on=true` 而 `lastAt` 永远是空串 —— R10 真机实测到。
    *
    * 三条护栏，缺一条都不干：
    *   1. 只认**别人发的** `msg`（自己发的不算、note 不算）
@@ -165,7 +171,15 @@ export function apply(ctx, rawConfig = {}) {
     if (!svc || typeof svc.prompt !== 'function') throw new Error('宿主没有 sessionController.prompt');
     const sessionId = await pickWakeSession();
     if (!sessionId) throw new Error('找不到可唤醒的会话');
-    const r = await svc.prompt({ sessionId, prompt: [{ type: 'text', text }] });
+    // requestId 是必填（SessionRequestId），mode 显式给 queue：看板消息不该打断正在跑的轮次。
+    const request = {
+      requestId: `collab-wake-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text }],
+    };
+    // 第二个参数必须是真的 AbortSignal：宿主会拿它做 throwIfAborted 前置检查。
+    const r = await svc.prompt(request, new AbortController().signal);
     return { sessionId, stopReason: (r && r.stopReason) || '' };
   }
 
