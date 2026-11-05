@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
 import { createDelivery } from '../src/host/delivery.mjs';
+import { shouldWake, maxSeenOf } from '../src/host/wake.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
 
 let pass = 0;
@@ -537,7 +538,28 @@ async function main() {
       return { accepted: true };
     },
   };
-  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+  // 先把 Hub 的 seq 垫到本机之后：真机上本机 seq 不会超过 Hub，测试环境会（构造残留）。
+  // 不垫的话 9d 的消息 seq 比本机已见小，会被判成历史重放。
+  for (const i of [1, 2, 3]) {
+    await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+      body: JSON.stringify({
+        events: [{
+          eventVersion: 2,
+          id: `ev_abcdef_fill0${i}_ccc`,
+          origin: otherOrigin,
+          name: '另一个成员',
+          kind: 'task',
+          taskId: `fill${i}`,
+          title: '垫高 seq',
+          status: 'pending',
+        }],
+      }),
+    });
+  }
+  await new Promise((r) => setTimeout(r, 3600));
+  const push9d = await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
     body: JSON.stringify({
@@ -552,6 +574,7 @@ async function main() {
       }],
     }),
   });
+  console.log(`  [9d] push ${push9d.status} ${JSON.stringify(await push9d.clone().json().catch(() => null)).slice(0, 160)}`);
   await new Promise((r) => setTimeout(r, 4000));
   check('唤醒真的调到 prompt', wakeCalls.length === 1, `calls=${wakeCalls.length}`);
   check('第二个参数是 AbortSignal',
@@ -566,6 +589,31 @@ async function main() {
   check('唤醒成功后 lastAt 有值',
     Boolean(verAfterWake.payload?.wake?.lastAt) && verAfterWake.payload?.wake?.lastError === '',
     JSON.stringify(verAfterWake.payload?.wake));
+
+  console.log('\n9e. 唤醒判据（(epoch, seq)，唯一一份在 wake.mjs）');
+  // 为什么不是测 ts：第一版按「10 分钟年龄」挡历史重放，被汐汐当场否掉 ——
+  // 对方关机几小时、开机后才拉到的真消息，ts 也老了。而且那版测试是假绿：
+  // 关掉过滤照样全过。这里改成直接测判据本身。
+  // 为什么带 epoch：Hub 换代后 seq 从 1 重来，只比 seq 会把新消息全判成历史 ——
+  // 那也是汐汐拦的。
+  const selfOrigin = 'self-origin';
+  const verdict = (ev, m = {}) => shouldWake(ev, { selfOrigin, maxEpoch: 1, maxSeq: 230, ...m });
+  check('同 epoch、seq 更大 → 叫（离线期间的真消息）',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231 }).wake === true);
+  check('同 epoch、seq 不大于已见 → 历史重放，不叫',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 13 }).reason === 'history');
+  check('同 epoch、seq 相等 → 历史（重复拉取）',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 230 }).wake === false);
+  check('epoch 更大、seq 只有 1 → 叫（换代后整批算新的）',
+    verdict({ kind: 'msg', origin: 'other', epoch: 2, seq: 1 }).wake === true);
+  check('epoch 更小 → 历史，不看 seq',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 999 }, { maxEpoch: 2, maxSeq: 3 }).reason === 'history');
+  check('自己发的不叫', verdict({ kind: 'msg', origin: selfOrigin, seq: 999 }).reason === 'self');
+  check('没有 seq 的不叫', verdict({ kind: 'msg', origin: 'other' }).reason === 'no-seq');
+  check('不是 msg 的不叫', verdict({ kind: 'note', origin: 'other', seq: 999 }).reason === 'not-msg');
+  check('maxSeenOf 取 (epoch, seq) 字典序最大',
+    JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }, { id: 'x' }])) === '{"epoch":2,"seq":3}',
+    JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }])));
 
   console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
@@ -634,6 +682,31 @@ async function main() {
   check('超过 wakeRetries 就放弃', given2.includes('ev_dead'), JSON.stringify(given2));
   check('放弃后账本不堵着', d2.snapshot().queued === 0);
   d2.close();
+
+  // 11b. 冷却期里的消息不再被丢掉（0.10.10）
+  const dfc = join(mkdtempSync(join(tmpdir(), 'collab-cool-')), 'inflight.json');
+  const coolCalls = [];
+  const cool = createDelivery({
+    file: dfc,
+    delayMs: 10,
+    retries: () => 3,
+    send: async (item) => { coolCalls.push(item.eventId); },
+  });
+  const future = Date.now() + 200;
+  cool.offer({ eventId: 'ev_c1', taskId: 'tc', from: '姐', text: '第一条', notBefore: future, deferred: true });
+  cool.offer({ eventId: 'ev_c2', taskId: 'tc', from: '姐', text: '第二条', notBefore: future });
+  await new Promise((r) => setTimeout(r, 60));
+  check('冷却期的消息不丢，只是延后', cool.snapshot().queued === 1, JSON.stringify(cool.snapshot()));
+  check('同一个 taskId 在账本里合并成一条（没攒成两条）',
+    cool.state().items.length === 1 && cool.state().items[0].eventId === 'ev_c2',
+    JSON.stringify(cool.state().items.map((it) => it.eventId)));
+  check('合并时保留「补叫」标注', cool.state().items[0].deferred === true,
+    String(cool.state().items[0].deferred));
+  check('冷却没到就不投', coolCalls.length === 0, JSON.stringify(coolCalls));
+  await waitFor(() => coolCalls.length === 1, 1000);
+  check('到点后补叫一次，触发的是最新那条', coolCalls.length === 1 && coolCalls[0] === 'ev_c2',
+    JSON.stringify(coolCalls));
+  cool.close();
 
   console.log('\n12. 重启补投（投递账本接进插件）');
   const restartDir = mkdtempSync(join(tmpdir(), 'collab-restart-'));

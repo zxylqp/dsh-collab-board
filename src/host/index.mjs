@@ -38,6 +38,7 @@ export const inject = [];
 /** 面板与数据接口的根路径。改它要同步改 src/client/index.js 的 API。 */
 const PANEL_BASE = '/collab-board';
 
+
 /**
  * 宿主包版本：启动时从 package.json 读一次。
  *
@@ -76,6 +77,7 @@ import { createSettings } from './settings.mjs';
 import { createCapabilities } from './capabilities.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
+import { shouldWake, maxSeenOf, WAKE_SKIP } from './wake.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -187,12 +189,15 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /** 唤醒文本。重试时把「第几次」写进消息头，否则 agent 会当成一条新消息。 */
-  function wakeText(meta, attempt = 1) {
+  function wakeText(meta, attempt = 1, deferred = false) {
     const where = meta.taskId ? `任务 ${meta.taskId}` : '全局';
     const retry = attempt > 1
       ? `（第 ${attempt} 次投递：前面 ${attempt - 1} 次没送到，可能是对端会话忙或宿主重启）`
       : '';
-    return `【协作看板自动触发${retry}】${meta.from || '对方'} 在${where}发了新消息。`
+    const late = deferred
+      ? '（补叫：你上次被叫醒后还没到冷却时间，这条现在才送到）'
+      : '';
+    return `【协作看板自动触发${retry}${late}】${meta.from || '对方'} 在${where}发了新消息。`
       + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
       + '回完就停，不要连续追问。';
   }
@@ -208,26 +213,45 @@ export function apply(ctx, rawConfig = {}) {
 
     const cooldown = Math.max(60000, Number(s.wakeCooldownMs) || 300000);
     const now = Date.now();
-    const target = fresh.find((ev) => {
-      const k = ev.taskId || 'global';
-      return now - (wakeState.lastAt.get(k) || 0) >= cooldown;
-    });
-    if (!target) return;
+    let called = 0;
 
-    wakeState.lastAt.set(target.taskId || 'global', now);
-    /**
-     * 只入账，不直接投。
-     *
-     * 账本负责三件以前没人管的事：同一条事件只投一次；正在投的时候再来的排队，
-     * 不丢；投失败留在盘上，重启后补投一次。之前这里 `busy` 一挡，那条消息
-     * 就只剩一个「叫不醒」的现象，谁也不知道它被跳过了。
-     */
-    delivery.offer({
-      eventId: target.id,
-      taskId: target.taskId || '',
-      from: target.from || target.name || '',
-      text: wakeText({ taskId: target.taskId || '', from: target.from || target.name || '' }, 1),
-    });
+    for (const ev of fresh) {
+      const taskId = ev.taskId || '';
+      const key = taskId || 'global';
+      const last = wakeState.lastAt.get(key) || 0;
+      const wait = Math.max(0, cooldown - (now - last));
+      const meta = { taskId, from: ev.from || ev.name || '' };
+
+      /**
+       * 冷却期里**不再直接丢**。
+       *
+       * 0.10.9 以前这里 `return` 掉：对方 19:39:39 刚被叫醒，我 19:39:53 回一句，
+       * 差 14 秒 < 5 分钟冷却 —— 那条回复就永远没人读，看板上只剩「她不回」。
+       * 现在改成延后到冷却结束再投；同一个 taskId 在账本里合并成一条。
+       * 一批里已经叫过一个的，后面的缓一分钟，别一口气叫好几轮。
+       */
+      const deferFor = wait > 0 ? wait : (called > 0 ? Math.min(cooldown, 60000) : 0);
+      if (deferFor > 0) {
+        delivery.offer({
+          eventId: ev.id,
+          taskId,
+          from: meta.from,
+          text: wakeText(meta, 1, true),
+          notBefore: now + deferFor,
+        });
+        continue;
+      }
+
+      called += 1;
+      // 先占住冷却位；真正投出去之后 send 会用完成时刻再刷一次
+      wakeState.lastAt.set(key, now);
+      delivery.offer({
+        eventId: ev.id,
+        taskId,
+        from: meta.from,
+        text: wakeText(meta, 1, false),
+      });
+    }
   }
 
   /* ───────────────────── Hub 生命周期 ───────────────────── */
@@ -250,7 +274,12 @@ export function apply(ctx, rawConfig = {}) {
   const delivery = createDelivery({
     file: join(dataDir, 'inflight.json'),
     retries: () => getSettings().wakeRetries,
-    send: (item) => wakeAgent(wakeText({ taskId: item.taskId, from: item.from }, item.attempts)),
+    send: (item) => wakeAgent(wakeText({ taskId: item.taskId, from: item.from }, item.attempts, item.deferred))
+      .then((r) => {
+        // 冷却从「真正投出去」那一刻算：投递可能等一整轮，别让它占发起时刻
+        wakeState.lastAt.set(item.taskId || 'global', Date.now());
+        return r;
+      }),
     onGiveUp: (item) => {
       const note = buildEvent({
         kind: 'note',
@@ -293,9 +322,11 @@ export function apply(ctx, rawConfig = {}) {
    * 租约释放）origin 也是本机，可本机日志里根本没有这一条 —— 按 origin 判就会
    * 把它整个丢掉，于是「我自己认领完，我看不见它变成 running」。
    */
-  function onPulled(events) {
+  function onPulled(events, meta = {}) {
     const freshly = [];
     const synced = [];
+    // 拉取**之前**本机见过的最高 (epoch, seq) —— 分「重放的历史」和「离线期间的真消息」
+    const maxSeen = maxSeenOf(readEvents());
     const known = new Set(
       readEvents().map((e) => (e && typeof e.id === 'string' ? e.id : '')).filter(Boolean),
     );
@@ -310,8 +341,74 @@ export function apply(ctx, rawConfig = {}) {
     }
     if (synced.length) markSynced(synced);
     invalidate();
-    // 只有**真正新落盘的**事件才考虑唤醒（重复拉回来、补序号都不算）
-    if (freshly.length) considerWake(freshly);
+    if (freshly.length === 0) return;
+
+    /**
+     * Hub 换代（epoch 变了）：seq 在新 epoch 里从 1 重来，判据不适用，
+     * 整批当补历史、只落盘。否则要么全叫醒一遍，要么全判成历史、再也叫不醒。
+     */
+    if (meta.epochChanged) {
+      noteBackfill(freshly.length);
+      return;
+    }
+
+    /**
+     * 首次同步（新装、或日志清空后第一次连上）：这批全是历史，只落盘不叫醒。
+     * 新成员第一次看到看板，不该被几百条旧消息叫醒。之后 maxSeen 有了，
+     * 客户端也只拉增量，不会再出现「历史 freshly」。
+     */
+    if (maxSeen.epoch === 0 && maxSeen.seq === 0) {
+      noteBackfill(freshly.length);
+      return;
+    }
+
+    /**
+     * 新落盘 ≠ 该唤醒。
+     *
+     * 客户端重连时 `since = 0` 重拉全量，本机日志被清空过的那些旧消息会「本机没有」
+     * 而被当成新事件 —— 2026-11-05 就是这样把一条 11-03 的 t2 消息叫醒的。
+     * 判据在 wake.mjs：按 (epoch, seq) 字典序，不大于本机已见的一律算历史。
+     */
+    const hot = [];
+    const history = [];
+    for (const ev of freshly) {
+      const verdict = shouldWake(ev, {
+        selfOrigin: identity.origin,
+        maxEpoch: maxSeen.epoch,
+        maxSeq: maxSeen.seq,
+      });
+      if (verdict.wake) hot.push(ev);
+      else if (verdict.reason === WAKE_SKIP.HISTORY) history.push(ev);
+    }
+    if (hot.length) considerWake(hot);
+    if (history.length) noteHistorySkipped(history);
+  }
+
+  /** 被跳过唤醒的历史消息，5 分钟内最多落一条 note —— 别让每次重连都刷一条。 */
+  const historyNote = { at: 0 };
+  function noteHistorySkipped(list) {
+    const now = Date.now();
+    if (now - historyNote.at < 5 * 60 * 1000) return;
+    historyNote.at = now;
+    const note = buildEvent({
+      kind: 'note',
+      level: 'info',
+      text: `补回 ${list.length} 条历史消息（seq 不大于本机已见），未唤醒 agent。`,
+    });
+    if (note) appendEvent(note);
+  }
+
+  /** 首次同步：整批历史落盘，不叫醒。同样 5 分钟限一条 note。 */
+  function noteBackfill(count) {
+    const now = Date.now();
+    if (now - historyNote.at < 5 * 60 * 1000) return;
+    historyNote.at = now;
+    const note = buildEvent({
+      kind: 'note',
+      level: 'info',
+      text: `首次同步 ${count} 条历史，未唤醒 agent。`,
+    });
+    if (note) appendEvent(note);
   }
 
   /** 挂一个 Hub 客户端。Hub 本机也走这条 —— 一条路径，不分支。 */
@@ -325,6 +422,8 @@ export function apply(ctx, rawConfig = {}) {
       name: displayName(),
       capabilities: capabilityPayload().all,
       code: code || '',
+      // 本机见过的最大 seq：重连只拉增量，不从 0 回放历史
+      startSince: maxSeenOf(readEvents()).seq,
       pending: pendingEvents,
       onPushed,
       onEvents: onPulled,

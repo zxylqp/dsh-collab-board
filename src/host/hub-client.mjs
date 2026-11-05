@@ -44,7 +44,11 @@ export function createHubClient(opts = {}) {
 
   let token = '';
   let epoch = 0;
-  let since = 0;
+  // 重连不再从 0 拉全量：本机已经见过的就跳过，只拉增量。
+  // 从 0 拉会把「本机日志清空前的旧消息」当新事件回放 —— 2026-11-05 就是把一条
+  // 11-03 的 t2 消息叫醒了。只有本机日志真的空（新装/清空后首次）才从 0 开始。
+  let since = Number(opts.startSince) || 0;
+  let epochChanged = false;
   let stopped = false;
   let pullTimer = null;
   let beatTimer = null;
@@ -112,9 +116,22 @@ export function createHubClient(opts = {}) {
           },
         });
         token = data.token;
-        epoch = Number(data.epoch) || 1;
-        // 新加入从 0 拉到全部；Hub 有 500 上限，循环会拉完
-        since = 0;
+        const joinedEpoch = Number(data.epoch) || 1;
+        /**
+         * Hub 换代：seq 从 1 重来，旧的 since 作废。
+         *
+         * Hub 的 `/events` 过滤是 `e.epoch === epoch && e.seq > since`（hub.mjs:766），
+         * 换代后 `since=235` 在新 epoch 里一条都匹配不到 —— 整台机器静默断流，
+         * 面板上还一切正常。这是汐汐 2026-11-05 拦下的：只按 seq 判会反过来
+         * 修出「再也收不到任何唤醒」。
+         */
+        if (epoch !== 0 && joinedEpoch !== epoch) {
+          since = 0;
+          epochChanged = true;
+        }
+        epoch = joinedEpoch;
+        // 本机见过的就跳过；只有本机日志为空时才从 0 拉全部（首次同步）
+        since = Math.max(since, Number(opts.startSince) || 0);
         online = true;
         lastError = '';
         log('info', `已连上 Hub：epoch ${epoch}`);
@@ -176,7 +193,9 @@ export function createHubClient(opts = {}) {
     if (got.length && typeof opts.onEvents === 'function') {
       const clean = dedupeById(got.sort(compareEvents));
       try {
-        opts.onEvents(clean, { epoch });
+        // `epochChanged`：换代后的首批，宿主要把整批当补历史，不叫醒
+        opts.onEvents(clean, { epoch, epochChanged });
+        epochChanged = false;
       } catch (e) {
         log('warn', `处理拉取事件失败：${e.message}`);
       }

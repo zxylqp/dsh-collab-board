@@ -116,7 +116,7 @@ TCP 48910 必须放行，否则连不上。
 
 ```bash
 # 宿主集成测试：假 ctx 加载真的 apply()，不重启 DSH
-node test/host.test.mjs       # 100 项
+node test/host.test.mjs       # 114 项
 
 # Hub 端到端：起真服务、走真 HTTP、真实 UDP
 node test/hub.test.mjs        # 70 项

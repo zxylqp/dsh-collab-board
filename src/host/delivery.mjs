@@ -97,19 +97,48 @@ export function createDelivery({
   /**
    * 记一条待投递。返回 false 表示「已经在账上或已投过」，调用方不用再管。
    * **先写盘再返回**：进程在这之后被杀，重启还能捡回来。
+   *
+   * 两个 0.10.10 的补充：
+   *   - `item.notBefore`：最早什么时候投（绝对时间戳）。冷却期里的唤醒不再丢弃，
+   *     改成「延后到冷却结束再投」。
+   *   - 同一个 `taskId` 已经在账上时**合并成一条**：冷却的 5 分钟里可能来五六条，
+   *     全排队会变成 5 分钟后连叫五六轮。合并后只叫一次，让 agent 读增量。
    */
   function offer(item) {
     if (!item || typeof item.eventId !== 'string' || item.eventId === '') return false;
     if (state.done.includes(item.eventId)) return false;
     if (state.items.some((it) => it.eventId === item.eventId)) return false;
+
+    const notBefore = Number(item.notBefore) || 0;
+    const taskId = typeof item.taskId === 'string' ? item.taskId : '';
+    const same = taskId
+      ? state.items.find((it) => it.taskId === taskId && it.eventId !== item.eventId)
+      : undefined;
+
+    if (same) {
+      // 旧的触发事件算处理过：它的唤醒被并进新这条了，以后别再单独投它
+      rememberDone(same.eventId);
+      same.eventId = item.eventId;
+      same.text = typeof item.text === 'string' ? item.text : same.text;
+      same.from = typeof item.from === 'string' ? item.from : same.from;
+      same.deferred = item.deferred === true || same.deferred === true;
+      same.at = Date.now();
+      // 只往晚里推，不往早里拉：合并不能让一条还得重试的项插队
+      if (notBefore > 0 && (Number(same.nextAt) || 0) < notBefore) same.nextAt = notBefore;
+      persist();
+      kick();
+      return true;
+    }
+
     state.items.push({
       eventId: item.eventId,
-      taskId: typeof item.taskId === 'string' ? item.taskId : '',
+      taskId,
       from: typeof item.from === 'string' ? item.from : '',
       text: typeof item.text === 'string' ? item.text : '',
+      deferred: item.deferred === true,
       attempts: 0,
       at: Date.now(),
-      nextAt: 0,
+      nextAt: notBefore,
       lastError: '',
     });
     persist();
