@@ -174,5 +174,28 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
     }
   }
 
-  return { readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate, markSynced, markRejected };
+  /**
+   * sidecar 里记过的最高 (epoch, seq)。
+   *
+   * 「本机已见」不能只从 `events.jsonl` 算：日志按 `maxEvents` 裁过，最老的行没了，
+   * 算出来的最大值会比真实的小。真机就这么中过 —— 日志被截断、最大值只到 seq 122，
+   * 重新连上 Hub 补回 123～282 时全被判成新消息，连着三轮「补叫」全是历史重放。
+   *
+   * sidecar 只增不减（按事件 id 记），不受裁剪影响。
+   */
+  function maxSynced() {
+    let epoch = 0;
+    let seq = 0;
+    for (const pair of Object.values(seqMap)) {
+      if (!Array.isArray(pair)) continue;
+      const e = Number(pair[0]);
+      const s = Number(pair[1]);
+      if (!Number.isFinite(e) || e <= 0) continue;
+      if (!Number.isFinite(s) || s <= 0) continue;
+      if (e > epoch || (e === epoch && s > seq)) { epoch = e; seq = s; }
+    }
+    return { epoch, seq };
+  }
+
+  return { readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate, markSynced, markRejected, maxSynced };
 }
