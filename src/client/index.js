@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 21;
-    const VERSION = '0.10.10';
+    const BUILD = 22;
+    const VERSION = '0.10.11';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -55,6 +55,8 @@ window.__ModuleLoader__.load({
       wakeOnMessage: false,
       wakeCooldownMs: 300000,
       wakeRetries: 3,
+      wakeSelfContinue: false,
+      wakeSelfContinueMax: 8,
     };
 
     const ROLE_LABEL = { solo: '单机', hub: 'Hub', member: '成员' };
@@ -1637,6 +1639,26 @@ window.__ModuleLoader__.load({
                 step: 1,
                 value: settings.wakeRetries,
                 onCommit: (v) => saveSetting('wakeRetries', v),
+              }),
+            }),
+            h(Field, {
+              label: '自动续跑',
+              desc: '开着时，一轮唤醒投完、那张卡还是 running，就自己再排一次唤醒（到冷却结束再叫自己）。**这是让 agent 不靠别人发消息也能接着转的开关** —— 每转一轮都是一整轮 token，默认关。别人的卡、done、blocked 都不续。',
+              control: h(Toggle, {
+                on: Boolean(settings.wakeSelfContinue),
+                onClick: (v) => saveSetting('wakeSelfContinue', v),
+              }),
+            }),
+            h(Field, {
+              label: '续跑上限',
+              desc: '同一张卡最多连续续跑几次（1～50，默认 8）。到了写一条 warn note 停下，不会无限刷自己。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 1,
+                max: 50,
+                step: 1,
+                value: settings.wakeSelfContinueMax,
+                onCommit: (v) => saveSetting('wakeSelfContinueMax', v),
               }),
             }),
             settings.hiddenMembers
