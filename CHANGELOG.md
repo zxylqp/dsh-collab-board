@@ -4,6 +4,29 @@
 
 ---
 
+## 0.10.11
+
+**让 agent 不靠别人发消息也能接着转：自动续跑。**
+
+- **任务没完成就自己再排一次**（`wakeSelfContinue`，**默认关**）。一轮唤醒投完、
+  那张卡还是 `running`、owner 是自己，就再排一条唤醒，`nextAt` = 冷却结束。
+  文本标「自动续跑 n/8」，agent 一看就知道不是谁在跟它说话。任务标 `done` 就停；
+  别人的卡、`done`、`cancelled`、`blocked` 都不续。
+- **上限 `wakeSelfContinueMax`（默认 8）**。连续续跑到上限还是没完成，写一条 warn
+  note 停下 —— 要么它干完了没标 done，要么它卡住了，等人看一眼。不会无限刷自己。
+  为什么默认关：每转一轮都是一整轮 token。
+- **修「补叫」标记没传**。`considerWake` 的 defer 分支只传了 `text`、漏了
+  `deferred: true`，账本里存成 false；`send` 拿 `item.deferred` 重新生成唤醒文本，
+  于是补叫照投、照叫醒，但醒来不知道自己是被补叫的。测试测的是 delivery 层直接
+  `offer({deferred:true})`，没覆盖 `considerWake` 这层传参 —— 绿着错。
+- **修「续跑排了又被吞」**。第一版在 `send` 的 `.then` 里排续跑，那一刻本条还在
+  `state.items` 上，offer 进去的同 taskId 新项会被「合并」逻辑当成另一条吃掉，
+  再跟着本条一起被摘掉。现在 `delivery` 加 `onDelivered` 回调：摘账、落盘之后再排。
+
+189 项测试全绿（hub 70 + host 119）。
+
+---
+
 ## 0.10.10
 
 **两条静默失败：冷却期丢消息、历史重放假唤醒。**
