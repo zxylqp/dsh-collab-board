@@ -237,6 +237,9 @@ export function apply(ctx, rawConfig = {}) {
           taskId,
           from: meta.from,
           text: wakeText(meta, 1, true),
+          // 必须显式传：delivery 的 send 会拿 item.deferred 重新生成唤醒文本，
+          // 少了这行账本里就是 false，真正投出去时不带「补叫」标记。
+          deferred: true,
           notBefore: now + deferFor,
         });
         continue;
@@ -252,6 +255,79 @@ export function apply(ctx, rawConfig = {}) {
         text: wakeText(meta, 1, false),
       });
     }
+  }
+
+  /* ───────────────────── 自动续跑 ───────────────────── */
+
+  /**
+   * 任务没完成就自己再排一次（`wakeSelfContinue`，默认关）。
+   *
+   * 唤醒在此之前只有一个来源：别人发了消息。于是「最后一条没人回」= 链断在那儿，
+   * 任务卡还挂在 running 上，没有任何人再来推它一把 —— 姐妹之间要「自己转下去」，
+   * 缺的就是这一环。
+   *
+   * 补法：一次投递结束、账上这张卡已经空了、任务还是 running，就排下一条唤醒，
+   * 到冷却结束再叫自己接着干。
+   *
+   * 四道刹车，缺一条都可能变成自己刷自己：
+   *   1. 开关默认关，不点着不转（每转一轮都是一整轮 token）
+   *   2. 只续**自己名下**的 running 卡；别人的、done、cancelled、blocked 都不续
+   *   3. 账上这张卡还有待投的项就不排 —— 别人已经在叫了，别叠第二条
+   *   4. 同一张卡最多连续 `wakeSelfContinueMax` 次，到了写一条 warn note 停手
+   *
+   * 判据一律读事件流（`latestTasks`），不另存状态：重启后看到的任务状态就是真的。
+   * 只有「连了几次」放内存 —— 重启清零是对的，重启后本来就该重新给一次机会。
+   */
+  const selfRunCount = new Map();
+
+  function selfContinueText(task, n, max) {
+    return `【协作看板自动触发（自动续跑 ${n}/${max}）】任务 ${task.taskId}「${task.title}」`
+      + `还是 ${task.status}，而且没有新消息 —— 这条是插件自己排的，不是谁在跟你说话。`
+      + '先调 collab_state 读增量，接着把它干完；干完就标成 done，标完这条链自己会停。'
+      + '不许为了不断链而空转：没有实际进展就标 blocked，写一条 note 说清卡在哪。';
+  }
+
+  function maybeSelfContinue(item) {
+    const s = getSettings();
+    if (s.wakeSelfContinue !== true) return;
+    const taskId = typeof item.taskId === 'string' ? item.taskId : '';
+    if (!taskId) return;
+
+    const task = latestTasks(readEvents()).get(taskId);
+    const stop = () => { selfRunCount.delete(taskId); };
+    if (!task || task.archived) return stop();
+    if (task.status !== 'running') return stop();
+    if (task.owner !== identity.origin) return stop();
+
+    const max = Math.max(1, Number(s.wakeSelfContinueMax) || 8);
+    const n = (selfRunCount.get(taskId) || 0) + 1;
+    if (n > max) {
+      stop();
+      const note = buildEvent({
+        kind: 'note',
+        level: 'warn',
+        text: `自动续跑 ${taskId} 连续 ${max} 次还是 ${task.status}，停了。`
+          + '要么它其实干完了没标 done，要么它卡住了 —— 人工看一眼再决定。',
+      });
+      if (note) appendEvent(note);
+      return;
+    }
+
+    // 账上这张卡还有**别的**待投项就不排 —— 别人已经在叫了，别叠第二条。
+    // 必须排除正在投的这一条：send 成功回调里，这一条还没从账上摘掉。
+    if (delivery.state().items.some((it) => it.taskId === taskId && it.eventId !== item.eventId)) return;
+
+    selfRunCount.set(taskId, n);
+    const cooldown = Math.max(60000, Number(s.wakeCooldownMs) || 300000);
+    delivery.offer({
+      eventId: `ev_self_${taskId}_${Date.now().toString(36)}_${n}`,
+      taskId,
+      from: displayName(),
+      kind: 'self',
+      text: selfContinueText(task, n, max),
+      notBefore: Date.now() + cooldown,
+      deferred: false,
+    });
   }
 
   /* ───────────────────── Hub 生命周期 ───────────────────── */
@@ -274,12 +350,24 @@ export function apply(ctx, rawConfig = {}) {
   const delivery = createDelivery({
     file: join(dataDir, 'inflight.json'),
     retries: () => getSettings().wakeRetries,
-    send: (item) => wakeAgent(wakeText({ taskId: item.taskId, from: item.from }, item.attempts, item.deferred))
-      .then((r) => {
+    send: (item) => {
+      // 续跑项的文本在 offer 时就算好了（要带任务标题和次数），直接用账里的那份；
+      // 别人发的消息才按 attempts / deferred 现生成。
+      const text = item.kind === 'self' && item.text
+        ? item.text
+        : wakeText({ taskId: item.taskId, from: item.from }, item.attempts, item.deferred);
+      return wakeAgent(text).then((r) => {
         // 冷却从「真正投出去」那一刻算：投递可能等一整轮，别让它占发起时刻
         wakeState.lastAt.set(item.taskId || 'global', Date.now());
         return r;
-      }),
+      });
+    },
+    // 续跑要等这一条从账上摘掉、落了盘之后才排，否则会被合并逻辑并进本条（见 delivery.mjs）。
+    onDelivered: (item) => {
+      try { maybeSelfContinue(item); } catch (e) {
+        hubLog('warn', `自动续跑排期失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
     onGiveUp: (item) => {
       const note = buildEvent({
         kind: 'note',
