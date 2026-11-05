@@ -57,6 +57,17 @@ export function settingsSpec(maxEventsDefault = 5000) {
      * 现在失败会留在投递账本里重试，次数由这里定。设 1 = 不重试，行为和旧版一致。
      */
     wakeRetries: { kind: 'int', min: 1, max: 10, def: 3 },
+    /**
+     * 任务没完成就自己再叫一次。
+     *
+     * 唤醒原本只有「别人发了消息」这一个来源：谁最后一条不回，链就断在那儿。
+     * 打开后，一轮投递结束时如果那张卡还是 running，插件自己排下一条唤醒，
+     * 到冷却结束再叫自己接着干。**默认关**：这是会让 agent 自己转起来的开关，
+     * 不点着就不转 —— 每转一轮都是一整轮 token。
+     */
+    wakeSelfContinue: { kind: 'bool', def: false },
+    /** 同一张卡最多连续续跑几次。到了就写一条 warn note 停下，不无限刷。 */
+    wakeSelfContinueMax: { kind: 'int', min: 1, max: 50, def: 8 },
   };
 }
 
