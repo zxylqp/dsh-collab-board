@@ -12,7 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
 import { createDelivery } from '../src/host/delivery.mjs';
-import { shouldWake, maxSeenOf } from '../src/host/wake.mjs';
+import { shouldWake, maxSeenOf, newerSeen } from '../src/host/wake.mjs';
+import { createStore } from '../src/host/store.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
 
 let pass = 0;
@@ -858,6 +859,61 @@ async function main() {
 
   for (const c of contCtx2.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
   rmSync(contDir, { recursive: true, force: true });
+
+  /* ───────────────────── 启动接 Hub 失败重试（0.10.12） ───────────────────── */
+
+  console.log('\n12d. 启动接 Hub 失败会退避重试');
+  const retryDir = mkdtempSync(join(tmpdir(), 'collab-bootretry-'));
+  writeFileSync(join(retryDir, 'settings.json'), JSON.stringify({
+    role: 'member',
+    hubAddress: 'http://127.0.0.1:1',
+  }), 'utf8');
+  const warns = [];
+  const retryCtx = makeCtx({});
+  retryCtx.ctx.logger = { info() {}, warn(msg) { warns.push(String(msg)); } };
+  apply(retryCtx.ctx, { dataDir: retryDir, syncLanInbox: false });
+  // 首次 800ms，失败后等 3s 再试：4.6 秒内应该看到两条
+  await new Promise((r) => setTimeout(r, 4600));
+  const hits = warns.filter((w) => w.includes('启动接 Hub 失败'));
+  check('第一次失败后会自动重试（4.6 秒内至少两次）', hits.length >= 2, JSON.stringify(hits));
+  check('重试日志写明第几次和等待秒数', /第 2 次.*秒后重试/.test(hits[1] || ''), hits[1] || '');
+  for (const c of retryCtx.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
+  rmSync(retryDir, { recursive: true, force: true });
+
+  /* ───────────────────── 「本机已见」要算上 sidecar（0.10.12） ───────────────────── */
+
+  console.log('\n12e. 日志被裁剪后，本机已见不能偏小');
+  const seenDir = mkdtempSync(join(tmpdir(), 'collab-seen-'));
+  const seenLog = join(seenDir, 'events.jsonl');
+  const seenSeq = join(seenDir, '.synced.json');
+  // 模拟 maxEvents 裁剪：日志里只剩到 seq 122，sidecar 却记到了 282
+  writeFileSync(seenLog, [
+    JSON.stringify({ id: 'ev_a', kind: 'msg', origin: 'other', epoch: 1, seq: 10 }),
+    JSON.stringify({ id: 'ev_b', kind: 'msg', origin: 'other', epoch: 1, seq: 122 }),
+  ].join('\n') + '\n', 'utf8');
+  writeFileSync(seenSeq, JSON.stringify({ ev_c: [1, 282], ev_d: [1, 200] }), 'utf8');
+  const seenStore = createStore({
+    logPath: seenLog,
+    seqFile: seenSeq,
+    rejectedFile: join(seenDir, '.rejected.json'),
+    origin: () => 'self',
+    nameOf: () => '我',
+    maxEventsOf: () => 5000,
+    localIso: () => new Date().toISOString(),
+  });
+  const fromLog = maxSeenOf(seenStore.readEvents());
+  const fromSide = seenStore.maxSynced();
+  const seen = newerSeen(fromLog, fromSide);
+  check('只算日志会偏小：只到 122', fromLog.seq === 122, String(fromLog.seq));
+  check('sidecar 记得更高：282', fromSide.seq === 282, String(fromSide.seq));
+  check('两者取大 → 282', seen.seq === 282, JSON.stringify(seen));
+  check('补回来的 seq 200 判成历史，不再叫醒',
+    shouldWake({ kind: 'msg', origin: 'other', epoch: 1, seq: 200 },
+      { selfOrigin: 'self', maxEpoch: seen.epoch, maxSeq: seen.seq }).reason === 'history');
+  check('真新消息 seq 283 仍然会叫',
+    shouldWake({ kind: 'msg', origin: 'other', epoch: 1, seq: 283 },
+      { selfOrigin: 'self', maxEpoch: seen.epoch, maxSeq: seen.seq }).wake === true);
+  rmSync(seenDir, { recursive: true, force: true });
 
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
