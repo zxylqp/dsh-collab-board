@@ -50,6 +50,13 @@ export function settingsSpec(maxEventsDefault = 5000) {
      */
     wakeOnMessage: { kind: 'bool', def: false },
     wakeCooldownMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },
+    /**
+     * 一次唤醒最多投几次（含第一次）。
+     *
+     * 唤醒失败以前没有第二次：宿主没会话、会话忙、进程刚好在重启，都只落一条日志。
+     * 现在失败会留在投递账本里重试，次数由这里定。设 1 = 不重试，行为和旧版一致。
+     */
+    wakeRetries: { kind: 'int', min: 1, max: 10, def: 3 },
   };
 }
 

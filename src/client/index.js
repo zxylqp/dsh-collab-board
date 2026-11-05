@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 21;
-    const VERSION = '0.10.8';
+    const VERSION = '0.10.9';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -54,6 +54,7 @@ window.__ModuleLoader__.load({
       hiddenMembers: '',
       wakeOnMessage: false,
       wakeCooldownMs: 300000,
+      wakeRetries: 3,
     };
 
     const ROLE_LABEL = { solo: '单机', hub: 'Hub', member: '成员' };
@@ -1624,6 +1625,18 @@ window.__ModuleLoader__.load({
                 step: 60000,
                 value: settings.wakeCooldownMs,
                 onCommit: (v) => saveSetting('wakeCooldownMs', v),
+              }),
+            }),
+            h(Field, {
+              label: '唤醒重试',
+              desc: '一次唤醒最多投几次（1～10，默认 3）。投不出去会留在账本里重试，**重启也会补投**；设 1 等于不重试、只试一次。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 1,
+                max: 10,
+                step: 1,
+                value: settings.wakeRetries,
+                onCommit: (v) => saveSetting('wakeRetries', v),
               }),
             }),
             settings.hiddenMembers

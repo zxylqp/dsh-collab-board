@@ -75,6 +75,7 @@ import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
 import { createSettings } from './settings.mjs';
 import { createCapabilities } from './capabilities.mjs';
 import { createStore } from './store.mjs';
+import { createDelivery } from './delivery.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -149,12 +150,14 @@ export function apply(ctx, rawConfig = {}) {
    * 三条护栏，缺一条都不干：
    *   1. 只认**别人发的** `msg`（自己发的不算、note 不算）
    *   2. 同一个 `taskId` / `global` 在冷却期内最多唤醒一次
-   *   3. 正在唤醒时不叠加（`prompt` 会等一整轮跑完，可能几十秒）
+   *   3. 唤醒请求全部进**投递账本**，串行投、失败重试、重启补投 ——
+   *      0.10.8 以前这里是 `busy` 时不叠加、直接 return，那条消息就永远没人叫了。
+   *      账本在 delivery.mjs，和 DS Bot 的 inflight.json 是同一个思路。
    *
    * **代价说清楚**：它会往对话里插一条真实消息，而且会等 agent 干完才返回。
    * 所以默认关，内容里也明写「协作看板自动触发」，不让人以为是凭空冒出来的话。
    */
-  const wakeState = { lastAt: new Map(), busy: false, lastError: '', lastAtIso: '' };
+  const wakeState = { lastAt: new Map() };
 
   async function pickWakeSession() {
     const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
@@ -183,8 +186,18 @@ export function apply(ctx, rawConfig = {}) {
     return { sessionId, stopReason: (r && r.stopReason) || '' };
   }
 
+  /** 唤醒文本。重试时把「第几次」写进消息头，否则 agent 会当成一条新消息。 */
+  function wakeText(meta, attempt = 1) {
+    const where = meta.taskId ? `任务 ${meta.taskId}` : '全局';
+    const retry = attempt > 1
+      ? `（第 ${attempt} 次投递：前面 ${attempt - 1} 次没送到，可能是对端会话忙或宿主重启）`
+      : '';
+    return `【协作看板自动触发${retry}】${meta.from || '对方'} 在${where}发了新消息。`
+      + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
+      + '回完就停，不要连续追问。';
+  }
+
   function considerWake(events) {
-    if (wakeState.busy) return;
     const s = getSettings();
     if (s.wakeOnMessage !== true) return;
 
@@ -201,26 +214,20 @@ export function apply(ctx, rawConfig = {}) {
     });
     if (!target) return;
 
-    const key = target.taskId || 'global';
-    wakeState.lastAt.set(key, now);
-    wakeState.busy = true;
-
-    const where = target.taskId ? `任务 ${target.taskId}` : '全局';
-    const text = `【协作看板自动触发】${target.from || target.name || '对方'} 在${where}发了新消息。`
-      + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
-      + '回完就停，不要连续追问。';
-
-    wakeAgent(text)
-      .then((r) => {
-        wakeState.lastAtIso = new Date().toISOString();
-        wakeState.lastError = '';
-        hubLog('info', `已唤醒会话 ${String(r.sessionId).slice(0, 16)}…（${r.stopReason || '?'}）`);
-      })
-      .catch((e) => {
-        wakeState.lastError = e instanceof Error ? e.message : String(e);
-        hubLog('warn', `唤醒失败：${wakeState.lastError}`);
-      })
-      .finally(() => { wakeState.busy = false; });
+    wakeState.lastAt.set(target.taskId || 'global', now);
+    /**
+     * 只入账，不直接投。
+     *
+     * 账本负责三件以前没人管的事：同一条事件只投一次；正在投的时候再来的排队，
+     * 不丢；投失败留在盘上，重启后补投一次。之前这里 `busy` 一挡，那条消息
+     * 就只剩一个「叫不醒」的现象，谁也不知道它被跳过了。
+     */
+    delivery.offer({
+      eventId: target.id,
+      taskId: target.taskId || '',
+      from: target.from || target.name || '',
+      text: wakeText({ taskId: target.taskId || '', from: target.from || target.name || '' }, 1),
+    });
   }
 
   /* ───────────────────── Hub 生命周期 ───────────────────── */
@@ -229,6 +236,48 @@ export function apply(ctx, rawConfig = {}) {
     if (level === 'warn') ctx.logger?.warn?.(`[collab-hub] ${msg}`);
     else ctx.logger?.info?.(`[collab-hub] ${msg}`);
   };
+
+  /* ───────────────────── 投递账本 ───────────────────── */
+
+  /**
+   * 唤醒请求的落盘账本（inflight.json）。
+   *
+   * 以前唤醒是「试一次，成功与否只写日志」：失败没人重试，重启全忘，
+   * 正在唤醒时来的消息直接丢。现在先记账再投、失败按 `wakeRetries` 重试、
+   * 重启后补投一次 —— 这一层是跟 DS Bot 的 resume.js 学的。
+   * 投递目标不变：还是本机最近活跃的那个会话。
+   */
+  const delivery = createDelivery({
+    file: join(dataDir, 'inflight.json'),
+    retries: () => getSettings().wakeRetries,
+    send: (item) => wakeAgent(wakeText({ taskId: item.taskId, from: item.from }, item.attempts)),
+    onGiveUp: (item) => {
+      const note = buildEvent({
+        kind: 'note',
+        level: 'warn',
+        text: `自动唤醒失败 ${item.max} 次，已放弃：${item.taskId || '全局'}（${item.lastError}）。`
+          + '这条消息还在看板上，人工叫一次就行。',
+      });
+      if (note) appendEvent(note);
+    },
+    log: (level, msg) => hubLog(level, `投递：${msg}`),
+  });
+
+  /** 重启后补投：等 3 秒让宿主把会话都打开（DS Bot 用的是同一个值）。 */
+  ctx.effect(() => {
+    const boot = setTimeout(() => {
+      // 开关关着就不补：账本留着，下次打开再补。别在人家关掉唤醒之后还去点会话。
+      if (getSettings().wakeOnMessage !== true) return;
+      const snap = delivery.snapshot();
+      if (snap.queued > 0) hubLog('info', `重启补投 ${snap.queued} 条`);
+      delivery.kick();
+    }, 3000);
+    if (typeof boot.unref === 'function') boot.unref();
+    return () => {
+      clearTimeout(boot);
+      delivery.close();
+    };
+  });
 
   const displayName = () => getSettings().selfName || hostname();
 
@@ -589,6 +638,7 @@ export function apply(ctx, rawConfig = {}) {
             if (req.method !== 'GET') return jsonReply(res, 405, { ok: false, error: 'method' });
             let serverInfo = null;
             try { serverInfo = hubRuntime.server ? hubRuntime.server.info() : null; } catch { serverInfo = null; }
+            const wake = delivery.snapshot();
             return jsonReply(res, 200, {
               ok: true,
               plugin: 'dsh-collab-board',
@@ -604,12 +654,17 @@ export function apply(ctx, rawConfig = {}) {
                * 唤醒链路状态。没有它，「没叫醒」就只能猜：是开关没开、
                * 没有活会话，还是 prompt 报错了 —— 三种都表现为「没反应」。
                * 报出来之后，另一台机器（或人）一眼能分出是哪一种。
+               *
+               * `queued` / `attempts` 是 0.10.9 加的：有账本之后，
+               * 「没叫醒」还要分出「还在排队」「重试中」「已放弃」三种。
                */
               wake: {
                 on: getSettings().wakeOnMessage === true,
-                busy: wakeState.busy,
-                lastAt: wakeState.lastAtIso || '',
-                lastError: wakeState.lastError || '',
+                busy: wake.queued > 0,
+                lastAt: wake.lastAt || '',
+                lastError: wake.lastError || '',
+                queued: wake.queued,
+                attempts: wake.attempts,
               },
               dataDir,
             });

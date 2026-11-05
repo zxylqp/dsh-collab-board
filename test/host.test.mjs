@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, appendFileSync, exist
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
+import { createDelivery } from '../src/host/delivery.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
 
 let pass = 0;
@@ -572,7 +573,112 @@ async function main() {
   const hubBack = await hit(routes, '/collab-board/hub');
   check('停了以后 running=false', hubBack.payload?.running === false);
 
-  console.log('\n10. 卸载');
+  /* ───────────────────── 投递账本（0.10.9） ───────────────────── */
+
+  console.log('\n11. 投递账本（先记账、去重、按项重试）');
+
+  async function waitFor(cond, ms = 3000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (cond()) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return false;
+  }
+
+  const df = join(mkdtempSync(join(tmpdir(), 'collab-delivery-')), 'inflight.json');
+  const calls = [];
+  const given = [];
+  let failOnce = true;
+  const d = createDelivery({
+    file: df,
+    delayMs: 20,
+    retries: () => 3,
+    send: async (item) => {
+      calls.push(item.eventId);
+      // ev_a 第一次失败，模拟「宿主没会话 / 会话忙」
+      if (item.eventId === 'ev_a' && failOnce) { failOnce = false; throw new Error('宿主忙'); }
+    },
+    onGiveUp: (item) => given.push(item.eventId),
+  });
+  d.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' });
+  check('第一次入账成功', d.snapshot().queued === 1 || calls.includes('ev_a'),
+    JSON.stringify(d.snapshot()));
+  check('同一条再 offer 不会重复入账', d.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' }) === false);
+  await waitFor(() => calls.includes('ev_a'));
+  check('失败后账本还留着（不是只写日志）', d.snapshot().queued === 1, JSON.stringify(d.snapshot()));
+  check('失败信息进了账本', d.snapshot().lastError === '宿主忙', d.snapshot().lastError);
+
+  // 坏项不该堵住后面的：ev_b 立刻能投
+  d.offer({ eventId: 'ev_b', taskId: 't2', from: '姐', text: 'y' });
+  await waitFor(() => calls.includes('ev_b'));
+  check('坏项在队头也不堵后面的消息', calls.includes('ev_b'), JSON.stringify(calls));
+
+  await waitFor(() => calls.filter((x) => x === 'ev_a').length === 2, 1000);
+  check('到点自动重试并成功', calls.filter((x) => x === 'ev_a').length === 2, JSON.stringify(calls));
+  await waitFor(() => d.snapshot().queued === 0, 1000);
+  check('投完账本清空', d.snapshot().queued === 0);
+  d.close();
+
+  const df2 = join(mkdtempSync(join(tmpdir(), 'collab-delivery2-')), 'inflight.json');
+  const given2 = [];
+  const d2 = createDelivery({
+    file: df2,
+    delayMs: 10,
+    retries: () => 2,
+    send: async () => { throw new Error('一直送不到'); },
+    onGiveUp: (item) => given2.push(item.eventId),
+  });
+  d2.offer({ eventId: 'ev_dead', taskId: 't3', from: '姐', text: 'z' });
+  await waitFor(() => given2.includes('ev_dead'), 2000);
+  check('超过 wakeRetries 就放弃', given2.includes('ev_dead'), JSON.stringify(given2));
+  check('放弃后账本不堵着', d2.snapshot().queued === 0);
+  d2.close();
+
+  console.log('\n12. 重启补投（投递账本接进插件）');
+  const restartDir = mkdtempSync(join(tmpdir(), 'collab-restart-'));
+  writeFileSync(join(restartDir, 'settings.json'), JSON.stringify({ wakeOnMessage: true }), 'utf8');
+  writeFileSync(join(restartDir, 'inflight.json'), JSON.stringify({
+    version: 1,
+    items: [{
+      eventId: 'ev_restart_1',
+      taskId: 't-restart',
+      from: '姐',
+      text: '上次没送到',
+      attempts: 1,
+      at: Date.now(),
+      nextAt: 0,
+      lastError: '宿主忙',
+    }],
+    done: [],
+  }), 'utf8');
+  const restartCalls = [];
+  const services2 = {
+    sessionController: {
+      list: async () => ({ items: [{ sessionId: 'sess-restart', updatedAt: Date.now(), agentAvailable: true }] }),
+      prompt: async (request, signal) => {
+        restartCalls.push({ request });
+        signal.throwIfAborted();
+        return { accepted: true };
+      },
+    },
+  };
+  const second = makeCtx(services2);
+  apply(second.ctx, { dataDir: restartDir, syncLanInbox: false });
+  await new Promise((r) => setTimeout(r, 3600));
+  check('重启后真的补投了一次', restartCalls.length === 1, `calls=${restartCalls.length}`);
+  check('补投的文本标明是第 2 次',
+    String(restartCalls[0]?.request?.content?.[0]?.text || '').includes('第 2 次投递'),
+    String(restartCalls[0]?.request?.content?.[0]?.text || '').slice(0, 80));
+  const afterRestart = JSON.parse(readFileSync(join(restartDir, 'inflight.json'), 'utf8'));
+  check('补投成功后账本清空', Array.isArray(afterRestart.items) && afterRestart.items.length === 0,
+    JSON.stringify(afterRestart.items));
+  for (const c of second.cleanups.reverse()) {
+    try { c(); } catch { /* 忽略 */ }
+  }
+  rmSync(restartDir, { recursive: true, force: true });
+
+  console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
   }

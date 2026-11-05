@@ -116,7 +116,7 @@ TCP 48910 必须放行，否则连不上。
 
 ```bash
 # 宿主集成测试：假 ctx 加载真的 apply()，不重启 DSH
-node test/host.test.mjs       # 88 项
+node test/host.test.mjs       # 100 项
 
 # Hub 端到端：起真服务、走真 HTTP、真实 UDP
 node test/hub.test.mjs        # 70 项
@@ -132,7 +132,9 @@ node test/hub.test.mjs        # 70 项
 
 - **默认不会自动叫醒 AI**：插件能写「有活等人接」的提示，也能自动认领任务卡，
   但 DSH 的 agent 只在被消息触发时跑一轮。打开 `wakeOnMessage` 后，收到别人的消息会调
-  `sessionController.prompt` 叫起本机 agent —— **代价**是它会往对话里插一条真实消息
+  `sessionController.prompt` 叫起本机 agent —— **代价**是它会往对话里插一条真实消息。
+  叫不醒不会静默丢：唤醒请求记在 `inflight.json`，失败按「唤醒重试」次数重试，
+  重启后补投一次（0.10.9）。
 - 成员离线状态按事件流算，面板上看不出谁刚掉线（`/members` 接口里有 `online`，界面还没接）
 - 只做 hub 模式的文件传输，小文件内联进事件（inline）还没接
 - 明确不做：审批流、事件回放、统计、搜索、任务转让、子任务、里程碑
