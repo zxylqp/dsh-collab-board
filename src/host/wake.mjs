@@ -81,3 +81,24 @@ export function maxSeenOf(events) {
   }
   return { epoch, seq };
 }
+
+/**
+ * 两个「本机已见」取更新的那个。
+ *
+ * 为什么要两份：`maxSeenOf` 读的是 `events.jsonl`，而那份文件**按上限裁剪**过 ——
+ * 最老的行会被删掉，算出来的最大值会比真实的小。2026-11-05 真机就是这个：
+ * 日志截断后最大只到 seq 122，重连 Hub 补回 123～282 时全被判成新消息，
+ * 连着三轮「补叫」其实全是历史重放，增量读出来是 0。
+ *
+ * `.synced.json`（sidecar）不受裁剪影响：它按事件 id 记 `[epoch, seq]`，只增不减。
+ * 两边各算一份，取大 —— 日志被裁了，sidecar 还记着；sidecar 丢过，日志还在。
+ */
+export function newerSeen(a, b) {
+  const ae = Number(a && a.epoch) || 0;
+  const as = Number(a && a.seq) || 0;
+  const be = Number(b && b.epoch) || 0;
+  const bs = Number(b && b.seq) || 0;
+  if (be > ae) return { epoch: be, seq: bs };
+  if (be < ae) return { epoch: ae, seq: as };
+  return { epoch: ae, seq: Math.max(as, bs) };
+}
