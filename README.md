@@ -112,11 +112,23 @@ TCP 48910 必须放行，否则连不上。
 
 数据目录可以在 `cordis.patch.yml` 里改（`dataDir`），改完要重启。
 
+**全新安装是干净的**：仓库里只有代码，不带任何事件日志、身份文件或测试数据。
+插件第一次启动时在 `~/.dsh/collab` 建一套空数据，生成新的 `origin` 和 `groupId`，
+`role` 默认 `solo` —— 不会自动连任何 Hub，也看不到别人板上的历史。
+
+想彻底重来（清空本机全部看板数据，从零开始）：先退出 DSH，再删掉数据目录。
+
+```bash
+rm -rf ~/.dsh/collab      # Windows: rmdir /s /q %USERPROFILE%\.dsh\collab
+```
+
+**升级不会清数据**：覆盖源码 + 重启即可，事件日志、身份、任务卡都保留。
+
 ## 开发
 
 ```bash
 # 宿主集成测试：假 ctx 加载真的 apply()，不重启 DSH
-node test/host.test.mjs       # 114 项
+node test/host.test.mjs       # 119 项
 
 # Hub 端到端：起真服务、走真 HTTP、真实 UDP
 node test/hub.test.mjs        # 70 项
