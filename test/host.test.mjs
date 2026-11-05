@@ -751,6 +751,114 @@ async function main() {
   }
   rmSync(restartDir, { recursive: true, force: true });
 
+  /* ───────────────────── 自动续跑（0.10.11） ───────────────────── */
+
+  console.log('\n12b. 自动续跑（任务没完成就自己再排一次）');
+  const contDir = mkdtempSync(join(tmpdir(), 'collab-continue-'));
+
+  // 先用一次 apply 把 identity.json 生出来：任务卡的 owner 得是「自己」才续跑。
+  const probe = makeCtx({});
+  apply(probe.ctx, { dataDir: contDir, syncLanInbox: false });
+  let contOrigin = '';
+  try {
+    contOrigin = JSON.parse(readFileSync(join(contDir, 'identity.json'), 'utf8')).origin || '';
+  } catch { /* 下面会红 */ }
+  for (const c of probe.cleanups.reverse()) {
+    try { c(); } catch { /* 忽略 */ }
+  }
+
+  writeFileSync(join(contDir, 'settings.json'), JSON.stringify({
+    wakeOnMessage: true,
+    wakeSelfContinue: true,
+    wakeSelfContinueMax: 2,
+    wakeCooldownMs: 60000,
+  }), 'utf8');
+  // 一张还在 running、归自己的卡
+  writeFileSync(join(contDir, 'events.jsonl'), JSON.stringify({
+    id: 'ev_cont_task_1',
+    kind: 'task', taskId: 't-cont', title: '续跑测试', status: 'running', owner: contOrigin,
+  }) + '\n', 'utf8');
+  // 一条「上次没送到」的唤醒，靠重启补投把它投出去
+  writeFileSync(join(contDir, 'inflight.json'), JSON.stringify({
+    version: 1,
+    items: [{
+      eventId: 'ev_cont_1',
+      taskId: 't-cont',
+      from: '姐',
+      text: '上次没送到',
+      attempts: 1,
+      at: Date.now(),
+      nextAt: 0,
+      lastError: '宿主忙',
+    }],
+    done: [],
+  }), 'utf8');
+
+  const contCalls = [];
+  const contCtx = makeCtx({
+    sessionController: {
+      list: async () => ({ items: [{ sessionId: 'sess-cont', updatedAt: Date.now(), agentAvailable: true }] }),
+      prompt: async (request, signal) => {
+        contCalls.push(request);
+        signal.throwIfAborted();
+        return { accepted: true };
+      },
+    },
+  });
+  apply(contCtx.ctx, { dataDir: contDir, syncLanInbox: false });
+  await new Promise((r) => setTimeout(r, 3600));
+
+  check('补投那条真的送出去了', contCalls.length === 1, `calls=${contCalls.length}`);
+  let contLedger = { items: [] };
+  try {
+    contLedger = JSON.parse(readFileSync(join(contDir, 'inflight.json'), 'utf8'));
+  } catch { /* 下面会红 */ }
+  const selfItem = (contLedger.items || []).find((it) => String(it.eventId).startsWith('ev_self_t-cont_'));
+  check('任务还在 running → 自己排了下一次唤醒', Boolean(selfItem),
+    JSON.stringify((contLedger.items || []).map((it) => it.eventId)));
+  check('续跑项标了 kind=self 并带次数',
+    selfItem?.kind === 'self' && String(selfItem?.text || '').includes('自动续跑 1/2'),
+    String(selfItem?.text || '').slice(0, 80));
+  check('续跑排在冷却之后，不是立刻刷',
+    (Number(selfItem?.nextAt) || 0) > Date.now() + 30000, String(selfItem?.nextAt));
+
+  // 12c. 任务 done 了就不该再续（同一份账本、同一张卡，把状态改成 done）
+  // 先把上一实例关掉：它账上还排着一条 60 秒后的续跑，两个实例不能同时开着一份账本。
+  for (const c of contCtx.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
+  appendFileSync(join(contDir, 'events.jsonl'), JSON.stringify({
+    id: 'ev_cont_task_2',
+    kind: 'task', taskId: 't-cont', title: '续跑测试', status: 'done', owner: contOrigin,
+  }) + '\n', 'utf8');
+  writeFileSync(join(contDir, 'inflight.json'), JSON.stringify({
+    version: 1,
+    items: [{
+      eventId: 'ev_cont_2', taskId: 't-cont', from: '姐', text: '再试一次',
+      attempts: 1, at: Date.now(), nextAt: 0, lastError: '宿主忙',
+    }],
+    done: [],
+  }), 'utf8');
+  const contCtx2 = makeCtx({
+    sessionController: {
+      list: async () => ({ items: [{ sessionId: 'sess-cont2', updatedAt: Date.now(), agentAvailable: true }] }),
+      prompt: async (request, signal) => {
+        contCalls.push(request);
+        signal.throwIfAborted();
+        return { accepted: true };
+      },
+    },
+  });
+  apply(contCtx2.ctx, { dataDir: contDir, syncLanInbox: false });
+  await new Promise((r) => setTimeout(r, 3600));
+  let doneLedger = { items: [] };
+  try {
+    doneLedger = JSON.parse(readFileSync(join(contDir, 'inflight.json'), 'utf8'));
+  } catch { /* 下面会红 */ }
+  check('任务 done 之后不再排续跑', (doneLedger.items || []).length === 0,
+    JSON.stringify((doneLedger.items || []).map((it) => it.eventId)));
+
+  for (const c of contCtx2.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
+  rmSync(contDir, { recursive: true, force: true });
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
