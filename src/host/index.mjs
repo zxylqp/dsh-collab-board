@@ -77,7 +77,7 @@ import { createSettings } from './settings.mjs';
 import { createCapabilities } from './capabilities.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
-import { shouldWake, maxSeenOf, WAKE_SKIP } from './wake.mjs';
+import { shouldWake, maxSeenOf, newerSeen, WAKE_SKIP } from './wake.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -413,8 +413,10 @@ export function apply(ctx, rawConfig = {}) {
   function onPulled(events, meta = {}) {
     const freshly = [];
     const synced = [];
-    // 拉取**之前**本机见过的最高 (epoch, seq) —— 分「重放的历史」和「离线期间的真消息」
-    const maxSeen = maxSeenOf(readEvents());
+    // 拉取**之前**本机见过的最高 (epoch, seq) —— 分「重放的历史」和「离线期间的真消息」。
+    // 日志和 sidecar 各算一份取大：events.jsonl 会被 maxEvents 裁剪，裁过之后
+    // 光看日志算出来的最大值偏小，补回来的历史就会被当新消息（真机中过，见 wake.mjs）。
+    const maxSeen = newerSeen(maxSeenOf(readEvents()), store.maxSynced());
     const known = new Set(
       readEvents().map((e) => (e && typeof e.id === 'string' ? e.id : '')).filter(Boolean),
     );
@@ -510,8 +512,9 @@ export function apply(ctx, rawConfig = {}) {
       name: displayName(),
       capabilities: capabilityPayload().all,
       code: code || '',
-      // 本机见过的最大 seq：重连只拉增量，不从 0 回放历史
-      startSince: maxSeenOf(readEvents()).seq,
+      // 本机见过的最大 seq：重连只拉增量，不从 0 回放历史。
+      // 同样要和 sidecar 取大 —— 只用日志的话，日志裁过就会把已经同步过的历史再拉一遍。
+      startSince: newerSeen(maxSeenOf(readEvents()), store.maxSynced()).seq,
       pending: pendingEvents,
       onPushed,
       onEvents: onPulled,
@@ -1786,26 +1789,50 @@ export function apply(ctx, rawConfig = {}) {
    * 看板单机也能用，连不上 Hub 不该变成整个面板打不开。
    */
   ctx.effect(() => {
-    const s = getSettings();
     let alive = true;
+    /**
+     * 启动连不上就退避重试。
+     *
+     * 0.10.11 以前这里失败只记一条日志，然后 `hubRuntime.client` 永远是 null ——
+     * 真机实测：Hub 20:56:51 才起来，成员机 20:56 重启，join 报 `fetch failed`，
+     * 之后一直挂着，直到有人手动点「连接」才通。两台机器同时重启是常态，
+     * 「谁先起来」不该决定谁整天掉线。
+     *
+     * 退避 3s/5s/10s/20s/30s 之后封顶 60s，直到连上为止；连上了就停。
+     * 每次重试都重新读设置 —— 中途改了地址/角色，下一轮就该用新值。
+     */
+    const RETRY_MS = [3000, 5000, 10000, 20000, 30000, 60000];
+    let timer = null;
+    let attempt = 0;
+
     const boot = async () => {
+      if (!alive) return;
+      // 已经连上了（手动 join、或上一轮重试成功）：不再重试
+      if (hubRuntime.client || hubRuntime.server) return;
+      const s = getSettings();
       try {
         if (s.role === 'hub') {
           await startHubRuntime({ port: s.hubPort, code: s.hubCode });
         } else if (s.role === 'member' && s.hubAddress) {
           await joinHubRemote(s.hubAddress, s.hubCode);
         }
+        attempt = 0;
       } catch (e) {
         hubRuntime.error = e instanceof Error ? e.message : String(e);
         hubRuntime.role = s.role;
-        hubLog('warn', `启动接 Hub 失败：${hubRuntime.error}`);
+        const wait = RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)];
+        attempt += 1;
+        hubLog('warn', `启动接 Hub 失败（第 ${attempt} 次）：${hubRuntime.error}；${Math.round(wait / 1000)} 秒后重试`);
+        timer = setTimeout(() => { if (alive) boot(); }, wait);
+        if (typeof timer.unref === 'function') timer.unref();
       }
     };
-    const timer = setTimeout(() => { if (alive) boot(); }, 800);
-    if (typeof timer.unref === 'function') timer.unref();
+    const first = setTimeout(() => { if (alive) boot(); }, 800);
+    if (typeof first.unref === 'function') first.unref();
     return () => {
       alive = false;
-      clearTimeout(timer);
+      clearTimeout(first);
+      if (timer) clearTimeout(timer);
       // 插件卸载：先断客户端再停服务，别让 client 对着已经关掉的服务重试
       if (hubRuntime.client) { try { hubRuntime.client.stop(); } catch { /* ignore */ } }
       if (hubRuntime.server) { try { hubRuntime.server.close(); } catch { /* ignore */ } }
