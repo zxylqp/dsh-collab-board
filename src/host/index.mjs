@@ -323,7 +323,7 @@ export function apply(ctx, rawConfig = {}) {
     const taskId = typeof item.taskId === 'string' ? item.taskId : '';
     if (!taskId) return;
 
-    const task = latestTasks(readEvents()).get(taskId);
+    const task = latestTasks(viewEvents()).get(taskId);
     const stop = () => { selfRunCount.delete(taskId); };
     if (!task || task.archived) return stop();
     if (task.status !== 'running') return stop();
@@ -592,7 +592,13 @@ export function apply(ctx, rawConfig = {}) {
     if (note) appendEvent(note);
   }
 
-  /** 挂一个 Hub 客户端。Hub 本机也走这条 —— 一条路径，不分支。 */
+  /**
+   * 挂一个 Hub 客户端。Hub 本机也走这条 —— **同步**一条路径，不分支。
+   *
+   * 注意「同步一条路径」不等于「读视图也只能读本机日志」：本机日志是这条增量路径的
+   * 产物，seq 一旦断层就永久残缺（见本文件的 `viewEvents`，记了 2026-11-06 那次真机事故）。
+   * 所以 `role === 'hub'` 时，面板和 agent 的读路径改读 Hub 内存里那份全量。
+   */
   function attachClient(baseUrl, code) {
     if (hubRuntime.client) {
       try { hubRuntime.client.stop(); } catch { /* 停了就算了 */ }
@@ -815,8 +821,39 @@ export function apply(ctx, rawConfig = {}) {
 
   /* ───────────────────── 面板数据 ───────────────────── */
 
+  /**
+   * 面板 / agent 看到的**视图事件流**（0.11.3）。
+   *
+   * 为什么不能只读本机 `events.jsonl`：那份是「增量同步的产物」，不是全量事实。
+   * Hub 本机也挂着一个 client 走增量拉（`attachClient`），`startSince` 取
+   * 「本地日志最大 seq」和 sidecar 的最大值 —— 本地日志一旦残缺（裁过、清过、
+   * 或哪次同步没补齐），缺口就**永久**补不回来：从缺口末尾往后拉，缺口本身再没人要。
+   *
+   * 2026-11-06 真机就是这一条：本机 `events.jsonl` 只剩 16 条 member/hub/msg，
+   * 全部 140 条 `task` 事件落在 seq 4–307 的缺口里，于是**任务列表空白、动态流正常**
+   * （msg/note 恰好都是缺口之后的新消息）。而完整历史一直在 `hub-events.jsonl` 里躺着。
+   *
+   * 所以 `role === 'hub'` 时直接读 Hub 内存里那份全量 —— 它既是全量，也是权威序，
+   * 面板没有理由绕一圈去读残缺的缓存。「一条路径不分支」说的是**同步**只有一条路，
+   * 不是**读视图**也必须读同一份文件；同步缺陷不该让视图陪葬。
+   *
+   * 仍要并上本机独有的那些：刚写完还没推上去的（pending）、被 Hub 拒掉的
+   * （`readEvents` 已滤掉，不进视图）。不并的话，发一条卡会先消失再出现。
+   */
+  function viewEvents() {
+    const local = readEvents();
+    if (hubRuntime.role !== 'hub' || !hubRuntime.server) return local;
+    let hubEvents = [];
+    try { hubEvents = hubRuntime.server.eventsSince(0) || []; } catch { return local; }
+    if (!Array.isArray(hubEvents) || hubEvents.length === 0) return local;
+    const seen = new Set();
+    for (const e of hubEvents) if (e && typeof e.id === 'string' && e.id) seen.add(e.id);
+    const extra = local.filter((e) => e && !(typeof e.id === 'string' && seen.has(e.id)));
+    return extra.length ? hubEvents.concat(extra) : hubEvents;
+  }
+
   function panelState(since = 0) {
-    const all = readEvents();
+    const all = viewEvents();
     return { ok: true, total: all.length, events: all.slice(since) };
   }
 
@@ -848,7 +885,7 @@ export function apply(ctx, rawConfig = {}) {
    * 这是给 agent 省 token 的，不是给它做审计的。要全量去调 `/collab-board/state`。
    */
   function readBoard(opts = {}) {
-    const all = readEvents();
+    const all = viewEvents();
     const maxSeq = all.reduce((m, e) => (Number.isFinite(e.seq) ? Math.max(m, e.seq) : m), 0);
     const from = Number.isFinite(Number(opts.since))
       ? Number(opts.since)
@@ -1054,7 +1091,7 @@ export function apply(ctx, rawConfig = {}) {
               const body = await readBody(req);
               const ids = [];
               if (body && body.allFinished === true) {
-                for (const t of latestTasks(readEvents()).values()) {
+                for (const t of latestTasks(viewEvents()).values()) {
                   if (!t || t.deleted === true) continue;
                   if (t.status !== 'done' && t.status !== 'cancelled') continue;
                   ids.push(String(t.taskId));
@@ -1064,7 +1101,7 @@ export function apply(ctx, rawConfig = {}) {
               }
               if (ids.length === 0) return jsonReply(res, 400, { ok: false, error: '没有要删的卡' });
               // 已经删过的、根本不存在的都跳过：重复点不该再写一条墓碑
-              const latest = latestTasks(readEvents());
+              const latest = latestTasks(viewEvents());
               const already = new Set(
                 [...latest.values()].filter((t) => t.deleted === true).map((t) => t.taskId),
               );
@@ -1727,7 +1764,7 @@ export function apply(ctx, rawConfig = {}) {
    */
   function resolveMentions(list) {
     const nameMap = new Map();
-    for (const ev of readEvents()) {
+    for (const ev of viewEvents()) {
       if (!ev || ev.kind !== 'member') continue;
       const name = typeof ev.name === 'string' ? ev.name.trim() : '';
       const target = typeof ev.target === 'string' ? ev.target.trim() : '';
@@ -1810,7 +1847,7 @@ export function apply(ctx, rawConfig = {}) {
           if (targets.length === 1) ev.to = targets[0];
           else if (targets.length > 1) ev.to = targets;
         } else if (ev.taskId) {
-          const owner = latestTasks(readEvents()).get(ev.taskId)?.owner || '';
+          const owner = latestTasks(viewEvents()).get(ev.taskId)?.owner || '';
           // 自己的卡不用「叫自己」；待认领的卡没有 owner，保持广播让看板可见
           if (owner && owner !== identity.origin) ev.to = owner;
         }
@@ -1937,7 +1974,7 @@ export function apply(ctx, rawConfig = {}) {
     if (!ev || ev.kind !== 'task') return;
     // 没写 owner = 不动它（Hub 会沿用当前值），不用校验
     if (!Object.prototype.hasOwnProperty.call(ev, 'owner')) return;
-    const tasks = latestTasks(readEvents());
+    const tasks = latestTasks(viewEvents());
     const prev = tasks.get(ev.taskId);
     const err = ownerTransitionError({
       nextOwner: ev.owner,
@@ -1994,7 +2031,7 @@ export function apply(ctx, rawConfig = {}) {
         if (now - lastScan < every) return;
         lastScan = now;
 
-        const list = pickClaimable(readEvents());
+        const list = pickClaimable(viewEvents());
         if (list.length === 0) return;
 
         busy = true;
@@ -2063,7 +2100,7 @@ export function apply(ctx, rawConfig = {}) {
 
         // 和自动认领同一份判据：**自己建的卡不喊**。之前这里漏了排除，
         // 于是同一张卡「认领不接、提醒却喊」，两个信号互相打脸。
-        const rows = claimableTasks(readEvents(), {
+        const rows = claimableTasks(viewEvents(), {
           selfOrigin: identity.origin,
                   });
         for (const { task, ok } of rows) {
@@ -2137,7 +2174,7 @@ export function apply(ctx, rawConfig = {}) {
         lastScanAt = now;
         const cutoff = now - days * 86400000;
         let n = 0;
-        for (const t of latestTasks(readEvents()).values()) {
+        for (const t of latestTasks(viewEvents()).values()) {
           if (!t || t.deleted === true) continue;
           if (t.status !== 'done' && t.status !== 'cancelled') continue;
           const ts = Date.parse(String(t.ts || ''));

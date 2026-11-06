@@ -1442,6 +1442,18 @@ export async function startHub(opts = {}) {
     }),
     members: memberList,
     tasks: () => [...tasks.values()],
+    /**
+     * 权威事件流（只读浅拷贝，0.11.3）。
+     *
+     * 存在的理由：本机那份 `events.jsonl` 是**增量同步的产物**，不是全量事实 ——
+     * seq 一旦断层就永久补不回来（详见 index.mjs 的 `viewEvents`）。Hub 内存里
+     * 这一份是「还原日志 + 逐条 applyIndex」出来的全量，且就是这个组的权威序。
+     * `role === 'hub'` 时面板和 agent 读它，不再绕本机缓存。
+     */
+    eventsSince: (since = 0) => {
+      const from = Number.isFinite(Number(since)) && Number(since) > 0 ? Number(since) : 0;
+      return from === 0 ? events.slice() : events.slice(from);
+    },
     systemWrite,
     fork: () => fork,
     peers: () => (discovery ? discovery.livePeers() : []),

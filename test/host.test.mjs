@@ -694,6 +694,68 @@ async function main() {
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }, { id: 'x' }])) === '{"epoch":2,"seq":3}',
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }])));
 
+  /* ───────────────────── 视图源（0.11.3） ───────────────────── */
+
+  console.log('\n9f. role=hub 时视图读 Hub 全量，不读残缺的本机日志');
+  /**
+   * 复刻 2026-11-06 真机事故：本机 `events.jsonl` 只剩十几条 member/hub/msg，
+   * 全部 `task` 事件落在 seq 断层的缺口里 —— 于是**任务列表空白、动态流正常**
+   * （msg/note 恰好都在缺口之后）。而完整历史一直在 Hub 那边。
+   *
+   * 视图源分支之后：`role === 'hub'` 时面板和 agent 读 Hub 内存里那份全量，
+   * 本机日志缺成什么样都不再影响显示。
+   */
+  const hubBefore = await hit(routes, '/collab-board/hub');
+  check('9f 前置：本机是 Hub', hubBefore.payload?.role === 'hub', String(hubBefore.payload?.role));
+  const hubEventCount = Number(hubBefore.payload?.server?.events) || 0;
+  check('9f 前置：Hub 里有相当多事件', hubEventCount > 5, String(hubEventCount));
+
+  const stateBeforeTrunc = await hit(routes, '/collab-board/state');
+  const t1Before = (stateBeforeTrunc.payload?.events || [])
+    .find((e) => e && e.kind === 'task' && e.taskId === 't1');
+  check('9f 前置：截断前 /state 有 t1 的 task 事件', Boolean(t1Before));
+
+  // 只留 member 事件 —— 就是真机上那十几条的形状（任务、对话、进度全没了）
+  const beforeRows = readFileSync(logPath, 'utf8').trim().split('\n')
+    .filter(Boolean).map((l) => JSON.parse(l));
+  const membersOnly = beforeRows.filter((e) => e && e.kind === 'member');
+  writeFileSync(
+    logPath,
+    membersOnly.length ? `${membersOnly.map((e) => JSON.stringify(e)).join('\n')}\n` : '',
+    'utf8',
+  );
+  const afterRows = readFileSync(logPath, 'utf8').trim().split('\n')
+    .filter(Boolean).map((l) => JSON.parse(l));
+  check('9f 本机日志里确实一条 task 事件都没有了',
+    afterRows.filter((e) => e.kind === 'task').length === 0, `${afterRows.length} 条`);
+
+  const stateAfterTrunc = await hit(routes, '/collab-board/state');
+  const t1After = (stateAfterTrunc.payload?.events || [])
+    .find((e) => e && e.kind === 'task' && e.taskId === 't1');
+  check('9f 本机日志残缺时 /state 仍看得见 task（读 Hub 全量）', Boolean(t1After),
+    `total=${stateAfterTrunc.payload?.total}`);
+  check('9f 看得见的那条带 Hub 分配的 seq（不是本机缓存补出来的）',
+    Boolean(t1After) && Number.isFinite(t1After.seq), JSON.stringify(t1After?.seq));
+  check('9f /state 总条数覆盖 Hub 全量',
+    Number(stateAfterTrunc.payload?.total) >= hubEventCount,
+    `${stateAfterTrunc.payload?.total} vs ${hubEventCount}`);
+
+  const boardTool = findTool(tools, 'collab_state');
+  const board = await boardTool.execute({ full: true, advance: false, limit: 100 });
+  const boardOut = JSON.parse(String(board.text));
+  const cardCount = (boardOut.watching || []).length + (boardOut.mine || []).length
+    + (boardOut.others || []).length + (boardOut.pending || []).length;
+  check('9f agent 读看板也看得见卡（不再是零张）', cardCount > 0,
+    JSON.stringify({
+      watching: (boardOut.watching || []).length,
+      mine: (boardOut.mine || []).length,
+      others: (boardOut.others || []).length,
+      pending: (boardOut.pending || []).length,
+    }));
+  check('9f agent 的增量流里也有 task 事件',
+    (boardOut.unread || []).some((e) => e.kind === 'task'),
+    `${(boardOut.unread || []).length} 条未读`);
+
   console.log('\n10. 停止 Hub');
   const stop = await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
   check('hub/stop 200', stop.status === 200 && stop.payload?.stopped === true);

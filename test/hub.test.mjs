@@ -140,6 +140,25 @@ async function main() {
     repush.data.accepted[0].seq === pushA.data.accepted[0].seq,
     `${repush.data.accepted[0].seq} vs ${pushA.data.accepted[0].seq}`);
 
+  /**
+   * `eventsSince` 是 `role === 'hub'` 时面板/agent 的视图源（0.11.3）。
+   *
+   * 单独立一条的理由：宿主侧调它时包了 try/catch（读不到就退回本机日志，
+   * 宁可视图旧一点也别让面板白掉）—— 那个兜底会把「访问器被删掉或改名」
+   * 静默退化成老 bug（本机日志残缺 → 任务列表空白）。这里钉死契约。
+   */
+  const viewAll = hub.controller.eventsSince(0);
+  const viewFrom1 = hub.controller.eventsSince(1);
+  const hubTotal = hub.controller.info().events;
+  check('eventsSince(0) 给出 Hub 内存里的全量', viewAll.length === hubTotal && hubTotal >= 1,
+    `${viewAll.length} vs ${hubTotal}`);
+  check('eventsSince(n) 跳过前 n 条', viewFrom1.length === hubTotal - 1,
+    `${viewFrom1.length} vs ${hubTotal}`);
+  check('eventsSince 返回副本：改它不影响 Hub 自己那份', (() => {
+    viewFrom1.push({ kind: 'msg', text: '不该进 Hub' });
+    return hub.controller.info().events === hubTotal;
+  })());
+
   console.log('\n3. 认领串行');
   const claimB = await call(base, '/tasks/claim', {
     method: 'POST',
