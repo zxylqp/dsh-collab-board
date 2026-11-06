@@ -273,6 +273,18 @@ export function createHubClient(opts = {}) {
   }
 
   /**
+   * 成员表（带 `online` / `lastSeen`）。
+   *
+   * 面板原来只从事件流里的 `member` 事件推在线态，而那种事件**只有 join 时写一次** ——
+   * 断了机的成员会永远显示在线。在线态是 Hub 的心跳算出来的瞬时值，必须现问。
+   */
+  async function members() {
+    if (!token) return [];
+    const data = await call('/members');
+    return Array.isArray(data?.members) ? data.members : [];
+  }
+
+  /**
    * 上传一个文件到 Hub。
    *
    * base64 走 JSON —— 没做 multipart，因为 Node 原生拼 multipart 要自己算 boundary，
@@ -356,6 +368,7 @@ export function createHubClient(opts = {}) {
     stop,
     join,
     claim,
+    members,
     uploadFile,
     downloadFile,
     recoverSystem,

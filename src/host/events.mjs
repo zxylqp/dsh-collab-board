@@ -195,13 +195,27 @@ export function validateEvent(raw, opts = {}) {
     case 'msg': {
       const text = textOf(raw.text, 8192);
       if (text.trim() === '') return bad('bad-param', 'msg 要有 text', 'text');
+      /**
+       * `to`：定向消息 —— 只叫醒这一个人（§6.10.2 依赖解锁用）。
+       *
+       * 为什么需要它：msg 本来是广播的，唤醒也就跟着广播 —— 一次依赖解锁
+       * 会把所有开着 wakeOnMessage 的机器都点醒一轮。给了 `to`，
+       * 别的机器照常收事件、照常显示，但**不为此烧一轮 token**。
+       * 可省：老消息没有这个字段，行为不变。
+       */
+      if (raw.to !== undefined && raw.to !== null && raw.to !== ''
+        && !(typeof raw.to === 'string' && HEX16.test(raw.to))) {
+        return bad('bad-param', 'to 要 16 位小写十六进制 origin', 'to');
+      }
       return { ok: true, event: { ...raw, text } };
     }
     case 'task': {
       const taskId = isText(raw.taskId) ? raw.taskId.trim() : (isText(raw.id) ? raw.id.trim() : '');
       if (!taskId) return bad('bad-param', 'task 要有 taskId', 'taskId');
-      if (!isText(raw.title)) return bad('bad-param', 'task 要有 title', 'title');
-      const status = TASK_STATUS.includes(raw.status) ? raw.status : 'pending';
+      // 墓碑不带标题（正是要擦掉它），所以只对普通任务卡要求 title
+      const tombstone = raw.deleted === true;
+      if (!tombstone && !isText(raw.title)) return bad('bad-param', 'task 要有 title', 'title');
+      const status = TASK_STATUS.includes(raw.status) ? raw.status : (tombstone ? 'cancelled' : 'pending');
       const priority = ['high', 'normal', 'low'].includes(raw.priority) ? raw.priority : 'normal';
       return {
         ok: true,
@@ -217,6 +231,13 @@ export function validateEvent(raw, opts = {}) {
           requiredCapabilities: strList(raw.requiredCapabilities, 32, 32),
           tags: strList(raw.tags, 32, 32),
           archived: raw.archived === true,
+          /**
+           * 墓碑（0.10.14）：删除一张卡 = 写一条 `deleted: true` 的 task 事件。
+           * **不删日志行** —— 两台机器靠事件流同步，删行会让对方以为没发生过、seq 还会断层。
+           * 折叠时把正文擦空，视图里只剩一个「已删除」的壳。
+           */
+          deleted: raw.deleted === true,
+          deletedAt: raw.deleted === true ? textOf(raw.deletedAt, 40) : '',
         },
       };
     }

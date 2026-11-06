@@ -207,7 +207,9 @@ export function apply(ctx, rawConfig = {}) {
     if (s.wakeOnMessage !== true) return;
 
     const fresh = (Array.isArray(events) ? events : []).filter(
-      (ev) => ev && ev.kind === 'msg' && typeof ev.origin === 'string' && ev.origin !== identity.origin,
+      (ev) => ev && ev.kind === 'msg' && typeof ev.origin === 'string' && ev.origin !== identity.origin
+        // 定向消息：`to` 不是我，就别叫 —— 依赖解锁的 msg 会走这条路
+        && !(typeof ev.to === 'string' && ev.to !== '' && ev.to !== identity.origin),
     );
     if (fresh.length === 0) return;
 
@@ -404,6 +406,48 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * 墓碑落地后，把本机日志里这张卡的正文也擦掉（0.10.14）。
+   *
+   * Hub 那边擦的是它自己的 `hub-events.jsonl`；本机这份 `events.jsonl` 得自己擦，
+   * 不然「删掉了」只是视图上说谎 —— 打开文件还看得见原文。
+   * 只改内容，不动 id / seq / 顺序。
+   */
+  function scrubLocalTaskBody(taskId) {
+    if (!taskId) return 0;
+    const rows = readEvents();
+    const kept = [];
+    let hit = 0;
+    for (const e of rows) {
+      if (!e || e.kind !== 'task' || e.taskId !== taskId) { kept.push(e); continue; }
+      if (e.deleted === true) { kept.push(e); continue; }
+      /**
+       * 还没推出去过的事件直接整行丢掉。
+       *
+       * 留着擦成空的反而更糟：`task` 事件要求有 title，擦空之后推上去会被 Hub 400 拒掉，
+       * 从此卡在待同步队列里 —— 一条永远同步不了的残骸比没这条更坏。
+       * 而「没推出去过」意味着别的机器从来没见过它，删掉不影响任何人的账。
+       */
+      const synced = Number.isFinite(e.epoch) && Number.isFinite(e.seq);
+      if (!synced) { hit += 1; continue; }
+      e.title = '';
+      e.detail = '';
+      e.owner = '';
+      e.tags = [];
+      e.dependsOn = [];
+      e.requiredCapabilities = [];
+      e.dueAt = '';
+      kept.push(e);
+      hit += 1;
+    }
+    if (hit === 0) return 0;
+    try {
+      writeFileSync(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '', 'utf8');
+      invalidate();
+    } catch { /* 写不动就先放着，下次再收到会重试 */ }
+    return hit;
+  }
+
+  /**
    * 拉回来的事件：本机没有的就落盘，有的只补序号。
    *
    * **判据是「本机有没有这条 id」，不是 origin。** Hub 替本机写的事件（认领、
@@ -430,6 +474,10 @@ export function apply(ctx, rawConfig = {}) {
       if (Number.isFinite(ev.epoch) && Number.isFinite(ev.seq)) synced.push(ev);
     }
     if (synced.length) markSynced(synced);
+    // 收到的墓碑：正文在本机也擦掉，别让日志里还留着原文
+    for (const t of freshly) {
+      if (t.kind === 'task' && t.deleted === true) scrubLocalTaskBody(String(t.taskId || ''));
+    }
     invalidate();
     if (freshly.length === 0) return;
 
@@ -568,6 +616,14 @@ export function apply(ctx, rawConfig = {}) {
     const code = typeof opts.code === 'string' ? opts.code : (s.hubCode || '');
     // P0-3b：拿上次连过的地址先探一下，别让同一个组起出两个 Hub
     const probeUrl = typeof opts.probeUrl === 'string' ? opts.probeUrl : (s.hubAddress || '');
+    /**
+     * UDP 发现端口（0.10.13）。`createDiscovery` 一直支持传，只是面板这边
+     * 从来没把它接出来 —— 于是 48911 被别的东西占了就只能关掉发现，
+     * 和 TCP 端口能改的行为对不上。
+     */
+    const discoveryPort = Number.isFinite(Number(opts.discoveryPort))
+      ? Number(opts.discoveryPort)
+      : (Number(s.discoveryPort) || 48911);
     const started = await startHub({
       dir: dataDir,
       groupId: identity.groupId,
@@ -577,6 +633,7 @@ export function apply(ctx, rawConfig = {}) {
       code,
       log: hubLog,
       probeUrl,
+      discoveryPort,
       force: opts.force === true,
     });
     hubRuntime.server = started.controller;
@@ -875,6 +932,83 @@ export function apply(ctx, rawConfig = {}) {
             } catch (err) {
               const status = err?.code === 'forbidden' ? 403 : 400;
               return jsonReply(res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
+            }
+          },
+        },
+        {
+          /**
+           * 删除任务卡（墓碑，0.10.14）。
+           *
+           * body: `{ taskId }` 删一张 ／ `{ allFinished: true }` 清掉所有已结束的卡。
+           * **不删日志行** —— 事件流是两台机器同步的唯一依据，删行会让对方以为没发生过、
+           * seq 还会断层。写一条 `deleted: true` 的墓碑，正文在所有机器上擦空。
+           */
+          kind: 'exact',
+          path: `${PANEL_BASE}/tasks/delete`,
+          handler: async (req, res) => {
+            if (req.method !== 'POST') return jsonReply(res, 405, { ok: false, error: 'method' });
+            try {
+              const body = await readBody(req);
+              const ids = [];
+              if (body && body.allFinished === true) {
+                for (const t of latestTasks(readEvents()).values()) {
+                  if (!t || t.deleted === true) continue;
+                  if (t.status !== 'done' && t.status !== 'cancelled') continue;
+                  ids.push(String(t.taskId));
+                }
+              } else if (body && typeof body.taskId === 'string' && body.taskId.trim()) {
+                ids.push(body.taskId.trim());
+              }
+              if (ids.length === 0) return jsonReply(res, 400, { ok: false, error: '没有要删的卡' });
+              // 已经删过的、根本不存在的都跳过：重复点不该再写一条墓碑
+              const latest = latestTasks(readEvents());
+              const already = new Set(
+                [...latest.values()].filter((t) => t.deleted === true).map((t) => t.taskId),
+              );
+              const pending = ids.filter((id) => latest.has(id) && !already.has(id));
+              if (pending.length === 0) return jsonReply(res, 200, { ok: true, deleted: [], skipped: true });
+              const deleted = [];
+              for (const id of pending) {
+                writeTombstone(id);
+                deleted.push(id);
+              }
+              return jsonReply(res, 200, { ok: true, deleted });
+            } catch (err) {
+              return jsonReply(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+            }
+          },
+        },
+        {
+          /**
+           * 成员在线态（0.10.13）。
+           *
+           * 事件流里的 `member` 事件只在 join 时写一次，之后再也不更新 ——
+           * 所以面板上「在线」等于「加入那一刻在线」，关机了也不会变。
+           * 在线态是 Hub 用 45 秒心跳窗口算出来的**瞬时值**，只能现问。
+           */
+          kind: 'exact',
+          path: `${PANEL_BASE}/members`,
+          handler: async (req, res) => {
+            if (req.method !== 'GET') return jsonReply(res, 405, { ok: false, error: 'method' });
+            if (!hubRuntime.client) {
+              return jsonReply(res, 200, { ok: true, connected: false, members: [] });
+            }
+            try {
+              const list = await hubRuntime.client.members();
+              return jsonReply(res, 200, {
+                ok: true,
+                connected: Boolean(hubRuntime.client.state()?.online),
+                members: list,
+                online: list.filter((m) => m && m.online).length,
+              });
+            } catch (err) {
+              // 拉不到在线态不是错：面板继续用事件流里的旧值，只是会标明「连不上」
+              return jsonReply(res, 200, {
+                ok: true,
+                connected: false,
+                members: [],
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           },
         },
@@ -1197,6 +1331,10 @@ export function apply(ctx, rawConfig = {}) {
             tags: { type: 'array', items: { type: 'string' }, description: 'task 标签，最多显示 3 个' },
             dueAt: { type: 'string', description: '截止时间（ISO），只显示不提醒' },
             archived: { type: 'boolean', description: '归档后不进主视图' },
+            deleted: {
+              type: 'boolean',
+              description: '墓碑：删除这张卡。标题/描述/标签会被擦空，日志里只留一个壳；默认视图不再显示',
+            },
             taskId: { type: 'string', description: 'msg / artifact 关联的任务 id' },
             replyTo: { type: 'string', description: 'msg 回复的事件 id' },
             mentions: { type: 'array', items: { type: 'string' }, description: 'msg 里 @ 的人' },
@@ -1526,14 +1664,23 @@ export function apply(ctx, rawConfig = {}) {
         const rawId = isText(input.taskId) ? input.taskId : input.id;
         if (!isText(rawId)) return undefined;
         const taskId = String(rawId).trim().slice(0, 64);
+        /**
+         * 墓碑（0.10.14）：删除走的就是这个入口。
+         * 标题/描述故意留空 —— 删掉的东西不该在本地日志里再写一遍。
+         */
+        const tombstone = input.deleted === true;
         const ev = {
           ...base,
           taskId,
-          title: isText(input.title) ? input.title.trim().slice(0, 200) : taskId,
+          title: isText(input.title) ? input.title.trim().slice(0, 200) : (tombstone ? '' : taskId),
           status: ['pending', 'running', 'blocked', 'done', 'cancelled'].includes(input.status)
             ? input.status
-            : 'pending',
+            : (tombstone ? 'cancelled' : 'pending'),
         };
+        if (tombstone) {
+          ev.deleted = true;
+          ev.deletedAt = isText(input.deletedAt) ? input.deletedAt : new Date().toISOString();
+        }
         /**
          * `owner` 只在调用方**显式**给了的时候写。
          *
@@ -1770,6 +1917,77 @@ export function apply(ctx, rawConfig = {}) {
       timer = setInterval(scan, 60000);
       if (typeof timer.unref === 'function') timer.unref();
     }, 6000);
+    if (typeof boot.unref === 'function') boot.unref();
+    return () => {
+      clearTimeout(boot);
+      if (timer) clearInterval(timer);
+    };
+  });
+
+  /* ───────────────────── 墓碑与保留期（0.10.14） ───────────────────── */
+
+  /**
+   * 写一条墓碑：这张卡的正文从此不再被读出来。
+   *
+   * 为什么不是「删掉日志里的行」：事件流是两台机器同步的唯一依据。删一行，
+   * 对方会以为这件事没发生过；中间少一个 seq，增量拉取还会卡住。
+   * 墓碑是唯一能跨机一致的做法 —— 日志留着骨架，内容擦掉。
+   */
+  function writeTombstone(taskId, reason = 'manual') {
+    if (!taskId) throw new Error('墓碑要有 taskId');
+    const ev = buildEvent({
+      kind: 'task',
+      taskId,
+      title: '',
+      status: 'cancelled',
+      deleted: true,
+      deletedAt: new Date().toISOString(),
+    });
+    if (!ev) throw new Error('墓碑没造出来：' + taskId);
+    appendEvent(ev);
+    // 本机这一份日志也要擦：只写墓碑不擦的话，打开 events.jsonl 还看得见原文
+    scrubLocalTaskBody(taskId);
+    hubLog('info', `墓碑：${taskId}（${reason}）`);
+    return ev;
+  }
+
+  /**
+   * 保留期：已结束的卡超过 `retentionDays` 天自动立碑。
+   *
+   * 每 60 秒醒一次轻表，真正扫描最多 10 分钟一次 —— 改设置立即生效，不用重启。
+   * `retentionDays = 0` 等于「永不自动清」，只能手动删。
+   */
+  ctx.effect(() => {
+    let lastScanAt = 0;
+    let timer = null;
+    const scan = () => {
+      try {
+        const s = getSettings();
+        const days = Number(s.retentionDays) || 0;
+        if (days <= 0) return;
+        const now = Date.now();
+        if (now - lastScanAt < 10 * 60 * 1000) return;
+        lastScanAt = now;
+        const cutoff = now - days * 86400000;
+        let n = 0;
+        for (const t of latestTasks(readEvents()).values()) {
+          if (!t || t.deleted === true) continue;
+          if (t.status !== 'done' && t.status !== 'cancelled') continue;
+          const ts = Date.parse(String(t.ts || ''));
+          if (!Number.isFinite(ts) || ts > cutoff) continue;
+          try {
+            writeTombstone(String(t.taskId), `保留期 ${days} 天`);
+            n += 1;
+          } catch { /* 单张失败不影响其它 */ }
+        }
+        if (n > 0) hubLog('info', `保留期到点：自动立碑 ${n} 张`);
+      } catch { /* 扫失败不该影响插件 */ }
+    };
+    const boot = setTimeout(() => {
+      scan();
+      timer = setInterval(scan, 60000);
+      if (typeof timer.unref === 'function') timer.unref();
+    }, 12000);
     if (typeof boot.unref === 'function') boot.unref();
     return () => {
       clearTimeout(boot);

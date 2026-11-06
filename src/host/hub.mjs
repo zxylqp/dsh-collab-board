@@ -28,7 +28,7 @@ import {
   validateBatch,
   validateEvent,
 } from './events.mjs';
-import { SYSTEM_ORIGIN } from './identity.mjs';
+import { SYSTEM_ORIGIN, isOrigin } from './identity.mjs';
 import { createDiscovery, createHubWatch } from './discovery.mjs';
 import { json, readBody, writeAtomic } from './http-util.mjs';
 import { ownerTransitionError } from './selectable.mjs';
@@ -39,6 +39,40 @@ export const OFFLINE_MS = 45000;
 /** 租约默认 10 分钟；`claim` 不传 `leaseMs` 时用它（§6.11）。 */
 export const DEFAULT_LEASE_MS = 10 * 60 * 1000;
 export const MAX_LEASE_MS = 86400000;
+/**
+ * 续约上限：从认领那一刻算，最多撑到 `4 × leaseMs`。
+ *
+ * 没有上限的续约等于「谁一直发进度谁就永久占卡」——一个空转的 agent
+ * 能靠每 5 分钟发一条进度把卡锁死，别人永远认领不到。有上限至少保证
+ * 每 40 分钟必须重新认领一次，卡不会烂在死人手里。
+ */
+export const LEASE_MAX_FACTOR = 4;
+/** 剩余租约掉到这个比例时发一条 warn note，提醒「快到期了」，每条租约只发一次。 */
+export const LEASE_WARN_FRACTION = 0.25;
+
+/**
+ * 一条任务此刻的租约终点（毫秒时间戳）：认领时算出的终点、续约水印，取大。
+ *
+ * 纯函数：`hub.json` 里恢复、定时器扫描、续约判定都走它，免得三处算法各写一遍。
+ */
+export function leaseEndAt({ claimedAt, leaseMs, renewedUntil } = {}) {
+  const lease = Number(leaseMs) || 0;
+  const t = claimedAt ? new Date(claimedAt).getTime() : NaN;
+  if (lease <= 0 || !Number.isFinite(t)) return 0;
+  return Math.max(t + lease, Number(renewedUntil) || 0);
+}
+
+/**
+ * 这次续约能推到哪（毫秒时间戳）。`now + leaseMs`，但绝不越过
+ * `claimedAt + leaseMs × LEASE_MAX_FACTOR`。
+ */
+export function leaseRenewAt({ claimedAt, leaseMs, now } = {}) {
+  const lease = Number(leaseMs) || 0;
+  const t = claimedAt ? new Date(claimedAt).getTime() : NaN;
+  const n = Number(now);
+  if (lease <= 0 || !Number.isFinite(t) || !Number.isFinite(n)) return 0;
+  return Math.min(t + lease * LEASE_MAX_FACTOR, n + lease);
+}
 
 /** Hub 的响应外壳：成功带 `data`，失败带 `error` —— 和面板侧的平铺响应不是一回事。 */
 function fail(res, httpStatus, code, message, extra = {}) {
@@ -68,6 +102,13 @@ export async function startHub(opts = {}) {
   const selfOrigin = String(opts.origin || '');
   const code = typeof opts.code === 'string' ? opts.code : '';
   const log = typeof opts.log === 'function' ? opts.log : () => {};
+  /**
+   * 租约扫描间隔。默认 30 秒；测试里传小值，不然验一次「到期释放」要等半分钟。
+   * 调小只影响判断频率，不改变租约时长本身。
+   */
+  const leaseTickMs = Number.isFinite(Number(opts.leaseTickMs)) && Number(opts.leaseTickMs) >= 10
+    ? Number(opts.leaseTickMs)
+    : 30000;
 
   if (!/^[0-9a-f]{16}$/.test(groupId)) throw new Error('Hub 需要一个 16 位十六进制 groupId');
   if (!/^[0-9a-f]{16}$/.test(selfOrigin)) throw new Error('Hub 需要一个 16 位十六进制 origin');
@@ -201,6 +242,14 @@ export async function startHub(opts = {}) {
   let capIndex = new Map();
   /** claimId → { taskId, origin, seq, at }（持久化最近 1000 条，§14） */
   let claims = new Map();
+  /**
+   * taskId → { until, warnedFor }（续约水印，持久化到 hub.json）。
+   *
+   * 为什么必须落盘：任务本身是日志重放出来的，`claimedAt + leaseMs` 是唯一
+   * 算得出来的租约终点；续约是**内存里的事件**，不写盘的话 Hub 一重启，
+   * 一个已经续到 35 分钟的长任务会被当成只剩 10 分钟。
+   */
+  let leases = new Map();
   /** 依赖索引：taskId → Set<taskId>（谁依赖我）。崩溃从日志重建（§15）。 */
   let dependents = new Map();
 
@@ -256,6 +305,28 @@ export async function startHub(opts = {}) {
     if (ev.kind === 'task' && ev.taskId) {
       // 第一条落盘的 task 事件定创建者；后面的认领 / 完成 / 评论都归它管。
       if (!creators.has(ev.taskId)) creators.set(ev.taskId, ev.origin);
+      /**
+       * 墓碑（0.10.14）：折叠成只剩 id 的空壳。
+       * 正文在**所有机器**上都不再从这张卡里读出来 —— 日志行还在（同步不能断），
+       * 但标题/描述/标签/负责人一律当空。
+       */
+      if (ev.deleted === true) {
+        const shell = {
+          ...ev,
+          title: '',
+          detail: '',
+          owner: '',
+          tags: [],
+          dependsOn: [],
+          requiredCapabilities: [],
+          dueAt: '',
+          archived: false,
+          status: 'cancelled',
+        };
+        folded.set(ev.taskId, shell);
+        tasks.set(ev.taskId, shell);
+        return;
+      }
       const prevF = folded.get(ev.taskId) || {};
       folded.set(ev.taskId, {
         ...prevF,
@@ -358,6 +429,30 @@ export async function startHub(opts = {}) {
           level: 'info',
           text: `${doneTaskId} ${doneStatus === 'cancelled' ? '已取消' : '已完成'}，${target.taskId} 的依赖已满足，退回待认领`,
         });
+        /**
+         * 解锁要真的把人叫醒，不能只把卡退回 pending（§6.10.2）。
+         *
+         * 原来这里只写 task 事件 —— 对端 `shouldWake` 只认 msg，于是卡变回
+         * 待认领，但没有任何机器知道「该开工了」。autoClaim 会认领，可认领
+         * 不唤醒，卡就停在 running 上没人动。
+         *
+         * 收件人优先级：当前 owner → 创建者。blocked 的卡通常没有 owner
+         * （认领被 blocked 拒掉时不会记 owner），所以创建者是实际能接的人。
+         * 两个都没有就不发 —— 宁可不叫，也不要广播叫醒所有人。
+         */
+        const to = target.owner || creators.get(target.taskId) || '';
+        // 日志裁过之后，creator 可能被算成系统 origin（重建时第一条就是系统写的
+        // pending 事件）—— 发给全 0 等于没人收，不如不发。
+        if (isOrigin(to) && to !== SYSTEM_ORIGIN) {
+          systemWrite({
+            kind: 'msg',
+            from: '系统',
+            taskId: target.taskId,
+            to,
+            text: `${doneTaskId} ${doneStatus === 'cancelled' ? '已取消' : '已完成'}，`
+              + `${target.taskId}「${target.title}」的依赖已经满足，可以开始了。`,
+          });
+        }
         unlocked.push(targetId);
         log('info', `依赖解锁：${doneTaskId} → ${target.taskId}`);
       } catch {
@@ -406,6 +501,8 @@ export async function startHub(opts = {}) {
           groupId,
           startedAt: startedAt,
           claims: [...claims.entries()].slice(-1000).map(([id, v]) => ({ id, ...v })),
+          /** 续约水印也跟着任务量截断：一万条 running 卡不该把 hub.json 撑爆。 */
+          leases: [...leases.entries()].slice(-2000).map(([taskId, v]) => ({ taskId, ...v })),
         }) + '\n',
       );
     } catch {
@@ -429,6 +526,35 @@ export async function startHub(opts = {}) {
   }
 
   /**
+   * 擦掉某张卡在日志里的正文（墓碑落地时调一次）。
+   *
+   * **只改内容，不动 id / seq / 顺序** —— 改顺序等于重造历史，别的机器对不上账。
+   * 不同步的只有本机这一份：别的机器收到的是墓碑事件，它们收到后各自擦自己的日志。
+   */
+  function scrubTaskBody(taskId) {
+    let hit = 0;
+    for (const e of events) {
+      if (e.kind !== 'task' || e.taskId !== taskId) continue;
+      if (e.deleted === true) continue; // 墓碑本身要留 deleted / deletedAt
+      e.title = '';
+      e.detail = '';
+      e.owner = '';
+      e.tags = [];
+      e.dependsOn = [];
+      e.requiredCapabilities = [];
+      e.dueAt = '';
+      hit += 1;
+    }
+    if (hit === 0) return 0;
+    try {
+      writeAtomic(LOG_FILE, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    } catch {
+      /* 写不动就先只在内存里擦；下次收到墓碑再试 */
+    }
+    return hit;
+  }
+
+  /**
    * 系统事件校验器（§6.10.4）—— 比普通事件紧。**只在 systemWrite 里调**。
    *
    * 为什么这么严：系统 origin 能绕过鉴权，如果它还能改 `title` / 把 `owner` 写成别人，
@@ -436,11 +562,33 @@ export async function startHub(opts = {}) {
    * 改 `status`、把 `owner` 清空（租约到期要用）。
    */
   function validateSystemEvent(ev) {
-    const allowed = ['task', 'note', 'hub'];
+    const allowed = ['task', 'note', 'hub', 'msg'];
     if (!allowed.includes(ev.kind)) throw new Error(`系统事件不允许 kind=${String(ev.kind)}`);
     if (ev.origin !== SYSTEM_ORIGIN) throw new Error('系统事件 origin 必须全 0');
     if (ev.name !== '系统') throw new Error('系统事件 name 必须是「系统」');
     if (eventBytes(ev) > 16 * 1024) throw new Error('系统事件超过 16 KB');
+
+    /**
+     * 系统 msg：只当「叫醒某一个人」用，不是广播通道（§6.10.2）。
+     *
+     * 为什么要放开它：依赖解锁写的是 `task` 事件，对端 `shouldWake` 判
+     * not-msg —— 卡退回 pending 了，却没有一台机器被叫醒，链就停在那儿。
+     * 为什么不干脆放开广播：一张卡解锁会把所有开着 wakeOnMessage 的机器
+     * 都点醒一轮，每轮都是一整轮 token。所以必须点名 `to`、必须挂一张真卡。
+     */
+    if (ev.kind === 'msg') {
+      if (typeof ev.taskId !== 'string' || ev.taskId.trim() === '') {
+        throw new Error('系统 msg 必须挂一张任务');
+      }
+      if (!tasks.has(String(ev.taskId))) throw new Error(`系统 msg 挂的任务不存在：${String(ev.taskId)}`);
+      if (!isOrigin(ev.to)) throw new Error('系统 msg 必须带 to（成员 origin）');
+      if (typeof ev.text !== 'string' || ev.text.trim() === '' || ev.text.length > 1024) {
+        throw new Error('系统 msg 文本为空或超过 1024 字');
+      }
+      for (const f of ['status', 'owner', 'title', 'detail', 'dependsOn', 'archived']) {
+        if (ev[f] !== undefined) throw new Error(`系统 msg 不许带 ${f}`);
+      }
+    }
 
     if (ev.kind === 'task') {
       const cur = tasks.get(ev.taskId);
@@ -523,6 +671,14 @@ export async function startHub(opts = {}) {
       }
     }
   }
+  if (Array.isArray(saved?.leases)) {
+    for (const row of saved.leases) {
+      if (!row || typeof row.taskId !== 'string') continue;
+      const until = Number(row.until);
+      if (!Number.isFinite(until) || until <= Date.now()) continue;
+      leases.set(row.taskId, { until, warnedFor: Number(row.warnedFor) || 0 });
+    }
+  }
 
   rebuild();
 
@@ -594,20 +750,84 @@ export async function startHub(opts = {}) {
 
   /* ─────────────────── 租约 ─────────────────── */
 
+  /** 这条任务此刻的租约终点：认领时算出来的，和续约水印取大。 */
+  function leaseEndOf(task) {
+    return leaseEndAt({
+      claimedAt: task?.claimedAt,
+      leaseMs: task?.leaseMs,
+      renewedUntil: leases.get(String(task?.taskId || ''))?.until,
+    });
+  }
+
+  /**
+   * 进度续约：owner 往自己认领的卡上写 progress / artifact，就把租约往后推。
+   *
+   * 为什么按事件而不是按定时器：定时续约等于永不过期 —— 机器断电了 Hub
+   * 还在替它续。**只有真在干活（写进度）才算数**。
+   *
+   * 上限 `LEASE_MAX_FACTOR × leaseMs`，从 claimedAt 起算；延长不到 5 秒就不动，
+   * 免得每写一条进度都刷一次 hub.json。
+   */
+  function renewLease(ev) {
+    if (!ev || (ev.kind !== 'progress' && ev.kind !== 'artifact')) return;
+    const taskId = String(ev.taskId || '').trim();
+    if (!taskId) return;
+    const task = tasks.get(taskId);
+    if (!task || task.status !== 'running' || !task.owner) return;
+    if (task.owner !== ev.origin) return;
+    const lease = Number(task.leaseMs) || 0;
+    if (lease <= 0 || !task.claimedAt) return;
+    const next = leaseRenewAt({ claimedAt: task.claimedAt, leaseMs: lease, now: Date.now() });
+    // 延长的还不到「租约的 5%」（最长 5 秒）就不写盘：短租约也能正常续，长租约不会每条进度都刷一次
+    if (next <= leaseEndOf(task) + Math.min(5000, lease * 0.05)) return;
+    // 续约后终点变了，之前那条「快到期」提醒作废：新终点前再提醒一次
+    leases.set(taskId, { until: next, warnedFor: 0 });
+    scheduleStateFlush();
+  }
+
   /**
    * 每 30 秒扫一次 running 任务：`claimedAt + leaseMs` 过了就退回 `pending`。
    *
    * 只动 `running` 且 `leaseMs > 0` 的（§27 幂等）：重复触发、重启重建都不会多写。
+   * 剩余不足 1/4 时先发一条 warn note —— 「被释放」比「没叫醒」更难查，
+   * 至少让看板上有一句话，而不是到点卡自己变回待认领。
    */
   const leaseTimer = setInterval(() => {
     if (fuse.broken) return; // 写不进去就别再刷 —— 等 /system/recover
     const now = Date.now();
     for (const task of tasks.values()) {
-      if (task.status !== 'running') continue;
+      const taskId = String(task.taskId || '');
+      if (task.status !== 'running') {
+        // 卡已经不在自己手里了（完成 / 取消 / 被释放），续约水印留着没意义
+        if (leases.has(taskId)) { leases.delete(taskId); scheduleStateFlush(); }
+        continue;
+      }
       const lease = Number(task.leaseMs) || 0;
       if (lease <= 0 || !task.claimedAt) continue;
-      const end = new Date(task.claimedAt).getTime() + lease;
-      if (!Number.isFinite(end) || now < end) continue;
+      const end = leaseEndOf(task);
+      if (!Number.isFinite(end) || end <= 0) continue;
+
+      // 快到期：先说话，别让它静默地变回待认领
+      if (now < end) {
+        const left = end - now;
+        const warned = Number(leases.get(taskId)?.warnedFor) || 0;
+        if (left <= lease * LEASE_WARN_FRACTION && warned !== end) {
+          const row = leases.get(taskId) || {};
+          leases.set(taskId, { ...row, until: Number(row.until) || end, warnedFor: end });
+          scheduleStateFlush();
+          try {
+            systemWrite({
+              kind: 'note',
+              level: 'warn',
+              text: `任务 ${taskId} 的租约还剩 ${Math.max(1, Math.round(left / 60000))} 分钟，`
+                + `到期会退回待认领。还在干就写一条 progress（会自动续约），干完了就改 done。`,
+            });
+            log('warn', `租约快到期：${taskId}（剩 ${Math.max(1, Math.round(left / 60000))} 分钟）`);
+          } catch { /* 熔断了，下一轮开头会跳过 */ }
+        }
+        continue;
+      }
+
       try {
         systemWrite({
           kind: 'task',
@@ -623,12 +843,14 @@ export async function startHub(opts = {}) {
           dueAt: task.dueAt,
           archived: task.archived,
         });
+        leases.delete(taskId);
+        scheduleStateFlush();
         log('warn', `租约到期，任务退回待认领：${task.taskId}`);
       } catch {
         /* 熔断了，下一轮开头会跳过 */
       }
     }
-  }, 30000);
+  }, leaseTickMs);
   if (typeof leaseTimer.unref === 'function') leaseTimer.unref();
 
   /* ─────────────────── 路由 ─────────────────── */
@@ -810,7 +1032,10 @@ export async function startHub(opts = {}) {
           // 身份撞号：taskId 归创建者。别人可以认领 / 完成 / 评论，但不能把
           // 标题、描述、依赖整条改写 —— 那正是 R5 真机撞号的样子：两张本地编号
           // 相同的卡被折叠成一张，后推的赢，前一张凭空消失。
-          if (ev.kind === 'task') {
+          //
+          // 墓碑是唯一例外：删除就是把正文擦空，不豁免的话「删别人的卡」永远 409。
+          const isTombstone = ev.kind === 'task' && ev.deleted === true;
+          if (ev.kind === 'task' && !isTombstone) {
             const creator = creators.get(ev.taskId);
             const prevTask = folded.get(ev.taskId);
             if (prevTask && creator && ev.origin !== creator) {
@@ -827,8 +1052,8 @@ export async function startHub(opts = {}) {
               }
             }
           }
-          // owner 迁移：普通写路径不许抢别人已认领的卡（CAS 的补口）
-          if (ev.kind === 'task') {
+          // owner 迁移：普通写路径不许抢别人已认领的卡（CAS 的补口）。墓碑同理豁免。
+          if (ev.kind === 'task' && !isTombstone) {
             const blocked = checkOwnerWrite(ev, me.origin);
             if (blocked) return fail(res, 403, 'forbidden', blocked.message, { field: 'owner' });
           }
@@ -840,6 +1065,16 @@ export async function startHub(opts = {}) {
           }
           const stamped = { ...ev, epoch, seq: nextSeq() };
           appendEvent(stamped);
+          // 干活就有租约：progress / artifact 推上来时顺手续掉，别让人手动续
+          renewLease(stamped);
+          // 墓碑落地：把这张卡的历史正文从日志里擦掉，然后按擦干净的事件重建索引
+          if (stamped.kind === 'task' && stamped.deleted === true) {
+            scrubTaskBody(stamped.taskId);
+            leases.delete(String(stamped.taskId));
+            rebuild();
+            scheduleStateFlush();
+            log('info', `墓碑：${stamped.taskId} 正文已擦除`);
+          }
           appended.push(stamped);
           accepted.push({ id: stamped.id, epoch: stamped.epoch, seq: stamped.seq });
         }
@@ -987,6 +1222,8 @@ export async function startHub(opts = {}) {
         }
 
         log('info', `${me.name} 认领 ${taskId}（租约 ${leaseMs ? Math.round(leaseMs / 60000) + ' 分钟' : '关'}）`);
+        // 新认领 = 新的租约起点，旧的续约水印作废（否则重认领后会带着上一次的延长）
+        if (leases.delete(taskId)) scheduleStateFlush();
         return ok(res, {
           taskId,
           epoch: ev.epoch,

@@ -130,7 +130,22 @@ async function main() {
   check('/settings 200', settings.status === 200);
   check('spec 里有 hubPort/hubAddress/hubCode',
     Boolean(settings.payload?.spec?.hubPort && settings.payload?.spec?.hubAddress && settings.payload?.spec?.hubCode));
+  check('spec 里有 discoveryPort（0.10.13：UDP 端口可配）',
+    settings.payload?.spec?.discoveryPort?.def === 48911
+      && settings.payload?.spec?.discoveryPort?.min === 1024);
   check('数据目录指对', settings.payload?.dataDir === dataDir, settings.payload?.dataDir);
+
+  const badDisc = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { discoveryPort: 80 },
+  });
+  check('发现端口低于 1024 → 400', badDisc.status === 400);
+  const goodDisc = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { discoveryPort: 49911 },
+  });
+  check('发现端口能改并读回', goodDisc.payload?.settings?.discoveryPort === 49911);
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { discoveryPort: 48911 } });
 
   console.log('\n3. 写事件与读回');
   const post = await hit(routes, '/collab-board/post', {
@@ -165,10 +180,55 @@ async function main() {
   check('identity 有 origin 和 groupId',
     /^[0-9a-f]{16}$/.test(identity.origin) && /^[0-9a-f]{16}$/.test(identity.groupId));
 
+  console.log('\n3b. 墓碑删除（0.10.14）');
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: {
+      kind: 'task', taskId: 't-del', title: '机密标题不该留', detail: '机密描述也不该留', status: 'pending',
+    },
+  });
+  const delRes = await hit(routes, '/collab-board/tasks/delete', {
+    method: 'POST',
+    body: { taskId: 't-del' },
+  });
+  check('/tasks/delete 成功',
+    delRes.payload?.ok === true && (delRes.payload?.deleted || []).includes('t-del'),
+    JSON.stringify(delRes.payload));
+
+  const rawLocal = readFileSync(logPath, 'utf8');
+  check('本机日志文件里搜不到原文', !rawLocal.includes('机密标题') && !rawLocal.includes('机密描述'));
+  const afterDel = await hit(routes, '/collab-board/state');
+  const delRows = (afterDel.payload?.events || []).filter((e) => e.kind === 'task' && e.taskId === 't-del');
+  check('墓碑事件还在（不删行）', delRows.some((e) => e.deleted === true));
+  check('历史行正文被擦空', delRows.every((e) => !String(e.title || '').includes('机密标题')));
+
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-finished', title: '做完的卡', status: 'done', owner: '' },
+  });
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-live', title: '还在跑的卡', status: 'running' },
+  });
+  const purge = await hit(routes, '/collab-board/tasks/delete', {
+    method: 'POST',
+    body: { allFinished: true },
+  });
+  check('allFinished 只清已结束的卡',
+    (purge.payload?.deleted || []).includes('t-finished')
+      && !(purge.payload?.deleted || []).includes('t-live'),
+    JSON.stringify(purge.payload?.deleted));
+  const purgeAgain = await hit(routes, '/collab-board/tasks/delete', {
+    method: 'POST',
+    body: { taskId: 't-finished' },
+  });
+  check('重复删是空操作', purgeAgain.payload?.ok === true
+    && (purgeAgain.payload?.deleted || []).length === 0, JSON.stringify(purgeAgain.payload));
+
   console.log('\n4. Hub 控制');
   const hubSolo = await hit(routes, '/collab-board/hub');
   check('solo 时 running=false', hubSolo.payload?.running === false);
-  check('solo 时 pending 记着那条待同步', hubSolo.payload?.pending === 1, String(hubSolo.payload?.pending));
+  check('solo 时 pending 记着待同步事件', hubSolo.payload?.pending > 0, String(hubSolo.payload?.pending));
 
   const claimNoHub = await hit(routes, '/collab-board/tasks/claim', {
     method: 'POST',
@@ -268,6 +328,16 @@ async function main() {
   }).then((r) => r.json());
   const otherToken = joinRes?.data?.token;
   check('另一个成员 join 成功', Boolean(otherToken));
+
+  // 在线态只有 Hub 现算得出来（心跳 45 秒窗口），事件流里没有 —— 得从 /members 拿
+  const memberList = await hit(routes, '/collab-board/members');
+  check('/members 连上 Hub 时返回 connected', memberList.payload?.connected === true,
+    JSON.stringify({ connected: memberList.payload?.connected, error: memberList.payload?.error }));
+  const seenOther = (memberList.payload?.members || []).find((m) => m.origin === otherOrigin);
+  check('/members 里有刚 join 的成员且在线', Boolean(seenOther) && seenOther.online === true,
+    JSON.stringify(seenOther || null));
+  check('/members 报的在线数和列表一致',
+    memberList.payload?.online === (memberList.payload?.members || []).filter((m) => m.online).length);
 
   await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
     method: 'POST',
@@ -612,6 +682,13 @@ async function main() {
   check('自己发的不叫', verdict({ kind: 'msg', origin: selfOrigin, seq: 999 }).reason === 'self');
   check('没有 seq 的不叫', verdict({ kind: 'msg', origin: 'other' }).reason === 'no-seq');
   check('不是 msg 的不叫', verdict({ kind: 'note', origin: 'other', seq: 999 }).reason === 'not-msg');
+  // 定向消息（0.10.15）：依赖解锁发的那条只该叫醒一个人
+  check('定向消息叫的是别人 → 不叫',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231, to: 'somebody-else' }).reason === 'not-for-me');
+  check('定向消息叫的就是我 → 叫',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231, to: selfOrigin }).wake === true);
+  check('没写 to 的老消息照旧叫',
+    verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231 }).wake === true);
   check('maxSeenOf 取 (epoch, seq) 字典序最大',
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }, { id: 'x' }])) === '{"epoch":2,"seq":3}',
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }])));

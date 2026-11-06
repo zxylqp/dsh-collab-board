@@ -27,6 +27,22 @@ export function settingsSpec(maxEventsDefault = 5000) {
     maxEvents: { kind: 'int', min: 100, max: 200000, def: maxEventsDefault },
     hubAddress: { kind: 'string', max: 200, def: '' },
     hubPort: { kind: 'int', min: 1, max: 65535, def: 48910 },
+    /**
+     * UDP 自动发现端口。默认 48911。
+     *
+     * 以前这个只能改代码 —— `createDiscovery` 支持传，但面板这边没接出来，
+     * 48911 被别的程序占了就等于「发现功能静默失效」。和 TCP 端口一样给个入口。
+     */
+    discoveryPort: { kind: 'int', min: 1024, max: 65535, def: 48911 },
+    /**
+     * 已结束的卡保留多少天（墓碑自动清，0 = 永不自动清）。默认 30。
+     *
+     * 删除不是物理删行 —— 事件流只追加，删行会让两台机器对不上账。
+     * 所以「清掉」= 写一条墓碑，正文擦空，只留 id + 删除时间 + 谁删的。
+     */
+    retentionDays: { kind: 'int', min: 0, max: 3650, def: 30 },
+    /** 面板要不要显示墓碑（已删除的卡）。默认关：删了就是删了。 */
+    showDeleted: { kind: 'bool', def: false },
     hubCode: { kind: 'string', max: 64, def: '' },
     pendingWatch: { kind: 'bool', def: false },
     pendingWatchMs: { kind: 'int', min: 60000, max: 3600000, def: 300000 },

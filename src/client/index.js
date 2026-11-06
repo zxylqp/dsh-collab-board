@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 23;
-    const VERSION = '0.10.12';
+    const BUILD = 25;
+    const VERSION = '0.10.15';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -44,8 +44,11 @@ window.__ModuleLoader__.load({
       capabilityDetect: true,
       capabilitiesExtra: '',
       maxEvents: 20000,
+      retentionDays: 30,
+      showDeleted: false,
       hubAddress: '',
       hubPort: 48910,
+      discoveryPort: 48911,
       hubCode: '',
       pendingWatch: false,
       pendingWatchMs: 300000,
@@ -101,6 +104,7 @@ window.__ModuleLoader__.load({
 .cb-title{font-size:17px;font-weight:600;letter-spacing:.2px;line-height:1.3;}
 .cb-title-ver{font-size:11px;font-weight:500;letter-spacing:0;color:var(--dsw-alias-label-tertiary);
   margin-left:7px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-bg-overlay);vertical-align:middle;}
+.cb-title-ver.cb-drift{color:var(--dsw-alias-state-warn-primary);font-weight:600;}
 .cb-sub{font-size:12px;line-height:1.4;color:var(--dsw-alias-label-tertiary);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-seg{display:inline-flex;gap:2px;padding:2px;border-radius:9px;background:var(--dsw-alias-bg-overlay);flex:none;}
@@ -530,6 +534,34 @@ window.__ModuleLoader__.load({
         if (kind === 'task') {
           const id = String(ev.taskId || ev.id || '').trim();
           if (!id) continue;
+          /**
+           * 墓碑（0.10.14）：折叠成空壳。
+           * 正文在所有机器上都不再从这张卡读出来 —— 日志留着（同步不断），内容当空。
+           */
+          if (ev.deleted === true) {
+            tasks.set(id, {
+              taskId: id,
+              title: '',
+              owner: '',
+              status: 'cancelled',
+              detail: '',
+              dependsOn: [],
+              requiredCapabilities: [],
+              priority: 'normal',
+              tags: [],
+              dueAt: '',
+              archived: false,
+              deleted: true,
+              deletedAt: typeof ev.deletedAt === 'string' ? ev.deletedAt : ev.ts || '',
+              claimedAt: '',
+              leaseMs: 0,
+              versions: [],
+              createdTs: ev.ts,
+              updatedTs: ev.ts,
+              ev,
+            });
+            continue;
+          }
           const prev = tasks.get(id) || {
             taskId: id,
             title: id,
@@ -843,9 +875,11 @@ window.__ModuleLoader__.load({
         title: task.title,
       },
         h('div', { className: 'cb-row' },
-          h(Pill, { tone: STATUS_TONE[task.status] }, STATUS_LABEL[task.status] || task.status),
-          task.priority === 'high' ? h('span', { className: 'cb-pdot', title: '高优先级' }) : null,
-          h('div', { className: 'cb-task-title' }, task.title),
+          task.deleted
+            ? h(Pill, { tone: 'off' }, '已删除')
+            : h(Pill, { tone: STATUS_TONE[task.status] }, STATUS_LABEL[task.status] || task.status),
+          task.priority === 'high' && !task.deleted ? h('span', { className: 'cb-pdot', title: '高优先级' }) : null,
+          h('div', { className: 'cb-task-title' }, task.deleted ? '（已删除）' : task.title),
           unsynced ? h(Dot, { tone: 'sync', title: '还没同步' }) : null,
           h('div', { className: 'cb-meta-right' },
             task.owner
@@ -887,6 +921,8 @@ window.__ModuleLoader__.load({
       }), [tasks]);
 
       const filtered = tasks.filter((t) => {
+        // 墓碑默认不显示（设置里「显示已删除」可开），归档的仍然按老规矩
+        if (t.deleted && !settings.showDeleted) return false;
         if (t.archived && !showArchived) return false;
         if (t.status === 'done' && !showDone) return false;
         if (filter === 'all') return true;
@@ -1454,6 +1490,7 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = useState('identity');
       const [confirmClear, setConfirmClear] = useState(false);
       const [confirmReset, setConfirmReset] = useState(false);
+      const [confirmPurge, setConfirmPurge] = useState(false);
       const [extraDraft, setExtraDraft] = useState(settings.capabilitiesExtra || '');
       const [detecting, setDetecting] = useState(false);
 
@@ -1569,6 +1606,18 @@ window.__ModuleLoader__.load({
                 step: 1,
                 value: settings.hubPort,
                 onCommit: (v) => saveSetting('hubPort', v),
+              }),
+            }),
+            h(Field, {
+              label: '发现端口',
+              desc: 'UDP 自动发现用（1024～65535），默认 48911。48911 被别的程序占了就换一个 —— 两台机器的发现端口要一致才互相看得见。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 1024,
+                max: 65535,
+                step: 1,
+                value: settings.discoveryPort,
+                onCommit: (v) => saveSetting('discoveryPort', v),
               }),
             }),
             h(Field, {
@@ -1769,12 +1818,59 @@ window.__ModuleLoader__.load({
                 onCommit: (v) => saveSetting('maxEvents', v),
               }),
             }),
+            h(Field, {
+              label: '已结束保留天数',
+              desc: '完成 / 取消的卡放多少天后自动立碑（正文擦空）。0 = 永不自动清。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 0,
+                max: 3650,
+                step: 1,
+                value: settings.retentionDays,
+                onCommit: (v) => saveSetting('retentionDays', v),
+              }),
+            }),
+            h(Field, {
+              label: '显示已删除',
+              desc: '墓碑默认不显示。打开后能看到「已删除」的空壳，用来核对谁在什么时候删的。',
+              control: h(Toggle, {
+                on: Boolean(settings.showDeleted),
+                onClick: (v) => saveSetting('showDeleted', v),
+              }),
+            }),
           ),
         ),
         danger: h('div', { className: 'cb-card', style: { background: 'color-mix(in srgb, var(--dsw-alias-state-error-primary) 5%, var(--dsw-alias-bg-layer-1))' } },
           h('div', { className: 'cb-card-h' }, '高危操作'),
           h('p', { className: 'cb-card-sub' }, '这两个动作不可撤销，都是本机的，不涉及别的设备。'),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 } },
+            h('div', { className: 'cb-field-row' },
+              h('div', { className: 'cb-field-desc' }, '把所有完成 / 取消的卡立碑（正文擦空）。日志不删行，两台机器一致。'),
+              h('div', { className: 'cb-field-ctl' },
+                confirmPurge
+                  ? h(Fragment, null,
+                    h(Btn, {
+                      small: true,
+                      danger: true,
+                      onClick: async () => {
+                        setConfirmPurge(false);
+                        try {
+                          const out = await fetchJson('/tasks/delete', {
+                            method: 'POST',
+                            body: JSON.stringify({ allFinished: true }),
+                          });
+                          if (out && out.ok === false) throw new Error(out.error || '删除失败');
+                          const n = Array.isArray(out?.deleted) ? out.deleted.length : 0;
+                          toast(n ? `已清空 ${n} 张已结束的卡` : '没有已结束的卡');
+                        } catch (e) {
+                          toast('清空失败：' + e.message, 'error');
+                        }
+                      },
+                    }, '确认清空'),
+                    h(Btn, { small: true, ghost: true, onClick: () => setConfirmPurge(false) }, '算了'))
+                  : h(Btn, { small: true, danger: true, onClick: () => setConfirmPurge(true) }, '清空已结束的卡'),
+              ),
+            ),
             h('div', { className: 'cb-field-row' },
               h('div', { className: 'cb-field-desc' }, '清空本机事件日志和收件去重记录。'),
               h('div', { className: 'cb-field-ctl' },
@@ -1842,13 +1938,26 @@ window.__ModuleLoader__.load({
           capabilities: caps.all || [],
           self: true,
         };
+        const liveMap = presence && presence.map ? presence.map : null;
         const others = model.members
           .filter((m) => m.name !== self.name)
-          .map((m) => ({
-            ...m,
-            self: false,
-            inferred: false,
-          }));
+          .map((m) => {
+            /**
+             * 在线态以 Hub 现报的为准；拉不到（没连 Hub / 老宿主）才退回事件流里的旧值。
+             * 不覆盖的话，断了机的成员会永远挂着「在线」——那比显示离线更误导。
+             */
+            const live = liveMap ? liveMap[m.origin] : null;
+            const liveStatus = live
+              ? (live.online ? (live.status === 'busy' ? 'busy' : 'idle') : 'offline')
+              : m.status;
+            return {
+              ...m,
+              status: liveStatus,
+              live: Boolean(live),
+              self: false,
+              inferred: false,
+            };
+          });
         /**
          * 这里**不再**把「只在消息里出现过的名字」折成成员。
          * 以前这么干过：两台机器的 member 事件名和消息里的发言名对不上
@@ -1862,7 +1971,7 @@ window.__ModuleLoader__.load({
           if (oa !== ob) return oa - ob;
           return a.name.localeCompare(b.name);
         });
-      }, [model.members, settings.selfName, caps.all]);
+      }, [model.members, settings.selfName, caps.all, presence]);
 
       /** 本地隐藏的成员（只影响这台机器的视图，不改事件流）。 */
       const hiddenSet = new Set(
@@ -2128,6 +2237,15 @@ window.__ModuleLoader__.load({
        * 客户端常量只能证明「浏览器加载了哪份 bundle」，判不了宿主，所以单开一项。
        */
       const [hostVer, setHostVer] = useState(null);
+      /**
+       * Hub 现报的成员在线态（`/collab-board/members`）。
+       *   null = 没连 Hub / 拉不到 → 界面退回事件流里的旧值（只是会标「连不上」）
+       *   { at, map: origin → { online, status, lastSeen } }
+       *
+       * 为什么不能只靠事件流：`member` 事件只有 join 那一条，之后再也不写 ——
+       * 拿它画「在线」等于画「加入那一刻在线」，关机了也不会变。
+       */
+      const [presence, setPresence] = useState(null);
 
       const rootRef = useRef(null);
       const settingsRef = useRef(settings);
@@ -2150,6 +2268,24 @@ window.__ModuleLoader__.load({
           setHub(data && data.ok !== false ? data : null);
         } catch {
           setHub(null);
+        }
+      }, []);
+
+      /** 成员在线态。没连 Hub 是正常的（单机），不是错误。 */
+      const refreshPresence = useCallback(async () => {
+        try {
+          const data = await fetchJson('/members');
+          if (data && data.ok !== false && data.connected && Array.isArray(data.members)) {
+            const map = {};
+            for (const m of data.members) {
+              if (m && typeof m.origin === 'string' && m.origin) map[m.origin] = m;
+            }
+            setPresence({ at: Date.now(), map });
+          } else {
+            setPresence(null);
+          }
+        } catch {
+          setPresence(null);
         }
       }, []);
 
@@ -2220,9 +2356,11 @@ window.__ModuleLoader__.load({
         const ms = Math.max(1000, Number(settings.pollIntervalMs) || 3000);
         // 事件每 pollIntervalMs 拉一次；Hub 状态更慢一点（5 秒），不用跟着事件抖
         const timer = setInterval(() => { refreshState(); }, ms);
-        const hubTimer = setInterval(() => { refreshHub(); }, Math.max(5000, ms));
+        const hubTimer = setInterval(() => { refreshHub(); refreshPresence(); }, Math.max(5000, ms));
+        // 进页面先拉一次在线态，别等 5 秒才知道谁真的在线
+        refreshPresence();
         return () => { clearInterval(timer); clearInterval(hubTimer); };
-      }, [ready, settings.pollIntervalMs, refreshState, refreshHub]);
+      }, [ready, settings.pollIntervalMs, refreshState, refreshHub, refreshPresence]);
 
       useEffect(() => {
         const el = rootRef.current;
@@ -2482,15 +2620,30 @@ window.__ModuleLoader__.load({
         ),
       );
 
+      /**
+       * 页面 bundle 和宿主进程的版本对不上 —— 这正是「面板显示新版、实际跑旧版」的样子。
+       * 只比明确拿到的版本号：legacy（<0.10.6 没这个路由）不报，免得老宿主满屏警告。
+       */
+      const verDrift = Boolean(
+        hostVer && typeof hostVer === 'object' && hostVer.version && hostVer.version !== VERSION,
+      );
+
       return h('div', { className: 'cb-root', ref: rootRef },
         h('div', { className: 'cb-wrap' },
           h('div', { className: 'cb-head' },
             h('div', { className: 'cb-head-icon' }, h(Icon, { name: 'board', size: 15 })),
             h('div', { className: 'cb-head-text' },
               h('div', { className: 'cb-title' }, '协作看板',
-                h('span', { className: 'cb-title-ver', title: 'v/b 是客户端常量（浏览器加载的 bundle）；「宿主」是宿主进程实际加载的包版本，来自 /collab-board/version' },
+                h('span', {
+                  className: 'cb-title-ver' + (verDrift ? ' cb-drift' : ''),
+                  title: verDrift
+                    ? `页面 bundle 是 ${VERSION}，宿主进程加载的是 ${hostVer.version}。`
+                      + '两种可能：页面没刷新（先 F5），或者宿主没重启（文件换了进程没换）。'
+                    : 'v/b 是客户端常量（浏览器加载的 bundle）；「宿主」是宿主进程实际加载的包版本，来自 /collab-board/version',
+                },
                   'v' + VERSION + ' · b' + BUILD
-                  + (hostVer ? ' · 宿主 ' + (typeof hostVer === 'string' ? '<0.10.6' : (hostVer.version || '?')) : ''))),
+                  + (hostVer ? ' · 宿主 ' + (typeof hostVer === 'string' ? '<0.10.6' : (hostVer.version || '?')) : '')
+                  + (verDrift ? ' ⚠ 版本不一致' : ''))),
               h('div', { className: 'cb-sub' }, headerSub),
             ),
             h('nav', { className: 'cb-seg', role: 'tablist' },
@@ -2559,6 +2712,7 @@ window.__ModuleLoader__.load({
                     caps,
                     me,
                     toast,
+                    presence,
                     onCopy: copyText,
                     runtime: hub,
                     onHubAction: hubAction,
@@ -2615,6 +2769,26 @@ window.__ModuleLoader__.load({
                 }
               },
             }, menu.task.archived ? '取消归档' : '归档'),
+            h('button', {
+              type: 'button',
+              style: { color: 'var(--dsw-alias-label-error)' },
+              onClick: async () => {
+                const task = menu.task;
+                setMenu(null);
+                if (!window.confirm('删掉这张卡？标题、描述、标签会被清空，日志里只留一个壳（跨机同步，不能撤销）。')) return;
+                try {
+                  const out = await fetchJson('/tasks/delete', {
+                    method: 'POST',
+                    body: JSON.stringify({ taskId: task.taskId }),
+                  });
+                  if (out && out.ok === false) throw new Error(out.error || '删除失败');
+                  toast('已删除 ' + task.taskId);
+                  await refreshState();
+                } catch (e) {
+                  toast('删除失败：' + e.message, 'error');
+                }
+              },
+            }, '删除'),
             h('button', {
               type: 'button',
               onClick: async () => {

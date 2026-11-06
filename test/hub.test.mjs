@@ -19,7 +19,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { startHub } from '../src/host/hub.mjs';
+import { startHub, leaseEndAt, leaseRenewAt } from '../src/host/hub.mjs';
 import { broadcastTargets, signPacket, createHubWatch, createDiscovery } from '../src/host/discovery.mjs';
 
 const GROUP = 'a1b2c3d4e5f60718';
@@ -267,7 +267,8 @@ async function main() {
 
   const pullAfterDone = await call(base, '/events?since=0', { token: tokenC });
   const t3Events = pullAfterDone.data.events
-    .filter((e) => e.taskId === 't3')
+    // 只看 task 事件：解锁现在会额外写一条 msg（0.10.15），不该混进「最新状态」
+    .filter((e) => e.taskId === 't3' && e.kind === 'task')
     .sort((a, b) => (a.seq - b.seq));
   const t3Latest = t3Events[t3Events.length - 1];
   check('t3 自动 blocked → pending', t3Latest && t3Latest.status === 'pending',
@@ -276,7 +277,19 @@ async function main() {
     pullAfterDone.data.events.some((e) => e.kind === 'note' && e.origin === '0000000000000000' && String(e.text).includes('t3')));
   check('解锁事件是系统 origin', t3Latest && t3Latest.origin === '0000000000000000', t3Latest && t3Latest.origin);
 
+  // 0.10.15：解锁要真的把人叫醒 —— 系统 msg，定向 to，不是广播
+  const unlockMsgs = pullAfterDone.data.events.filter(
+    (e) => e.kind === 'msg' && e.taskId === 't3' && e.origin === '0000000000000000',
+  );
+  check('解锁发了一条系统 msg（叫醒下游）', unlockMsgs.length === 1, String(unlockMsgs.length));
+  const unlockMsg = unlockMsgs[0];
+  check('这条 msg 指向 t3 的创建者 A', Boolean(unlockMsg) && unlockMsg.to === ORIGIN_A,
+    unlockMsg ? String(unlockMsg.to) : '没有 msg');
+  check('这条 msg 不是广播（to 非空）', Boolean(unlockMsg) && Boolean(unlockMsg.to));
+  check('这条 msg 带得上 taskId（能挂回卡上）', Boolean(unlockMsg) && unlockMsg.taskId === 't3');
+
   const t3CountBefore = t3Events.length;
+  const msgCountBefore = pullAfterDone.data.events.filter((e) => e.kind === 'msg' && e.taskId === 't3').length;
   await call(base, '/events', {
     method: 'POST',
     token: tokenB,
@@ -294,11 +307,19 @@ async function main() {
     },
   });
   const pullAgain = await call(base, '/events?since=0', { token: tokenC });
-  const t3CountAfter = pullAgain.data.events.filter((e) => e.taskId === 't3').length;
+  const t3CountAfter = pullAgain.data.events.filter((e) => e.taskId === 't3' && e.kind === 'task').length;
   check('重复 done 不重复解锁（条件二）', t3CountAfter === t3CountBefore, `${t3CountBefore} → ${t3CountAfter}`);
+  const msgCountAfter = pullAgain.data.events.filter((e) => e.kind === 'msg' && e.taskId === 't3').length;
+  check('重复 done 不重复发唤醒 msg', msgCountAfter === msgCountBefore, `${msgCountBefore} → ${msgCountAfter}`);
 
-  console.log('\n5d. owner 旁路：普通写不许抢已认领的卡');
-  // 认领本来走 /tasks/claim 的串行 CAS，但普通 task 事件也能写 owner ——
+  const badTo = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: { events: [{ id: 'ev_aaaaaa_t1k00009_iii', origin: ORIGIN_A, kind: 'msg', text: 'to 不合法', to: 'not-a-hex-origin' }] },
+  });
+  check('msg 的 to 不是合法 origin → 400', badTo.status === 400, JSON.stringify(badTo.error));
+
+  console.log('\n5d. owner 旁路：普通写不许抢已认领的卡');  // 认领本来走 /tasks/claim 的串行 CAS，但普通 task 事件也能写 owner ——
   // 不堵住的话，任何人推一条事件就能把别人的卡抢走。
   await call(base, '/events', {
     method: 'POST',
@@ -466,6 +487,176 @@ async function main() {
     },
   });
   check('创建者改自己的卡 → 放行', renameByA.ok === true, JSON.stringify(renameByA.error));
+
+  console.log('\n5e. 租约续约（0.10.13）');
+  // 纯算法：不依赖计时器，先把边界定死
+  const t0 = '2026-01-01T00:00:00.000Z';
+  const t0ms = new Date(t0).getTime();
+  check('终点 = 认领时间 + 时长', leaseEndAt({ claimedAt: t0, leaseMs: 60000 }) === t0ms + 60000);
+  check('续约水印晚于认领终点时取水印',
+    leaseEndAt({ claimedAt: t0, leaseMs: 60000, renewedUntil: t0ms + 180000 }) === t0ms + 180000);
+  check('续约不越过 4 倍上限',
+    leaseRenewAt({ claimedAt: t0, leaseMs: 60000, now: t0ms + 230000 }) === t0ms + 240000);
+  check('续约 = 现在 + 时长（没到上限时）',
+    leaseRenewAt({ claimedAt: t0, leaseMs: 60000, now: t0ms + 30000 }) === t0ms + 90000);
+  check('没开租约的卡不算终点', leaseEndAt({ claimedAt: t0, leaseMs: 0 }) === 0);
+
+  // 真行为：短租约的 Hub，进度推上来要能续命
+  const leaseDir = dir();
+  const leaseHub = await startHub({
+    dir: leaseDir,
+    groupId: GROUP,
+    origin: ORIGIN_C,
+    name: '租约 Hub',
+    port: 0,
+    log: () => {},
+    leaseTickMs: 50,
+    noDiscovery: true,
+  });
+  const leaseBase = `http://127.0.0.1:${leaseHub.info.port}`;
+  const lj = await call(leaseBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_A, name: 'A', code: '' },
+  });
+  const lTok = lj.data.token;
+  await call(leaseBase, '/events', {
+    method: 'POST',
+    token: lTok,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_lease_t1_000001',
+        origin: ORIGIN_A,
+        name: 'A',
+        ts: new Date().toISOString(),
+        kind: 'task',
+        taskId: 't-lease',
+        title: '长任务：不许做到一半被抢走',
+        status: 'pending',
+        detail: '',
+        owner: '',
+      }],
+    },
+  });
+  const claimed = await call(leaseBase, '/tasks/claim', {
+    method: 'POST',
+    token: lTok,
+    body: { taskId: 't-lease', leaseMs: 800 },
+  });
+  check('短租约认领成功', claimed.ok === true, JSON.stringify(claimed.error));
+
+  const latestTask = async () => {
+    const r = await call(leaseBase, '/events?since=0&limit=500', { token: lTok });
+    const rows = (r.data?.events || []).filter((e) => e.kind === 'task' && e.taskId === 't-lease');
+    return rows.sort((a, b) => (a.seq || 0) - (b.seq || 0)).pop() || null;
+  };
+
+  // 800ms 的租约过 600ms 再推进度：续到 600+800=1400，比原来 800 的终点晚
+  await new Promise((r) => setTimeout(r, 600));
+  await call(leaseBase, '/events', {
+    method: 'POST',
+    token: lTok,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_lease_p1_000001',
+        origin: ORIGIN_A,
+        name: 'A',
+        ts: new Date().toISOString(),
+        kind: 'progress',
+        taskId: 't-lease',
+        done: 1,
+        total: 2,
+        note: '干到一半',
+      }],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 250));
+  const savedState = JSON.parse(readFileSync(join(leaseDir, 'hub.json'), 'utf8'));
+  const savedLease = (savedState.leases || []).find((l) => l.taskId === 't-lease');
+  check('续约水印落盘了（重启才认得出长任务）', Boolean(savedLease) && savedLease.until > 0,
+    JSON.stringify(savedLease || null));
+
+  await new Promise((r) => setTimeout(r, 500));
+  const midway = await latestTask();
+  check('写过进度 → 过了原租约也没被释放', Boolean(midway && midway.status === 'running'),
+    JSON.stringify(midway?.status));
+
+  await new Promise((r) => setTimeout(r, 1400));
+  const expired = await latestTask();
+  check('续约也会到期 → 照样退回待认领，不无限续',
+    Boolean(expired && expired.status === 'pending'), JSON.stringify(expired?.status));
+
+  const leaseLog = readFileSync(join(leaseDir, 'hub-events.jsonl'), 'utf8')
+    .trim().split('\n').map((l) => JSON.parse(l));
+  check('释放前先发过「租约快到期」提醒',
+    leaseLog.some((e) => e.kind === 'note' && String(e.text).includes('租约还剩')));
+  check('提醒是 warn 级', leaseLog.some((e) => e.kind === 'note' && e.level === 'warn'));
+  await leaseHub.controller.close();
+  rmSync(leaseDir, { recursive: true, force: true });
+
+  console.log('\n5f. 墓碑删除（0.10.14）');
+  // 一张带敏感正文的卡，由 A 创建
+  const tombCreated = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_tomb_create_000001',
+        origin: ORIGIN_A,
+        name: 'A',
+        ts: new Date().toISOString(),
+        kind: 'task',
+        taskId: 't-tomb',
+        title: '机密标题不该留',
+        status: 'pending',
+        detail: '机密描述也不该留',
+        tags: ['敏感'],
+      }],
+    },
+  });
+  check('待删的卡建好了', tombCreated.ok === true, JSON.stringify(tombCreated.error));
+
+  // 由 B（不是创建者）来删：墓碑必须豁免「非创建者不能改标题」这条
+  const tombEv = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_tomb_live_000001',
+        origin: ORIGIN_B,
+        name: 'B',
+        ts: new Date().toISOString(),
+        kind: 'task',
+        taskId: 't-tomb',
+        title: '',
+        status: 'cancelled',
+        deleted: true,
+        deletedAt: new Date().toISOString(),
+      }],
+    },
+  });
+  check('别人也能删（墓碑豁免改标题保护）', tombEv.ok === true, JSON.stringify(tombEv.error));
+
+  const tombDump = await call(base, '/events?since=0&limit=500', { token: tokenA });
+  const tombRows = (tombDump.data?.events || []).filter((e) => e.kind === 'task' && e.taskId === 't-tomb');
+  check('该卡的历史事件还在（不删行）', tombRows.length >= 2, String(tombRows.length));
+  check('历史正文已擦空', tombRows.every((e) => !String(e.title || '').includes('机密标题')),
+    JSON.stringify(tombRows.map((e) => e.title)));
+  check('墓碑带 deletedAt / 谁删的', tombRows.some((e) => e.deleted === true && e.deletedAt && e.origin === ORIGIN_B));
+
+  const rawHub = readFileSync(join(dataDir, 'hub-events.jsonl'), 'utf8');
+  check('Hub 日志文件里搜不到原文', !rawHub.includes('机密标题') && !rawHub.includes('机密描述'));
+
+  // 已删除的卡不能再认领
+  const claimDeleted = await call(base, '/tasks/claim', {
+    method: 'POST',
+    token: tokenC,
+    body: { taskId: 't-tomb', leaseMs: 0 },
+  });
+  check('已删除的卡拒绝认领', claimDeleted.status === 409, JSON.stringify(claimDeleted.error));
 
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;

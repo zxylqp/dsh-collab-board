@@ -25,6 +25,7 @@
 export const WAKE_SKIP = {
   NOT_MSG: 'not-msg',
   SELF: 'self',
+  NOT_FOR_ME: 'not-for-me',
   NO_SEQ: 'no-seq',
   HISTORY: 'history',
 };
@@ -41,6 +42,15 @@ export function shouldWake(ev, { selfOrigin, maxEpoch = 0, maxSeq = 0 }) {
   if (!ev || ev.kind !== 'msg') return { wake: false, reason: WAKE_SKIP.NOT_MSG };
   if (typeof ev.origin !== 'string' || ev.origin === selfOrigin) {
     return { wake: false, reason: WAKE_SKIP.SELF };
+  }
+  /**
+   * 定向消息（`to`）：叫的是别人，我照收、照显示，但不为此烧一轮 token。
+   *
+   * 依赖解锁发的那条系统消息就是这种 —— 不给定向的话，一张卡解锁会把
+   * 所有开着 wakeOnMessage 的机器都点醒一轮（§6.10.2）。
+   */
+  if (typeof ev.to === 'string' && ev.to !== '' && ev.to !== selfOrigin) {
+    return { wake: false, reason: WAKE_SKIP.NOT_FOR_ME };
   }
   const seq = Number(ev.seq);
   if (!Number.isFinite(seq) || seq <= 0) return { wake: false, reason: WAKE_SKIP.NO_SEQ };
