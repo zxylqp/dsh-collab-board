@@ -336,6 +336,7 @@ export function apply(ctx, rawConfig = {}) {
       const note = buildEvent({
         kind: 'note',
         level: 'warn',
+        taskId,
         text: `自动续跑 ${taskId} 连续 ${max} 次还是 ${task.status}，停了。`
           + '要么它其实干完了没标 done，要么它卡住了 —— 人工看一眼再决定。',
       });
@@ -402,6 +403,7 @@ export function apply(ctx, rawConfig = {}) {
       const note = buildEvent({
         kind: 'note',
         level: 'warn',
+        taskId: item.taskId || '',
         text: `自动唤醒失败 ${item.max} 次，已放弃：${item.taskId || '全局'}（${item.lastError}）。`
           + '这条消息还在看板上，人工叫一次就行。',
       });
@@ -629,6 +631,7 @@ export function apply(ctx, rawConfig = {}) {
         const note = buildEvent({
           kind: 'note',
           level: 'warn',
+          taskId: ev.kind === 'task' ? ev.taskId : '',
           text: `一条事件被 Hub 拒了（${what}）：${err && err.message ? err.message : '原因不明'}。`
             + '已跳过，不会堵住后面的同步；这条要补就重新发。',
         });
@@ -1943,7 +1946,19 @@ export function apply(ctx, rawConfig = {}) {
         return ev;
       }
       case 'note':
-        return { ...base, text: String(input.text ?? ''), level: input.level === 'warn' ? 'warn' : 'info' };
+        /**
+         * `taskId` 是可选字段：这条提示说的是哪张卡（0.11.4）。
+         *
+         * 面板据此在**卡被删掉之后把这条一起收走** —— 不然卡清了、动态流里
+         * 那几十条「自动认领: xxx」还挂着，看着像没删干净。
+         * 不带 = 全局提示，永远留着。
+         */
+        return {
+          ...base,
+          text: String(input.text ?? ''),
+          level: input.level === 'warn' ? 'warn' : 'info',
+          ...(isText(input.taskId) ? { taskId: String(input.taskId).trim().slice(0, 64) } : {}),
+        };
       case 'member':
         // 成员事件由成员自己写（系统 origin 不许写 member，§6.10.4）
         return {
@@ -2043,6 +2058,7 @@ export function apply(ctx, rawConfig = {}) {
               kind: 'note',
               text: `自动认领：${task.taskId} ${task.title}`,
               level: 'info',
+              taskId: task.taskId,
             });
             if (note) appendEvent(note);
             hubLog('info', `自动认领 ${task.taskId}`);
@@ -2111,6 +2127,7 @@ export function apply(ctx, rawConfig = {}) {
             kind: 'note',
             text: `有活等人接：${task.taskId} ${task.title}`,
             level: 'info',
+            taskId: task.taskId,
           });
           if (ev) appendEvent(ev);
         }

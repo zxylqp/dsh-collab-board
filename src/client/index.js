@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 27;
-    const VERSION = '0.11.3';
+    const VERSION = '0.11.4';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -486,6 +486,30 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 一条 note 说的是哪张卡（0.11.4）。返回 '' = 全局的，不属于任何卡。
+     *
+     * 为什么需要它：动态流以前把所有 note 一视同仁全摊出来，于是**删掉的卡**
+     * 留下的「自动认领: xxx」「一条事件被 Hub 拒了」还能在流里挂一辈子 ——
+     * 卡清了、流没清，看着就像没删干净。
+     *
+     * 判据分两档，原则是**认不出来就当全局**：宁可多留一条，也不能猜错卡，
+     * 把不相关的记录一起藏掉。
+     *   1. 读字段：0.11.4 起插件自己写 note 会带 `taskId`
+     *   2. 读文案：老数据没字段，只能反解 —— **只认我们自己生成的那两种格式**，
+     *      格式由生成端保证（见 host/index.mjs 的「自动认领：」和「一条事件被 Hub 拒了（task …）」）
+     */
+    function noteTaskIdOf(ev, text) {
+      const direct = typeof ev.taskId === 'string' ? ev.taskId.trim()
+        : (typeof ev.task === 'string' ? ev.task.trim() : '');
+      if (direct) return direct;
+      const auto = /^自动认领：(\S+)/.exec(text);
+      if (auto) return auto[1];
+      const rejected = /被 Hub 拒了（task (\S+?)）/.exec(text);
+      if (rejected) return rejected[1];
+      return '';
+    }
+
+    /**
      * 这条事件拿到 Hub 分配的序号没有（= 已同步）。
      *
      * 新事件（带 `eventVersion`）必须真的有 epoch + seq 才算同步 —— 光有 id 不算，
@@ -655,11 +679,14 @@ window.__ModuleLoader__.load({
         }
 
         if (kind === 'note') {
+          const noteText = String(ev.text == null ? '' : ev.text);
           notes.push({
             ev,
             ts: ev.ts,
-            text: String(ev.text == null ? '' : ev.text),
+            text: noteText,
             level: ev.level === 'warn' ? 'warn' : 'info',
+            // 属于哪张卡（0.11.4）：卡被删掉时，这条也要跟着从动态流里消失
+            taskId: noteTaskIdOf(ev, noteText),
           });
           continue;
         }
@@ -721,6 +748,18 @@ window.__ModuleLoader__.load({
         if (!senders.has(m.from)) senders.set(m.from, m.ts);
       }
 
+      /**
+       * 已经删掉的卡（墓碑）的 id 集合（0.11.4）。
+       *
+       * 「清空任务」就该是「清空跟它有关的一切」—— 卡没了，它的评论、它的系统提示
+       * 都不该还在动态流里挂着。这里只放 `deleted === true` 的：
+       * `archived` 不算，归档只是不进主视图，卡还活着，它的对话也该还看得到。
+       */
+      const deletedIds = new Set();
+      for (const t of tasks.values()) {
+        if (t.deleted === true) deletedIds.add(t.taskId);
+      }
+
       return {
         events: ordered,
         total: all.length,
@@ -728,6 +767,7 @@ window.__ModuleLoader__.load({
         shown: ordered.length,
         tasks: list,
         byId: tasks,
+        deletedIds,
         messages,
         notes,
         artifacts,
@@ -1337,6 +1377,14 @@ window.__ModuleLoader__.load({
         }
         for (const note of model.notes) {
           if (!settings.showSystemEvents) continue;
+          /**
+           * 挂在一张已经删掉的卡上的提示，跟着卡一起消失（0.11.4）。
+           *
+           * 以前不分卡：卡清空了，那几十条「自动认领: xxx」还挂在流里，
+           * 看上去像没删干净。动态流跟着任务走，任务没了它也该没了。
+           * 认不出属于哪张卡的 note 一律当全局留着 —— 宁可多留，不能藏错。
+           */
+          if (note.taskId && model.deletedIds.has(note.taskId)) continue;
           list.push({ kind: 'note', ts: note.ts, data: note });
         }
         if (settings.showArtifacts) {
@@ -1358,6 +1406,13 @@ window.__ModuleLoader__.load({
         for (const [taskId, list] of model.commentsByTask) {
           const task = model.byId.get(taskId);
           if (task && task.archived) continue;
+          /**
+           * 卡删了，这条索引也删（0.11.4）。
+           *
+           * 以前只跳过 `archived`，没跳 `deleted` —— 于是删掉的卡还按评论数排在最前面，
+           * 点进去 29 条评论全文都在。「删除」删的是标题，评论一条没动，等于删了个寂寞。
+           */
+          if (model.deletedIds.has(taskId)) continue;
           rows.push({ taskId, count: list.length, title: task ? task.title : taskId });
         }
         return rows.sort((a, b) => b.count - a.count);

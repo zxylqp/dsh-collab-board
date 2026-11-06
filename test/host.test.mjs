@@ -372,6 +372,10 @@ async function main() {
     JSON.stringify({ status: autoLatest?.status, owner: autoLatest?.owner, n: autoEv.length }));
   check('写了「自动认领」系统提示',
     afterAuto.some((e) => e.kind === 'note' && String(e.text).includes('自动认领')));
+  // 0.11.4：提示要带 taskId，否则卡删掉之后这条会一直挂在动态流里
+  const autoNote = afterAuto.find((e) => e.kind === 'note' && String(e.text).includes('自动认领'));
+  check('自动认领提示带 taskId（删卡时跟着消失）',
+    autoNote?.taskId === 'auto1', JSON.stringify(autoNote?.taskId));
 
   // 自己建的卡不该被自己抢（否则「我派给别人的活我自己接了」）
   await hit(routes, '/collab-board/post', {
@@ -450,6 +454,9 @@ async function main() {
   );
   check('被拒事件落了 warn note（面板和 agent 都看得见）',
     Boolean(rejectNote), String(rejectNote?.text || '').slice(0, 90));
+  // 0.11.4：这条提示属于 dirty1 那张卡；卡删了它就该跟着走，不能永远挂在动态流里
+  check('被拒提示带 taskId（删卡时跟着消失）',
+    rejectNote?.taskId === 'dirty1', JSON.stringify(rejectNote?.taskId));
 
   // 落盘拉黑：不再算待同步、不进看板视图、重启后也不该再推
   const hubAfterDirty = await hit(routes, '/collab-board/hub');
