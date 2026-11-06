@@ -168,6 +168,25 @@ node test/hub.test.mjs        # 88 项
   `retentionDays` 默认 30 天自动立碑；日志文件本身要变小，得等快照 / 归档那一轮
 - 明确不做：审批流、事件回放、统计、搜索、任务转让、子任务、里程碑
 
+## 发布
+
+```bash
+node publish.mjs            # 版本对齐 → 跑测试 → 同步安装位 → 推 GitHub
+node publish.mjs --check    # 只检查并对齐版本号
+node publish.mjs --dry      # 全做，但不推送
+```
+
+**版本号只有一个真源：`package.json`。** 客户端 `VERSION` 常量、CHANGELOG 顶部标题都由
+脚本对齐 —— 以前这三处各写一遍，于是出过「磁盘 0.10.15、宿主 0.10.14、GitHub 0.10.12」
+这种三张皮。
+
+推送走 GitHub **Git Data API**（`api.github.com` 在 `no_proxy` 里，直连可用），不依赖本地
+git 历史，也不依赖 `127.0.0.1:7897` 那个经常没开的代理。本地 `.git` 只当工作副本，
+**别拿它判断发布状态** —— 版本以 `package.json` 和 GitHub 上的文件为准。
+
+宿主进程要重启才加载新代码；`/collab-board/version` 报的是宿主**实际加载**的版本，
+跟磁盘对不上就是还没重启。
+
 ## 许可
 
 MIT
