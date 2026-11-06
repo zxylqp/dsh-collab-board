@@ -21,6 +21,7 @@ import {
   WIRE_PROTOCOL,
   EVENT_VERSION,
   MAX_BATCH_BYTES,
+  HUB_ONLY_FIELDS,
   compareEvents,
   dedupeById,
   eventBytes,
@@ -31,7 +32,8 @@ import {
 import { SYSTEM_ORIGIN, isOrigin } from './identity.mjs';
 import { createDiscovery, createHubWatch } from './discovery.mjs';
 import { json, readBody, writeAtomic } from './http-util.mjs';
-import { ownerTransitionError } from './selectable.mjs';
+import { ownerTransitionError, isTaskActivity } from './selectable.mjs';
+import { verifyHubCode } from './settings.mjs';
 
 /** 心跳 15 秒一次，45 秒无响应视为离线（§13 成员态）。 */
 export const HEARTBEAT_MS = 15000;
@@ -236,10 +238,8 @@ export async function startHub(opts = {}) {
    * 所以单开一份折叠视图。
    */
   let folded = new Map();
-  /** token → { origin, name, capabilities, status, lastSeen } */
+  /** token → { origin, name, status, lastSeen } */
   let members = new Map();
-  /** capability → Set<origin>（从 member 事件重建，§28） */
-  let capIndex = new Map();
   /** claimId → { taskId, origin, seq, at }（持久化最近 1000 条，§14） */
   let claims = new Map();
   /**
@@ -290,12 +290,11 @@ export async function startHub(opts = {}) {
     return out;
   }
 
-  /** 重建任务表 / 能力索引 / 幂等表。顺序：按权威序逐条应用。 */
+  /** 重建任务表 / 幂等表。顺序：按权威序逐条应用。 */
   function rebuild() {
     tasks = new Map();
     creators = new Map();
     folded = new Map();
-    capIndex = new Map();
     dependents = new Map();
     for (const ev of events) applyIndex(ev);
   }
@@ -337,18 +336,25 @@ export async function startHub(opts = {}) {
       });
       const prev = tasks.get(ev.taskId);
       if (!prev || compareEvents(ev, prev) > 0) {
-        tasks.set(ev.taskId, ev);
+        /**
+         * Hub 专属字段（`claimedAt` / `leaseMs`）**不会被成员带上来**
+         * （`HUB_ONLY_FIELDS` 拦着）。折叠时如果不从上一版继承，任何一条普通
+         * task 事件（改标题、标进度）都会把它们抹掉 —— 租约终点当场变 0，
+         * 卡永远不过期，也不再被扫描释放。这是「改个标题把租约丢了」的真身。
+         * 换 owner 时不继承：那是重新认领，claimedAt 必须换新的。
+         */
+        const next = { ...ev };
+        if (prev && (next.owner === undefined || next.owner === prev.owner)) {
+          for (const f of HUB_ONLY_FIELDS) {
+            if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
+          }
+        }
+        tasks.set(ev.taskId, next);
         // 依赖索引：这条任务依赖谁，就登记到「谁被依赖」上
         for (const dep of Array.isArray(ev.dependsOn) ? ev.dependsOn : []) {
           if (!dependents.has(dep)) dependents.set(dep, new Set());
           dependents.get(dep).add(ev.taskId);
         }
-      }
-    }
-    if (ev.kind === 'member' && ev.origin && ev.action !== 'leave') {
-      for (const cap of Array.isArray(ev.capabilities) ? ev.capabilities : []) {
-        if (!capIndex.has(cap)) capIndex.set(cap, new Set());
-        capIndex.get(cap).add(ev.origin);
       }
     }
   }
@@ -699,7 +705,6 @@ export async function startHub(opts = {}) {
         byOrigin.set(m.origin, {
           origin: m.origin,
           name: m.name,
-          capabilities: m.capabilities,
           status: m.status,
           lastSeen: m.lastSeen,
           online: now - m.lastSeen < OFFLINE_MS,
@@ -708,44 +713,6 @@ export async function startHub(opts = {}) {
       }
     }
     return [...byOrigin.values()];
-  }
-
-  function capabilitiesOf(origin) {
-    for (const m of members.values()) {
-      if (m.origin === origin) return m.capabilities;
-    }
-    // 成员不在线时退回到能力索引
-    const out = [];
-    for (const [cap, set] of capIndex) if (set.has(origin)) out.push(cap);
-    return out;
-  }
-
-  /** §7.3：在线 + 具备任务要求的全部标签。只返回信息，不影响 claim 结果。 */
-  function matchedMembersFor(task) {
-    const need = Array.isArray(task?.requiredCapabilities) ? task.requiredCapabilities : [];
-    if (need.length === 0) return [];
-    const now = Date.now();
-    const out = [];
-    for (const m of members.values()) {
-      if (now - m.lastSeen >= OFFLINE_MS) continue;
-      const has = new Set(m.capabilities.map((c) => String(c).toLowerCase()));
-      if (need.every((c) => has.has(String(c).toLowerCase()))) {
-        out.push({ origin: m.origin, name: m.name, capabilities: m.capabilities });
-      }
-    }
-    return out;
-  }
-
-  /** §7.3：warnings 顺序 = requiredCapabilities 原顺序。只比 requiredCapabilities。 */
-  function warningsFor(task, claimerCaps) {
-    const need = Array.isArray(task?.requiredCapabilities) ? task.requiredCapabilities : [];
-    if (need.length === 0) return [];
-    const has = new Set(claimerCaps.map((c) => String(c).toLowerCase()));
-    const out = [];
-    for (const cap of need) {
-      if (!has.has(String(cap).toLowerCase())) out.push(`缺 ${cap}`);
-    }
-    return out;
   }
 
   /* ─────────────────── 租约 ─────────────────── */
@@ -760,28 +727,33 @@ export async function startHub(opts = {}) {
   }
 
   /**
-   * 进度续约：owner 往自己认领的卡上写 progress / artifact，就把租约往后推。
+   * 进度续约：owner 往自己认领的卡上写「活动」，就把租约往后推。
    *
    * 为什么按事件而不是按定时器：定时续约等于永不过期 —— 机器断电了 Hub
-   * 还在替它续。**只有真在干活（写进度）才算数**。
+   * 还在替它续。**只有真在干活才算数**。
+   *
+   * 「活动」的判据只有一份，在 `selectable.mjs` 的 `isTaskActivity`：
+   * progress / artifact / 带 status 或 owner 的 task。`note` **不算**
+   * （事件模型里没有「progress 类 note」，想续约就写 progress）。
    *
    * 上限 `LEASE_MAX_FACTOR × leaseMs`，从 claimedAt 起算；延长不到 5 秒就不动，
-   * 免得每写一条进度都刷一次 hub.json。
+   * 免得每写一条进度都刷一次 hub.json。续到上限时记 `exhausted`，
+   * 到期释放时据此写不同的 note —— 「续到顶了」和「压根没干」不是一回事。
    */
   function renewLease(ev) {
-    if (!ev || (ev.kind !== 'progress' && ev.kind !== 'artifact')) return;
-    const taskId = String(ev.taskId || '').trim();
+    const taskId = String(ev?.taskId || '').trim();
     if (!taskId) return;
     const task = tasks.get(taskId);
     if (!task || task.status !== 'running' || !task.owner) return;
-    if (task.owner !== ev.origin) return;
+    if (!isTaskActivity(ev, task)) return;
     const lease = Number(task.leaseMs) || 0;
     if (lease <= 0 || !task.claimedAt) return;
+    const cap = new Date(task.claimedAt).getTime() + lease * LEASE_MAX_FACTOR;
     const next = leaseRenewAt({ claimedAt: task.claimedAt, leaseMs: lease, now: Date.now() });
     // 延长的还不到「租约的 5%」（最长 5 秒）就不写盘：短租约也能正常续，长租约不会每条进度都刷一次
     if (next <= leaseEndOf(task) + Math.min(5000, lease * 0.05)) return;
     // 续约后终点变了，之前那条「快到期」提醒作废：新终点前再提醒一次
-    leases.set(taskId, { until: next, warnedFor: 0 });
+    leases.set(taskId, { until: next, warnedFor: 0, ...(Number.isFinite(cap) && next >= cap - 1 ? { exhausted: true } : {}) });
     scheduleStateFlush();
   }
 
@@ -827,6 +799,23 @@ export async function startHub(opts = {}) {
         }
         continue;
       }
+
+      /**
+       * 到期释放先说清楚是哪种到期（lease-exhausted）：
+       * 续约已经到 4× 上限 → 「用尽了」；否则 → 「期间没写进度」。
+       * 两种在看板上原来都是同一条 `task → pending`，分不出来谁该被催。
+       */
+      const leaseRow = leases.get(taskId);
+      try {
+        systemWrite({
+          kind: 'note',
+          level: leaseRow?.exhausted ? 'warn' : 'info',
+          text: leaseRow?.exhausted
+            ? `任务 ${taskId} 的续约已到上限（${LEASE_MAX_FACTOR}× 租约），到期退回待认领 —— `
+              + '不是「没干活」，是租约用尽了；要继续就重新认领。'
+            : `任务 ${taskId} 的租约到期，期间没有写入 progress / artifact，退回待认领。`,
+        });
+      } catch { /* 熔断了：下面的 task 也写不进去，交给下一轮 */ }
 
       try {
         systemWrite({
@@ -935,7 +924,12 @@ export async function startHub(opts = {}) {
       if (Number(body.wireProtocol) !== WIRE_PROTOCOL) {
         return fail(res, 400, 'protocol', `wireProtocol 要是 ${WIRE_PROTOCOL}`);
       }
-      if (code !== '' && String(body.code || '') !== code) {
+      /**
+       * 口令校验（0.10.16 起 `code` 是哈希）。
+       * 三种输入都认：本机存的哈希（成员重启后只能拿这个）、人输入的明文、
+       * 升级前的明文存储。盐是本组 groupId —— 两台机器算出来必须一样。
+       */
+      if (code !== '' && !verifyHubCode(code, String(body.code || ''), groupId)) {
         return fail(res, 401, 'bad-code', '口令不对');
       }
       const origin = String(body.origin || '');
@@ -944,8 +938,7 @@ export async function startHub(opts = {}) {
       }
       const token = randomBytes(16).toString('hex');
       const name = String(body.name || '成员').slice(0, 64);
-      const caps = Array.isArray(body.capabilities) ? body.capabilities.slice(0, 64) : [];
-      members.set(token, { origin, name, capabilities: caps, status: 'idle', lastSeen: Date.now() });
+      members.set(token, { origin, name, status: 'idle', lastSeen: Date.now() });
       // 注意：**不在这里写 member 事件** —— §6.10.4 规定系统 origin 不许写 member
       // （系统不替人说话、不改成员名）。成员加入由成员自己在 join 成功后写一条。
       log('info', `成员加入：${name} (${origin.slice(0, 6)})`);
@@ -970,7 +963,6 @@ export async function startHub(opts = {}) {
       if (!m) return fail(res, 401, 'bad-token', 'token 无效');
       m.lastSeen = Date.now();
       if (body.status === 'busy' || body.status === 'idle') m.status = body.status;
-      if (Array.isArray(body.capabilities)) m.capabilities = body.capabilities.slice(0, 64);
       return ok(res, { epoch, headSeq, online: memberList().filter((x) => x.online).length });
     }
 
@@ -1110,6 +1102,12 @@ export async function startHub(opts = {}) {
       }
 
       const claimId = String(body.claimId || '').trim();
+      /**
+       * 认领时可以带一句「为什么接 / 打算怎么做」。只写进 running 事件，
+       * 不参与任何判定 —— 是给人（和下一轮读看板的 agent）看的观测字段。
+       */
+      const reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 500) : '';
+      const plan = typeof body.plan === 'string' ? body.plan.trim().slice(0, 500) : '';
 
       // 幂等：同一个 claimId 再来一次，返回上次结果，不重复写事件（§14）
       if (claimId && claims.has(claimId)) {
@@ -1119,8 +1117,6 @@ export async function startHub(opts = {}) {
           epoch: prev.epoch,
           seq: prev.seq,
           leaseMs: prev.leaseMs,
-          warnings: prev.warnings || [],
-          matchedMembers: [],
           idempotent: true,
         });
       }
@@ -1158,8 +1154,6 @@ export async function startHub(opts = {}) {
               epoch: Number.isFinite(task.epoch) ? task.epoch : epoch,
               seq: Number.isFinite(task.seq) ? task.seq : headSeq,
               leaseMs: lease,
-              warnings: [],
-              matchedMembers: [],
               idempotent: true,
               ownedByMe: true,
             });
@@ -1174,13 +1168,6 @@ export async function startHub(opts = {}) {
         if (blockedBy.length) {
           return fail(res, 409, 'blocked', `依赖 ${blockedBy.join('、')} 未完成`, { blockedBy });
         }
-
-        // warnings：请求里的 capabilities 优先，空数组等同不传
-        const reqCaps = Array.isArray(body.capabilities) && body.capabilities.length
-          ? body.capabilities.slice(0, 64)
-          : capabilitiesOf(me.origin);
-        const warnings = warningsFor(task, reqCaps);
-        const matched = matchedMembersFor(task);
 
         const ev = {
           eventVersion: EVENT_VERSION,
@@ -1204,6 +1191,8 @@ export async function startHub(opts = {}) {
           // 只有 Hub 能写这两个（§6.3）：服务器时间，不信客户端
           claimedAt: new Date().toISOString(),
           leaseMs,
+          ...(reason ? { reason } : {}),
+          ...(plan ? { plan } : {}),
         };
         appendEvent(ev);
 
@@ -1214,7 +1203,6 @@ export async function startHub(opts = {}) {
             epoch: ev.epoch,
             seq: ev.seq,
             leaseMs,
-            warnings,
             at: Date.now(),
           });
           if (claims.size > 1000) claims.delete(claims.keys().next().value);
@@ -1229,8 +1217,6 @@ export async function startHub(opts = {}) {
           epoch: ev.epoch,
           seq: ev.seq,
           leaseMs,
-          warnings,
-          matchedMembers: matched,
         });
       });
 

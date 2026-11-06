@@ -1,12 +1,11 @@
 /**
  * 协作看板 · 「哪些活该我接」的唯一判据
  *
- * 为什么要有这个文件：这条判据原来在五处各写了一遍 ——
+ * 为什么要有这个文件：这条判据原来在四处各写了一遍 ——
  *   - 自动认领 `pickClaimable`（index.mjs）
  *   - 待办提醒 `scan`（index.mjs）
  *   - `readBoard` 的 pending 池（index.mjs）
- *   - Hub 侧的 `matchedMembersFor` / `warningsFor`（hub.mjs）
- *   - 客户端任务详情的 `missingCaps` / `unmet`（client/index.js）
+ *   - 客户端任务详情（client/index.js）
  *
  * 已经分叉了：自动认领排除「自己建的卡」，待办提醒没排除 ——
  * 同一张卡，一个信号说「我不接」，另一个喊「有人接一下」。
@@ -39,9 +38,19 @@ export function latestTasks(events) {
        * `collab_state` 的 mine 漏掉自己认领的卡、别人那台还以为这张卡能接。
        * 折叠时把上一版的 owner 带过来 —— 只有显式写了 owner（含 ""）才算变更。
        */
-      out.set(ev.taskId, Object.prototype.hasOwnProperty.call(ev, 'owner')
-        ? ev
-        : { ...ev, owner: prev.owner });
+      const next = Object.prototype.hasOwnProperty.call(ev, 'owner')
+        ? { ...ev }
+        : { ...ev, owner: prev.owner };
+      /**
+       * `claimedAt` / `leaseMs` 是 Hub 专属字段，成员推上来的普通 task 事件没有它们。
+       * 不继承的话，本机看板会把「租约还剩多久」算成 0 —— 和 Hub 那边同一个坑。
+       */
+      if (next.owner === prev.owner) {
+        for (const f of ['claimedAt', 'leaseMs']) {
+          if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
+        }
+      }
+      out.set(ev.taskId, next);
     }
   }
   return out;
@@ -53,19 +62,15 @@ export function latestTasks(events) {
  * @param {any[]} events
  * @param {object} opts
  * @param {string}   [opts.selfOrigin]    本机 origin（判「自己建的」）
- * @param {string[]} [opts.capabilities]  本机能力标签
  * @param {boolean}  [opts.excludeOwn]    true = 自己建的卡不算可接（默认 true）
  * @param {boolean}  [opts.includeArchived] true = 归档的也返回（只用于展示）
  * @returns {Array<{ task: any, ok: boolean, reason: string }>}
- *   reason: '' | 'not-pending' | 'owned' | 'archived' | 'own' | 'deps' | 'caps'
+ *   reason: '' | 'not-pending' | 'owned' | 'archived' | 'own' | 'deps'
  */
 export function claimableTasks(events, opts = {}) {
   const selfOrigin = typeof opts.selfOrigin === 'string' ? opts.selfOrigin : '';
   const excludeOwn = opts.excludeOwn !== false;
   const includeArchived = opts.includeArchived === true;
-  const mine = new Set(
-    (Array.isArray(opts.capabilities) ? opts.capabilities : []).map((c) => String(c).toLowerCase()),
-  );
 
   const tasks = latestTasks(events);
   const creators = earliestByTask(events);
@@ -97,12 +102,6 @@ export function claimableTasks(events, opts = {}) {
       out.push({ task, ok: false, reason: 'deps' });
       continue;
     }
-    const caps = Array.isArray(task.requiredCapabilities) ? task.requiredCapabilities : [];
-    const capsOk = caps.every((c) => mine.has(String(c).toLowerCase()));
-    if (!capsOk) {
-      out.push({ task, ok: false, reason: 'caps' });
-      continue;
-    }
     out.push({ task, ok: true, reason: '' });
   }
   return out;
@@ -111,6 +110,30 @@ export function claimableTasks(events, opts = {}) {
 /** 只留能接的，返回任务事件本身（调用方常用的形状）。 */
 export function claimableOnly(events, opts = {}) {
   return claimableTasks(events, opts).filter((x) => x.ok).map((x) => x.task);
+}
+
+/**
+ * 「活动」—— 全链路**只有一个定义**（口径分裂过两次，别再写第二份）。
+ *
+ * ```
+ * 活动(ev, task) = ev.taskId === task.taskId
+ *               && ev.origin === task.owner
+ *               && (ev.kind === 'progress'
+ *                   || ev.kind === 'artifact'
+ *                   || (ev.kind === 'task' && (ev.status !== undefined || ev.owner !== undefined)))
+ * ```
+ *
+ * 用途只有两个：**租约续约**和**投递门控**。`note` 不算 —— 事件模型里没有
+ * 「progress 类 note」这个概念，想续约就写 progress，别让 Hub 猜语义。
+ */
+export function isTaskActivity(ev, task) {
+  if (!ev || !task) return false;
+  const taskId = String(task.taskId || '');
+  if (taskId === '' || ev.taskId !== taskId) return false;
+  const owner = String(task.owner || '');
+  if (owner === '' || ev.origin !== owner) return false;
+  if (ev.kind === 'progress' || ev.kind === 'artifact') return true;
+  return ev.kind === 'task' && (ev.status !== undefined || ev.owner !== undefined);
 }
 
 /**
@@ -139,18 +162,8 @@ export function earliestByTask(events) {
 }
 
 /**
- * 缺哪些能力标签。给「缺 xx」提示用，和 claimableTasks 同一套大小写规则。
- * @returns {string[]} 缺的标签（原样返回任务里写的那个拼法）
+ * 依赖里还没完成/取消的那些。
  */
-export function missingCapabilities(task, capabilities) {
-  const mine = new Set(
-    (Array.isArray(capabilities) ? capabilities : []).map((c) => String(c).toLowerCase()),
-  );
-  const need = Array.isArray(task?.requiredCapabilities) ? task.requiredCapabilities : [];
-  return need.filter((c) => !mine.has(String(c).toLowerCase()));
-}
-
-/** 依赖里还没完成/取消的那些。 */
 export function unmetDependencies(task, tasks) {
   const table = tasks instanceof Map ? tasks : latestTasks(tasks);
   const deps = Array.isArray(task?.dependsOn) ? task.dependsOn : [];

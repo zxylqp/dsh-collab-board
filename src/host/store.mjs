@@ -12,7 +12,7 @@
  *
  * @module dsh-collab-board/host/store
  */
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { hasSyncStamp, makeEventId } from './events.mjs';
 import { writeAtomic } from './http-util.mjs';
 
@@ -136,7 +136,14 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
     const limit = maxEventsOf();
     if (after.length > limit) {
       const kept = after.slice(-limit);
-      writeFileSync(logPath, kept.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+      /**
+       * 裁剪用**原子写**（tmp + rename）。
+       *
+       * 这个文件头写着「只追加、永不原地改」，而裁剪正是唯一一次全量重写 ——
+       * 以前这里是裸 `writeFileSync`，断电落在写一半的窗口里就是半截文件：
+       * 丢的不只是被裁掉的老事件，而是整份日志。旁边 sidecar 早就用 writeAtomic 了。
+       */
+      writeAtomic(logPath, kept.map((e) => JSON.stringify(e)).join('\n') + '\n');
       invalidate();
     }
     return stamped;

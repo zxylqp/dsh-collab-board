@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 25;
-    const VERSION = '0.10.16';
+    const BUILD = 26;
+    const VERSION = '0.11.1';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -41,8 +41,6 @@ window.__ModuleLoader__.load({
       autoScroll: true,
       timeFormat: 'clock',
       maxReplay: 500,
-      capabilityDetect: true,
-      capabilitiesExtra: '',
       maxEvents: 20000,
       retentionDays: 30,
       showDeleted: false,
@@ -50,6 +48,7 @@ window.__ModuleLoader__.load({
       hubPort: 48910,
       discoveryPort: 48911,
       hubCode: '',
+      hubCodeSet: false,
       pendingWatch: false,
       pendingWatchMs: 300000,
       autoClaim: true,
@@ -104,7 +103,7 @@ window.__ModuleLoader__.load({
 .cb-title{font-size:17px;font-weight:600;letter-spacing:.2px;line-height:1.3;}
 .cb-title-ver{font-size:11px;font-weight:500;letter-spacing:0;color:var(--dsw-alias-label-tertiary);
   margin-left:7px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-bg-overlay);vertical-align:middle;}
-.cb-title-ver.cb-drift{color:var(--dsw-alias-state-warn-primary);font-weight:600;}
+.cb-title-ver.cb-drift{color:var(--dsw-alias-label-error);font-weight:600;}
 .cb-sub{font-size:12px;line-height:1.4;color:var(--dsw-alias-label-tertiary);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-seg{display:inline-flex;gap:2px;padding:2px;border-radius:9px;background:var(--dsw-alias-bg-overlay);flex:none;}
@@ -1019,7 +1018,7 @@ window.__ModuleLoader__.load({
     /* ────────────────────────────── 看板：详情 ────────────────────────────── */
 
     function TaskDetail(props) {
-      const { task, model, settings, caps, me, toast, onOpenTask } = props;
+      const { task, model, settings, me, toast, onOpenTask } = props;
       const hub = props.hub || null;
       const [historyOpen, setHistoryOpen] = useState(false);
       const [confirmClaim, setConfirmClaim] = useState(false);
@@ -1033,8 +1032,6 @@ window.__ModuleLoader__.load({
         return { id, title: dep ? dep.title : id, status: dep ? dep.status : 'missing' };
       });
       const unmet = deps.filter((d) => d.status !== 'done' && d.status !== 'cancelled');
-      const mine = (caps.all || []).map((c) => String(c).toLowerCase());
-      const missingCaps = task.requiredCapabilities.filter((c) => !mine.includes(String(c).toLowerCase()));
 
       const leaseEnd = task.claimedAt && task.leaseMs > 0 ? new Date(task.claimedAt).getTime() + task.leaseMs : 0;
       const leaseLeft = leaseEnd ? leaseEnd - now : 0;
@@ -1076,11 +1073,8 @@ window.__ModuleLoader__.load({
         if (busy) return;
         setBusy('claim');
         try {
-          const out = await props.onClaim(task.taskId, {});
-          const warn = Array.isArray(out && out.warnings) && out.warnings.length
-            ? '；' + out.warnings.join('、')
-            : '';
-          toast('已认领' + warn);
+          await props.onClaim(task.taskId, {});
+          toast('已认领');
         } catch (e) {
           if (e.code === 'conflict') toast('认领失败：' + (e.message || '别人先认领了'), 'error');
           else if (e.code === 'blocked') toast('认领失败：依赖没完成（' + ((e.blockedBy || []).join('、') || '未知') + '）', 'error');
@@ -1104,7 +1098,6 @@ window.__ModuleLoader__.load({
                   h(Pill, { tone: task.priority === 'high' ? 'high' : (task.priority === 'low' ? 'low' : undefined) },
                     '优先级 ' + PRIORITY_LABEL[task.priority]),
                   task.tags.map((tag) => h(Pill, { key: 'dt-' + tag }, tag)),
-                  task.requiredCapabilities.map((cap) => h(Pill, { key: 'cap-' + cap, title: '认领需要的能⼒' }, cap)),
                   task.archived ? h(Pill, null, '已归档') : null,
                 ),
               ),
@@ -1141,11 +1134,6 @@ window.__ModuleLoader__.load({
                 className: (dueOver || dueSoon) ? 'cb-errline' : 'cb-hint',
                 style: { marginTop: 8 },
               }, '截止 ' + fmtShort(task.dueAt) + (dueOver ? '（已过期）' : dueSoon ? '（24 小时内）' : ''))
-              : null,
-            missingCaps.length
-              ? h('div', { className: 'cb-warnline', style: { marginTop: 8 } },
-                h(Icon, { name: 'warn', size: 12 }),
-                h('span', null, '你缺少 ' + missingCaps.join(' / ') + '，仍要认领吗？'))
               : null,
             leaseEnd
               ? h('div', { className: leaseWarn ? 'cb-warnline' : 'cb-hint', style: { marginTop: 6 } },
@@ -1425,7 +1413,6 @@ window.__ModuleLoader__.load({
       { id: 'identity', label: '身份' },
       { id: 'display', label: '显示' },
       { id: 'connect', label: '连接' },
-      { id: 'caps', label: '能力标签' },
       { id: 'data', label: '数据' },
       { id: 'danger', label: '高危操作' },
     ];
@@ -1485,16 +1472,40 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /**
+     * 口令输入：**永远不显示已存的值**（宿主已经不回传原文了，页面也不该假装知道）。
+     * 输入后回车 / 失焦提交，提交完清空 —— 屏幕上不留明文。
+     */
+    function SecretDraft(props) {
+      const [draft, setDraft] = useState('');
+      const commit = () => {
+        const v = draft.trim();
+        if (v === '') return;
+        if (typeof props.onCommit === 'function') props.onCommit(v);
+        setDraft('');
+      };
+      return h('input', {
+        className: 'cb-input',
+        type: 'password',
+        value: draft,
+        placeholder: props.placeholder || '输入新口令后回车',
+        maxLength: 64,
+        autoComplete: 'new-password',
+        onChange: (e) => setDraft(e.target.value),
+        onBlur: commit,
+        onKeyDown: (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(); }
+          if (e.key === 'Escape') setDraft('');
+        },
+      });
+    }
+
     function SettingsView(props) {
-      const { settings, saveSetting, caps, detectCaps, toast, dataDir, onClearData } = props;
+      const { settings, saveSetting, toast, dataDir, onClearData } = props;
       const [tab, setTab] = useState('identity');
       const [confirmClear, setConfirmClear] = useState(false);
       const [confirmReset, setConfirmReset] = useState(false);
       const [confirmPurge, setConfirmPurge] = useState(false);
-      const [extraDraft, setExtraDraft] = useState(settings.capabilitiesExtra || '');
-      const [detecting, setDetecting] = useState(false);
-
-      useEffect(() => { setExtraDraft(settings.capabilitiesExtra || ''); }, [settings.capabilitiesExtra]);
 
       const roleSeg = h('div', { className: 'cb-seg' },
         ['solo', 'hub', 'member'].map((r) => h('button', {
@@ -1622,13 +1633,13 @@ window.__ModuleLoader__.load({
             }),
             h(Field, {
               label: 'Hub 口令',
-              desc: '别人加入要输的口令。留空 = 不设口令，同网段谁都能连 —— 家里局域网通常够用。',
-            }, h(DraftInput, {
-              value: settings.hubCode || '',
-              placeholder: '留空不设口令',
-              maxLength: 64,
-              onCommit: (v) => saveSetting('hubCode', v),
-            })),
+              desc: settings.hubCodeSet
+                ? '已设置（口令不回显，宿主的 HTTP 也不回传原文）。输入新口令回车可重设；留空不改。'
+                : '未设置。别人加入要输这个口令；留空 = 不设口令，同网段谁都能连 —— 家里局域网通常够用。',
+              control: settings.hubCodeSet
+                ? h(Btn, { small: true, onClick: () => saveSetting('hubCode', '') }, '清除口令')
+                : null,
+            }, h(SecretDraft, { onCommit: (v) => saveSetting('hubCode', v) })),
             h(Field, {
               label: 'Hub 地址',
               desc: '加入别人 Hub 时用，例如 http://192.168.1.5:48910。也可以直接在「成员」页填。',
@@ -1741,59 +1752,6 @@ window.__ModuleLoader__.load({
                 onCommit: (v) => saveSetting('pendingWatchMs', v),
               }),
             }),
-          ),
-        ),
-        caps: h('div', { className: 'cb-card' },
-          h('div', { className: 'cb-card-h' }, '能力标签'),
-          h('p', { className: 'cb-card-sub' }, '别人认领你的任务前看得到这些标签。内置探测只写标签，不写路径。'),
-          h('div', { style: { marginTop: 6 } },
-            h(Field, {
-              label: '启动时探测',
-              desc: 'DSH 启动时跑一次 ffmpeg / python / soffice / GPU / 浏览器探测。',
-              control: h(Toggle, {
-                on: settings.capabilityDetect,
-                onClick: (v) => saveSetting('capabilityDetect', v),
-              }),
-            }),
-            h(Field, {
-              label: '手动补充',
-              desc: '一行一个标签，例如 gpu、ffmpeg、pptx。',
-            }, h('textarea', {
-              className: 'cb-input cb-textarea',
-              value: extraDraft,
-              placeholder: '一行一个',
-              onChange: (e) => setExtraDraft(e.target.value),
-              onBlur: () => {
-                if (extraDraft !== (settings.capabilitiesExtra || '')) saveSetting('capabilitiesExtra', extraDraft);
-              },
-            })),
-            h(Field, {
-              label: '当前标签',
-              desc: (caps.status === 'done' ? '上次检测 ' + fmtShort(caps.at) : '还没检测过'),
-              control: h(Btn, {
-                small: true,
-                disabled: detecting,
-                onClick: async () => {
-                  setDetecting(true);
-                  try {
-                    await detectCaps();
-                    toast('检测完成');
-                  } catch (e) {
-                    toast('检测失败：' + e.message, 'error');
-                  } finally {
-                    setDetecting(false);
-                  }
-                },
-              }, detecting ? '检测中…' : '重新检测'),
-            }, caps.all && caps.all.length
-              ? h('div', { className: 'cb-chips', style: { paddingTop: 4 } },
-                caps.all.map((c) => h('span', {
-                  key: 'cap-' + c,
-                  className: 'cb-cap',
-                  'data-manual': (caps.manual || []).includes(c) ? '' : undefined,
-                  title: (caps.manual || []).includes(c) ? '手动补充' : '内置探测',
-                }, c)))
-              : h('div', { className: 'cb-hint' }, '还没有标签。点「重新检测」或手动补充。')),
           ),
         ),
         data: h('div', { className: 'cb-card' },
@@ -1923,7 +1881,7 @@ window.__ModuleLoader__.load({
     function MembersView(props) {
       // presence 必须在这儿解构：它是父组件用 useState 管着的在线态，
       // 0.10.13 往 props 里传了却忘了接，点「成员」直接 ReferenceError。
-      const { model, settings, caps, me, toast, onCopy, presence } = props;
+      const { model, settings, me, toast, onCopy, presence } = props;
       /** 宿主回报的 Hub 运行态（`GET /hub`）。跟事件流里那张 `hub` 卡片不是一回事。 */
       const runtime = props.runtime || null;
       const onHubAction = props.onHubAction;
@@ -1937,7 +1895,6 @@ window.__ModuleLoader__.load({
           origin: 'local',
           name: settings.selfName || '本机',
           status: 'idle',
-          capabilities: caps.all || [],
           self: true,
         };
         const liveMap = presence && presence.map ? presence.map : null;
@@ -1973,7 +1930,7 @@ window.__ModuleLoader__.load({
           if (oa !== ob) return oa - ob;
           return a.name.localeCompare(b.name);
         });
-      }, [model.members, settings.selfName, caps.all, presence]);
+      }, [model.members, settings.selfName, presence]);
 
       /** 本地隐藏的成员（只影响这台机器的视图，不改事件流）。 */
       const hiddenSet = new Set(
@@ -2045,11 +2002,6 @@ window.__ModuleLoader__.load({
                 ),
                 h('div', { className: 'cb-member-sub' },
                   m.inferred ? '离线 · 只在消息里见过' : (m.status === 'busy' ? '忙碌' : (isOnline(m.status) ? '在线' : '离线')),
-                  m.capabilities.length
-                    ? h('span', { title: m.capabilities.join(' · ') },
-                      ' · ' + m.capabilities.slice(0, 3).join(' ') +
-                        (m.capabilities.length > 3 ? ' +' + (m.capabilities.length - 3) : ''))
-                    : null,
                 ),
               ),
               m.self
@@ -2200,8 +2152,6 @@ window.__ModuleLoader__.load({
                     : ROLE_LABEL[settings.role]))),
             h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '显示名'),
               h('span', { className: 'cb-kv-v' }, settings.selfName || '本机')),
-            h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '能力标签'),
-              h('span', { className: 'cb-kv-v' }, (caps.all && caps.all.length) ? caps.all.join(' · ') : '—')),
             h('div', { className: 'cb-kv' }, h('span', { className: 'cb-kv-k' }, '事件数'),
               h('span', { className: 'cb-kv-v' }, String(model.total))),
           ),
@@ -2216,7 +2166,6 @@ window.__ModuleLoader__.load({
       const [view, setView] = useState('board');
       const [state, setState] = useState({ loading: true, error: null, events: [], total: 0 });
       const [settings, setSettingsState] = useState(SETTINGS_DEFAULTS);
-      const [caps, setCaps] = useState({ status: 'idle', detected: [], manual: [], all: [] });
       const [dataDir, setDataDir] = useState('');
       const [toasts, setToasts] = useState([]);
       const [selectedId, setSelectedId] = useState('');
@@ -2338,10 +2287,6 @@ window.__ModuleLoader__.load({
             setState({ loading: false, error: e.message, events: [], total: 0 });
           }
           try {
-            const c = await fetchJson('/capabilities');
-            if (alive) setCaps(c);
-          } catch { /* 老宿主没有这个接口，标签留空 */ }
-          try {
             const h = await fetchJson('/hub');
             if (alive && h && h.ok !== false) setHub(h);
           } catch { /* 老宿主没有 /hub，按单机画 */ }
@@ -2410,10 +2355,6 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ patch: { [key]: value } }),
           });
           if (res.settings) setSettingsState(res.settings);
-          // 手动标签改完，当前能力列表要跟着变，不然界面上还是旧标签
-          if (key === 'capabilitiesExtra' || key === 'capabilityDetect') {
-            try { setCaps(await fetchJson('/capabilities')); } catch { /* 老宿主没有 */ }
-          }
         } catch (e) {
           setSettingsState(prev);
           toast('保存失败，已还原：' + e.message, 'error');
@@ -2425,12 +2366,6 @@ window.__ModuleLoader__.load({
         await refreshState();
         return res.event;
       }, [refreshState]);
-
-      const detectCaps = useCallback(async () => {
-        const res = await fetchJson('/capabilities/detect', { method: 'POST', body: '{}' });
-        setCaps(res);
-        return res;
-      }, []);
 
       /**
        * 认领。**不用 fetchJson** —— 它会把 `error` 字段当消息吞掉，
@@ -2603,7 +2538,6 @@ window.__ModuleLoader__.load({
               task: selectedTask,
               model,
               settings,
-              caps,
               me,
               toast,
               hub,
@@ -2673,7 +2607,23 @@ window.__ModuleLoader__.load({
                       h(Btn, { small: true, onClick: refreshState }, '重试')),
                   )
                   : null,
-                // 系统写入熔断：成功才收红条，失败保留（§32）
+                /**
+                 * 版本不一致：**必须给一个一键动作**。
+                 * 原来只有标题旁标黄 + tooltip —— 知道不一致，却还得自己想「那我该干嘛」。
+                 */
+                verDrift
+                  ? h('div', { className: 'cb-banner', 'data-tone': 'error' },
+                    h(Icon, { name: 'warn', size: 12 }),
+                    h('div', { className: 'cb-banner-text' },
+                      `版本不一致：页面 bundle 是 ${VERSION}，宿主进程加载的是 ${hostVer.version}。`
+                      + '先点右边重新加载；还不对就是宿主没重启（文件换了、进程没换）。'),
+                    h('div', { className: 'cb-banner-actions' },
+                      h(Btn, {
+                        small: true,
+                        onClick: () => { try { window.location.reload(); } catch { /* 老环境 */ } },
+                      }, '重新加载页面')),
+                  )
+                  : null,
                 hub && hub.systemBroken
                   ? h('div', { className: 'cb-banner', 'data-tone': 'error' },
                     h(Icon, { name: 'warn', size: 12 }),
@@ -2700,8 +2650,6 @@ window.__ModuleLoader__.load({
                   ? h(SettingsView, {
                     settings,
                     saveSetting,
-                    caps,
-                    detectCaps,
                     toast,
                     dataDir,
                     onClearData: clearData,
@@ -2711,7 +2659,6 @@ window.__ModuleLoader__.load({
                   ? h(MembersView, {
                     model,
                     settings,
-                    caps,
                     me,
                     toast,
                     presence,

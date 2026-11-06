@@ -126,6 +126,20 @@ export function createDelivery({
       // 正常消息并进「自动续跑」项时以消息为准：续跑是自己的空转，消息才是人要说的话。
       if (item.kind !== 'self') same.kind = '';
       same.at = Date.now();
+      /**
+       * 结构化 payload 跟着合并：
+       *   - cardIds 取并集（这一波涉及几张卡）
+       *   - coalescedCount 累加（文本里会说「合并了 N 条」）
+       *   - reason 以「点名」为准：@ 我的消息比卡上普通评论更值得写清楚
+       */
+      const cards = Array.isArray(item.cardIds) ? item.cardIds.filter((x) => typeof x === 'string') : [];
+      if (cards.length) same.cardIds = [...new Set([...(Array.isArray(same.cardIds) ? same.cardIds : []), ...cards])];
+      same.coalescedCount = Math.max(1, Number(same.coalescedCount) || 1)
+        + Math.max(1, Number(item.coalescedCount) || 1);
+      if (item.directed === true) same.directed = true;
+      if (item.directed === true && typeof item.reason === 'string' && item.reason !== '') {
+        same.reason = item.reason;
+      }
       // 只往晚里推，不往早里拉：合并不能让一条还得重试的项插队
       if (notBefore > 0 && (Number(same.nextAt) || 0) < notBefore) same.nextAt = notBefore;
       persist();
@@ -138,6 +152,10 @@ export function createDelivery({
       taskId,
       from: typeof item.from === 'string' ? item.from : '',
       text: typeof item.text === 'string' ? item.text : '',
+      reason: typeof item.reason === 'string' ? item.reason : '',
+      cardIds: Array.isArray(item.cardIds) ? item.cardIds.filter((x) => typeof x === 'string') : [],
+      coalescedCount: Math.max(1, Number(item.coalescedCount) || 1),
+      directed: item.directed === true,
       /**
        * 唤醒由什么触发：
        *   - 缺省 / '' 别人发来的消息
@@ -242,14 +260,50 @@ export function createDelivery({
       .finally(() => { pumping = false; });
   }
 
+  /**
+   * 清掉某张卡上还没投的唤醒。
+   *
+   * 什么时候用：
+   *   - 我刚认领了这张卡 —— 之前排给「等 owner 决定」的唤醒没意义了
+   *   - 这张卡被别人认领 / 转让了 —— 参与集只含当前 owner，叫我不对
+   *
+   * `relayOnly` = 只清「卡上普通评论」的排队项，**不清点名发给我的**。
+   * 被 @ 一次就该收到一次，不因为卡换了主人而丢。
+   *
+   * @returns {number} 清掉几条
+   */
+  function dropTask(taskId, { relayOnly = false } = {}) {
+    const id = typeof taskId === 'string' ? taskId : '';
+    if (!id) return 0;
+    const before = state.items.length;
+    state.items = state.items.filter((it) => {
+      if (it.taskId !== id) return true;
+      if (relayOnly && it.directed === true) return true;
+      return false;
+    });
+    const n = before - state.items.length;
+    if (n > 0) persist();
+    return n;
+  }
+
   function snapshot() {
+    const head = state.items[0];
     return {
       queued: state.items.length,
       attempts: state.items.reduce((m, it) => Math.max(m, it.attempts), 0),
       lastAt,
       lastError,
-      pending: state.items[0]?.eventId ?? '',
+      pending: head?.eventId ?? '',
       delivered: state.done.length,
+      /** 队头那条的结构化 payload（排障用：为什么叫、涉及哪几张卡、合并了几条）。 */
+      payload: head
+        ? {
+          reason: head.reason || '',
+          cardIds: Array.isArray(head.cardIds) ? head.cardIds : [],
+          coalescedCount: Number(head.coalescedCount) || 1,
+          directed: head.directed === true,
+        }
+        : null,
     };
   }
 
@@ -260,5 +314,9 @@ export function createDelivery({
 
   load();
 
-  return { offer, kick, snapshot, close, hasPending: () => state.items.length > 0, state: () => state };
+  return {
+    offer, kick, snapshot, close, dropTask,
+    hasPending: () => state.items.length > 0,
+    state: () => state,
+  };
 }

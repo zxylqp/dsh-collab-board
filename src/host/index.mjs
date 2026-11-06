@@ -27,7 +27,6 @@ import {
   claimableOnly,
   claimableTasks,
   latestTasks,
-  missingCapabilities,
   ownerTransitionError,
 } from './selectable.mjs';
 
@@ -73,11 +72,11 @@ function localIso(date = new Date()) {
  * 面板侧历史上把它叫 `jsonReply`，这里就保留这个别名，省得改 50 多处调用。
  */
 import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
-import { createSettings } from './settings.mjs';
-import { createCapabilities } from './capabilities.mjs';
+import { createSettings, hashCode, isHashedCode, publicSettings } from './settings.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
-import { shouldWake, maxSeenOf, newerSeen, WAKE_SKIP } from './wake.mjs';
+import { shouldWake, maxSeenOf, newerSeen, directedAway, WAKE_SKIP } from './wake.mjs';
+import { validateEvent } from './events.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -96,15 +95,13 @@ export function apply(ctx, rawConfig = {}) {
 
   const SETTINGS_FILE = join(dataDir, 'settings.json');
   // 设置项定义、校验、读写都在 settings.mjs；这里只拿到需要的那几个。
+  // 口令哈希的盐用本组 groupId：两台机器算出同一个哈希，重启后也能互认。
   const {
-    SETTINGS_SPEC, getSettings, patchSettings,
-  } = createSettings({ file: SETTINGS_FILE, maxEventsDefault: maxEvents });
-
-  /* ───────────────────── 能力自检（§6.8） ───────────────────── */
-
-  // 探测表、chrome 路径、手填标签的合并全在 capabilities.mjs。
-  const { detectCapabilities, capabilityPayload } = createCapabilities({
-    dataDir, getSettings, localIso,
+    SETTINGS_SPEC, getSettings, patchSettings, migrateHubCode,
+  } = createSettings({
+    file: SETTINGS_FILE,
+    maxEventsDefault: maxEvents,
+    saltOf: () => identity.groupId,
   });
 
   /* ───────────────────── 本地事件库 ───────────────────── */
@@ -131,6 +128,17 @@ export function apply(ctx, rawConfig = {}) {
    * 本地 hub 事件 → 新生成）。groupId 换了等于换了个组，界面上看不出来，只会「又连不上」。
    */
   const identity = loadIdentity({ dir: dataDir, logPath: LOG, readLog: () => readEvents() });
+
+  /**
+   * 口令迁移：升级前落的是明文，这里一次性换成 `v1$<sha256(groupId + code)>`。
+   * 必须等 identity 建好（盐是 groupId）；换过之后旧版就读不懂这个字段了，
+   * 所以升级顺序是「先升 Hub，再升成员」—— Hub 端两种格式都能校验，反过来不行。
+   */
+  try {
+    if (migrateHubCode()) {
+      ctx.logger?.info?.('[collab] 口令已从明文迁移为哈希（重启 Hub 后生效）');
+    }
+  } catch { /* 迁移失败不该让插件起不来；下次启动再试 */ }
 
   /** Hub 运行态。`role` 跟着 settings 走，但真正起没起看 server/client。 */
   const hubRuntime = { role: 'solo', server: null, client: null, error: '', startedAt: '' };
@@ -190,14 +198,22 @@ export function apply(ctx, rawConfig = {}) {
 
   /** 唤醒文本。重试时把「第几次」写进消息头，否则 agent 会当成一条新消息。 */
   function wakeText(meta, attempt = 1, deferred = false) {
-    const where = meta.taskId ? `任务 ${meta.taskId}` : '全局';
+    const cards = Array.isArray(meta.cardIds) && meta.cardIds.length
+      ? meta.cardIds.filter(Boolean)
+      : (meta.taskId ? [meta.taskId] : []);
+    const where = cards.length ? `任务 ${cards.join('、')}` : '全局';
+    const count = Math.max(1, Number(meta.coalescedCount) || 1);
+    const merged = count > 1 ? `（这一波合并了 ${count} 条，读一次增量就够）` : '';
+    const why = meta.reason === 'mention'
+      ? '，并且点名 @ 了你'
+      : (meta.reason === 'card' ? '，在你这张卡上' : '');
     const retry = attempt > 1
       ? `（第 ${attempt} 次投递：前面 ${attempt - 1} 次没送到，可能是对端会话忙或宿主重启）`
       : '';
     const late = deferred
       ? '（补叫：你上次被叫醒后还没到冷却时间，这条现在才送到）'
       : '';
-    return `【协作看板自动触发${retry}${late}】${meta.from || '对方'} 在${where}发了新消息。`
+    return `【协作看板自动触发${retry}${late}】${meta.from || '对方'} 在${where}发了新消息${why}${merged}。`
       + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
       + '回完就停，不要连续追问。';
   }
@@ -208,8 +224,8 @@ export function apply(ctx, rawConfig = {}) {
 
     const fresh = (Array.isArray(events) ? events : []).filter(
       (ev) => ev && ev.kind === 'msg' && typeof ev.origin === 'string' && ev.origin !== identity.origin
-        // 定向消息：`to` 不是我，就别叫 —— 依赖解锁的 msg 会走这条路
-        && !(typeof ev.to === 'string' && ev.to !== '' && ev.to !== identity.origin),
+        // 定向消息：`to` 不是我（单个或数组），就别叫 —— 依赖解锁 / @ 别人的消息走这条路
+        && !directedAway(ev, identity.origin),
     );
     if (fresh.length === 0) return;
 
@@ -222,7 +238,21 @@ export function apply(ctx, rawConfig = {}) {
       const key = taskId || 'global';
       const last = wakeState.lastAt.get(key) || 0;
       const wait = Math.max(0, cooldown - (now - last));
-      const meta = { taskId, from: ev.from || ev.name || '' };
+      /**
+       * 唤醒 payload 结构化（和纯文本一起走）：
+       *   - reason          为什么叫（mention / card / global）
+       *   - cardIds         这一波涉及哪几张卡
+       *   - coalescedCount  合并了几条（账本合并时累加）
+       *   - directed        是不是点名发给我的（转让清账时不误删）
+       */
+      const meta = {
+        taskId,
+        from: ev.from || ev.name || '',
+        reason: ev.to ? 'mention' : (taskId ? 'card' : 'global'),
+        cardIds: taskId ? [taskId] : [],
+        coalescedCount: 1,
+        directed: Boolean(ev.to),
+      };
 
       /**
        * 冷却期里**不再直接丢**。
@@ -236,8 +266,7 @@ export function apply(ctx, rawConfig = {}) {
       if (deferFor > 0) {
         delivery.offer({
           eventId: ev.id,
-          taskId,
-          from: meta.from,
+          ...meta,
           text: wakeText(meta, 1, true),
           // 必须显式传：delivery 的 send 会拿 item.deferred 重新生成唤醒文本，
           // 少了这行账本里就是 false，真正投出去时不带「补叫」标记。
@@ -252,8 +281,7 @@ export function apply(ctx, rawConfig = {}) {
       wakeState.lastAt.set(key, now);
       delivery.offer({
         eventId: ev.id,
-        taskId,
-        from: meta.from,
+        ...meta,
         text: wakeText(meta, 1, false),
       });
     }
@@ -441,7 +469,8 @@ export function apply(ctx, rawConfig = {}) {
     }
     if (hit === 0) return 0;
     try {
-      writeFileSync(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '', 'utf8');
+      // 擦正文也是全量重写：同样必须原子写，半截文件等于整份事件流没了
+      writeAtomic(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '');
       invalidate();
     } catch { /* 写不动就先放着，下次再收到会重试 */ }
     return hit;
@@ -476,7 +505,21 @@ export function apply(ctx, rawConfig = {}) {
     if (synced.length) markSynced(synced);
     // 收到的墓碑：正文在本机也擦掉，别让日志里还留着原文
     for (const t of freshly) {
-      if (t.kind === 'task' && t.deleted === true) scrubLocalTaskBody(String(t.taskId || ''));
+      if (t.kind === 'task' && t.deleted === true) {
+        scrubLocalTaskBody(String(t.taskId || ''));
+        delivery.dropTask(String(t.taskId || ''));
+        continue;
+      }
+      /**
+       * 卡换主人 / 已经结束：账上「等当前 owner 决定」的唤醒作废。
+       * 参与集只含 owner —— 别人认领了这张卡，再叫我就是叫错人。
+       * 点名发给我的不在此列（`relayOnly`），@ 一次就该收到一次。
+       */
+      if (t.kind === 'task' && t.taskId
+        && ((t.status === 'running' && t.owner && t.owner !== identity.origin)
+          || t.status === 'done' || t.status === 'cancelled')) {
+        delivery.dropTask(String(t.taskId), { relayOnly: true });
+      }
     }
     invalidate();
     if (freshly.length === 0) return;
@@ -558,8 +601,7 @@ export function apply(ctx, rawConfig = {}) {
       baseUrl,
       origin: identity.origin,
       name: displayName(),
-      capabilities: capabilityPayload().all,
-      code: code || '',
+            code: code || '',
       // 本机见过的最大 seq：重连只拉增量，不从 0 回放历史。
       // 同样要和 sidecar 取大 —— 只用日志的话，日志裁过就会把已经同步过的历史再拉一遍。
       startSince: newerSeen(maxSeenOf(readEvents()), store.maxSynced()).seq,
@@ -591,12 +633,11 @@ export function apply(ctx, rawConfig = {}) {
       // 连上之后由**本机**写一条 member 事件：§6.10.4 禁止系统 origin 写 member
       onJoined: () => {
         const name = displayName();
-        const caps = capabilityPayload().all;
         const already = readEvents().some(
           (e) => e && e.kind === 'member' && e.origin === identity.origin && e.action === 'join' && e.name === name,
         );
         if (already) return;
-        const ev = buildEvent({ kind: 'member', action: 'join', name, capabilities: caps });
+        const ev = buildEvent({ kind: 'member', action: 'join', name });
         if (ev) appendEvent(ev);
       },
     });
@@ -606,6 +647,24 @@ export function apply(ctx, rawConfig = {}) {
     return client;
   }
 
+  /**
+   * 口令统一成「落盘格式」再往外发：`v1$<sha256(groupId + code)>`。
+   *
+   * 面板/工具给的可能是明文（人刚输的），设置里存的已经是哈希（重启后没法还原明文）。
+   * 两条路径都归到这里，免得 start 收明文、member 收哈希，比对时一边对不上。
+   */
+  function resolveHubCode(input, saltGroupId = identity.groupId) {
+    const raw = typeof input === 'string' ? input.trim() : '';
+    if (raw === '') return '';
+    if (isHashedCode(raw)) return raw;
+    const hashed = hashCode(raw, saltGroupId);
+    // 本组的口令才落盘；跨组加入只在本轮内存里用另一个组的盐，别污染自己的设置
+    if (saltGroupId === identity.groupId) {
+      try { patchSettings({ hubCode: raw }); } catch { /* 存不下也先让它能连 */ }
+    }
+    return hashed;
+  }
+
   /** 「我来当 Hub」。 */
   async function startHubRuntime(opts = {}) {
     if (hubRuntime.server) {
@@ -613,7 +672,10 @@ export function apply(ctx, rawConfig = {}) {
     }
     const s = getSettings();
     const port = Number.isFinite(Number(opts.port)) ? Number(opts.port) : Number(s.hubPort) || 48910;
-    const code = typeof opts.code === 'string' ? opts.code : (s.hubCode || '');
+    // 传了明文就按本组盐换成哈希（并落盘），否则用设置里已有的那份
+    const code = typeof opts.code === 'string'
+      ? resolveHubCode(opts.code)
+      : (s.hubCode || '');
     // P0-3b：拿上次连过的地址先探一下，别让同一个组起出两个 Hub
     const probeUrl = typeof opts.probeUrl === 'string' ? opts.probeUrl : (s.hubAddress || '');
     /**
@@ -681,7 +743,22 @@ export function apply(ctx, rawConfig = {}) {
       // 不同组：加入就是加入别人的组，这个动作得显式做，不能悄悄改
       hubLog('warn', `目标 Hub 的 groupId(${info.groupId.slice(0, 6)}) 和本机(${identity.groupId.slice(0, 6)}) 不同`);
     }
-    attachClient(url, code || '');
+    /**
+     * 口令：面板传明文，设置里存哈希，加别人的 Hub 时还得按**对方组的盐**算。
+     * 本组的就顺手落盘（下次重启自己连得上），跨组的只用这一轮，不覆盖本机口令。
+     */
+    const s = getSettings();
+    const raw = typeof code === 'string' ? code.trim() : '';
+    let resolved = s.hubCode || '';
+    if (raw !== '') {
+      resolved = isHashedCode(raw)
+        ? raw
+        : resolveHubCode(raw, info.groupId || identity.groupId);
+    }
+    if (raw !== '' && info.groupId && info.groupId !== identity.groupId) {
+      hubLog('warn', '跨组加入：口令只在这次连接里用，本机设置里的口令没改；重启后要重新输入');
+    }
+    attachClient(url, resolved);
     hubRuntime.role = 'member';
     return { address: url, epoch: info.epoch, groupId: info.groupId, needCode: info.needCode };
   }
@@ -726,7 +803,14 @@ export function apply(ctx, rawConfig = {}) {
    */
   async function claimTask(taskId, opts = {}) {
     if (!hubRuntime.client) throw new Error('还没连上 Hub，认领要 Hub 的串行通道');
-    return hubRuntime.client.claim(taskId, opts);
+    const out = await hubRuntime.client.claim(taskId, opts);
+    /**
+     * 认领成功 = 这张卡归我了：账上「等 owner 决定的卡上评论」可以清掉了
+     * （点名发给我的不在此列，见 delivery.dropTask 的 relayOnly）。
+     * 放在认领返回之后做，是因为 claimChain 里不能有 await —— 这里是宿主侧，不影响 Hub 的 CAS。
+     */
+    try { delivery.dropTask(String(taskId), { relayOnly: true }); } catch { /* 清账失败不影响认领结果 */ }
+    return out;
   }
 
   /* ───────────────────── 面板数据 ───────────────────── */
@@ -776,15 +860,23 @@ export function apply(ctx, rawConfig = {}) {
     const verdicts = new Map(
       claimableTasks(all, {
         selfOrigin: identity.origin,
-        capabilities: capabilityPayload().all,
-        includeArchived: true,
+                includeArchived: true,
       }).map((row) => [row.task.taskId, row]),
     );
 
     const mine = [];
     const pending = [];
+    /** origin → 显示名（从 member 事件重建，不额外落盘）。 */
+    const names = new Map();
+    for (const ev of all) {
+      if (ev && ev.kind === 'member' && typeof ev.name === 'string' && ev.name && typeof ev.target === 'string') {
+        names.set(ev.target, ev.name);
+      }
+    }
+    const watching = [];
+    const others = [];
     for (const t of tasks.values()) {
-      if (t.archived) continue;
+      if (t.archived || t.deleted === true) continue;
       const brief = {
         taskId: t.taskId,
         title: t.title,
@@ -792,8 +884,16 @@ export function apply(ctx, rawConfig = {}) {
         priority: t.priority || 'normal',
         ...(t.dueAt ? { dueAt: t.dueAt } : {}),
       };
+      /**
+       * 参与集只含 owner —— 所以「我在看的卡」= owner 是我的卡。
+       * creator 不算：建 20 张卡的人不该被 20 张卡的评论各叫一次。
+       */
       if (t.owner === identity.origin) {
+        watching.push({ ...brief, owner: t.owner, ownerName: names.get(t.owner) || displayName() });
         if (t.status === 'running' || t.status === 'blocked') mine.push(brief);
+      } else if (t.owner && t.status === 'running') {
+        // 别人在跑的卡：带上 owner，agent 才知道该找谁，而不是以为「没人接」
+        others.push({ ...brief, owner: t.owner, ownerName: names.get(t.owner) || '' });
       } else if (t.status === 'pending' && !t.owner) {
         // 待认领池：把它「为什么还不能接」一起给出去。
         // 只有 taskId 和标题的话，agent 会以为每张 pending 它都能接。
@@ -802,9 +902,6 @@ export function apply(ctx, rawConfig = {}) {
           ...brief,
           claimable: Boolean(v && v.ok),
           ...(v && !v.ok && v.reason ? { blockedBy: v.reason } : {}),
-          ...(missingCapabilities(t, capabilityPayload().all).length
-            ? { missingCapabilities: missingCapabilities(t, capabilityPayload().all) }
-            : {}),
         });
       }
     }
@@ -849,6 +946,10 @@ export function apply(ctx, rawConfig = {}) {
       me: { origin: identity.origin, name: displayName() },
       cursor: { from, to: maxSeq, unreadTotal: unread.length },
       mine,
+      /** 参与集（我是 owner 的卡），含 done / cancelled —— 交接和验收要看。 */
+      watching: watching.slice(0, 50),
+      /** 别人正在跑的卡 + owner：知道该等谁、找谁，别以为没人接。 */
+      others: others.slice(0, 50),
       pending,
       unread: shown,
       ...(unread.length > shown.length ? { truncated: unread.length - shown.length } : {}),
@@ -912,6 +1013,8 @@ export function apply(ctx, rawConfig = {}) {
                 lastError: wake.lastError || '',
                 queued: wake.queued,
                 attempts: wake.attempts,
+                /** 队头那条的结构化理由（reason / cardIds / coalescedCount）。 */
+                payload: wake.payload || null,
               },
               dataDir,
             });
@@ -1019,7 +1122,11 @@ export function apply(ctx, rawConfig = {}) {
             if (req.method === 'GET') {
               return jsonReply(res, 200, {
                 ok: true,
-                settings: getSettings(),
+                /**
+                 * **不回传口令**：以前这里把 `getSettings()` 整份吐出来，含 hubCode 原文。
+                 * 现在只给 `hubCodeSet`（已设置 / 未设置），面板据此画「重设」。
+                 */
+                settings: publicSettings(getSettings()),
                 spec: SETTINGS_SPEC,
                 dataDir,
               });
@@ -1031,34 +1138,14 @@ export function apply(ctx, rawConfig = {}) {
               const body = await readBody(req);
               const patch = body && typeof body === 'object' && body.patch ? body.patch : body;
               const out = patchSettings(patch);
-              // 刚把「启动时探测」打开，就顺手探一次 —— 不然要等下次重启才有标签
-              if (patch && patch.capabilityDetect === true) {
-                detectCapabilities().catch(() => { /* 失败就是没标签 */ });
-              }
-              return jsonReply(res, 200, { ok: true, ...out, dataDir });
+              return jsonReply(res, 200, {
+                ok: true,
+                settings: publicSettings(out.settings),
+                ignored: out.ignored,
+                dataDir,
+              });
             } catch (err) {
               return jsonReply(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
-            }
-          },
-        },
-        {
-          kind: 'exact',
-          path: `${PANEL_BASE}/capabilities`,
-          handler: async (req, res) => {
-            if (req.method !== 'GET') return jsonReply(res, 405, { ok: false, error: 'method' });
-            return jsonReply(res, 200, capabilityPayload());
-          },
-        },
-        {
-          kind: 'exact',
-          path: `${PANEL_BASE}/capabilities/detect`,
-          handler: async (req, res) => {
-            if (req.method !== 'POST') return jsonReply(res, 405, { ok: false, error: 'method' });
-            try {
-              await detectCapabilities();
-              return jsonReply(res, 200, capabilityPayload());
-            } catch (err) {
-              return jsonReply(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
             }
           },
         },
@@ -1071,7 +1158,8 @@ export function apply(ctx, rawConfig = {}) {
               // **保留 member 事件**：成员是谁不该因为「清空聊天记录」一起没了。
               // 清掉的是任务、对话、进度这些内容；成员名单留着。
               const kept = readEvents().filter((e) => e && e.kind === 'member');
-              writeFileSync(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '', 'utf8');
+              // 清空 = 全量重写：原子写，别让断电留下半截日志
+              writeAtomic(LOG, kept.length ? kept.map((e) => JSON.stringify(e)).join('\n') + '\n' : '');
               invalidate();
               return jsonReply(res, 200, { ok: true, keptMembers: kept.length });
             } catch (err) {
@@ -1304,6 +1392,8 @@ export function apply(ctx, rawConfig = {}) {
           'kind=msg 是人和人的话（from 填发言者名字）；' +
           'kind=task 是任务卡（taskId 相同的后写覆盖前写）；progress 是进度；' +
           'artifact 是产出物；note 是系统提示（卡在哪、为什么等）。' +
+          'msg 的 mentions 指名谁就定向叫谁；卡上的普通消息只投给当前 owner（creator 不自动参与）。' +
+          '**progress 会续租约、note 不会** —— 还在干就写一条 progress。' +
           '规矩：**先写日志再干活**，别干完才补记。',
         parameters: {
           type: 'object',
@@ -1385,11 +1475,8 @@ export function apply(ctx, rawConfig = {}) {
               type: 'integer',
               description: '租约毫秒：省略 = 默认 10 分钟；0 = 这条任务不开租约。超过 24 小时会被拒',
             },
-            capabilities: {
-              type: 'array',
-              items: { type: 'string' },
-              description: '本次自报的能力标签，只用来算「缺 xx」警告，不改变广播出去的能力画像',
-            },
+            reason: { type: 'string', description: '可省：为什么接这张卡（写进 running 事件，给人看）' },
+            plan: { type: 'string', description: '可省：打算怎么做（写进 running 事件，给下一轮读看板的自己看）' },
           },
           required: ['taskId'],
         },
@@ -1407,13 +1494,13 @@ export function apply(ctx, rawConfig = {}) {
           try {
             const out = await claimTask(taskId, {
               leaseMs: args?.leaseMs,
-              capabilities: args?.capabilities,
+              reason: args?.reason,
+              plan: args?.plan,
             });
             const lease = Number(out?.leaseMs) > 0 ? `${Math.round(Number(out.leaseMs) / 60000)} 分钟` : '不开租约';
-            const warn = Array.isArray(out?.warnings) && out.warnings.length ? `；注意：${out.warnings.join('、')}` : '';
             return {
               ok: true,
-              text: `认领成功：${taskId}（epoch ${out?.epoch}，seq ${out?.seq}，租约 ${lease}）${warn}`,
+              text: `认领成功：${taskId}（epoch ${out?.epoch}，seq ${out?.seq}，租约 ${lease}）`,
             };
           } catch (e) {
             const code = e?.code || 'internal';
@@ -1632,14 +1719,65 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
-   * 本地事件写入。v2 的可选字段（priority / tags / dueAt / dependsOn /
-   * requiredCapabilities / archived / derivedFrom）在这里**原样接住**，
+   * 把 `mentions`（名字或 origin）解析成 origin 列表。
+   *
+   * 只有**本机见过的成员**才解析得出来：成员名挂在 `member` 事件的 `name` 上，
+   * `target` 是那个人的 origin。解析不出来就原样留在 `mentions` 里（看板还能显示 @ 了谁），
+   * 但不猜、不乱投 —— 猜错等于把话投给无关的人、还烧他一轮 token。
+   */
+  function resolveMentions(list) {
+    const nameMap = new Map();
+    for (const ev of readEvents()) {
+      if (!ev || ev.kind !== 'member') continue;
+      const name = typeof ev.name === 'string' ? ev.name.trim() : '';
+      const target = typeof ev.target === 'string' ? ev.target.trim() : '';
+      if (name && /^[0-9a-f]{16}$/.test(target)) nameMap.set(name, target);
+    }
+    const out = [];
+    for (const raw of Array.isArray(list) ? list : []) {
+      const token = String(raw || '').trim().replace(/^@/, '');
+      if (token === '') continue;
+      const origin = /^[0-9a-f]{16}$/.test(token) ? token : (nameMap.get(token) || '');
+      // 不投给自己：@ 自己不会叫醒任何东西，只会让账本多一条空转
+      if (!origin || origin === identity.origin) continue;
+      if (!out.includes(origin)) out.push(origin);
+    }
+    return out;
+  }
+
+  /**
+   * 本地事件写入（唯一入口）。v2 的可选字段在这里**原样接住**，
    * 不然面板画得出来、数据却没处落。
    *
    * `claimedAt` / `leaseMs` 故意**不接**：§6.3 规定只有 Hub 的 claim 内部路径能写，
    * 成员自己写就能伪造「我刚认领」。
    */
   function buildEvent(input) {
+    const ev = buildEventRaw(input);
+    if (!ev) return undefined;
+    /**
+     * 本地也校验（0.10.16 的缺口）：以前只在 Hub 端调 `validateEvent`，
+     * 脏事件先落盘、推上去被 400 整批拒、从此堵在待同步队列 —— 0.10.14 踩过。
+     * 现在写日志之前就挡掉，坏事件根本进不了本地日志。
+     */
+    const r = validateEvent(ev, { localWrite: true });
+    if (!r.ok) {
+      const e = new Error(`事件不合法：${r.error.message}`);
+      e.code = r.error.code || 'bad-param';
+      throw e;
+    }
+    /**
+     * 只借它做**判定**，不拿它做归一化。
+     *
+     * `validateEvent` 会给缺省字段补值（`owner: ''` / `deleted: false`…），
+     * 而 `owner` 一旦出现在事件里就表示「显式设置」—— 改个标题会被 Hub 当成
+     * 「释放这张卡」。本地写的就是本地写的，缺省语义交给 Hub 端补。
+     */
+    return ev;
+  }
+
+  /** 老名字：造事件本体（补信封之前）。只有 buildEvent 该调它。 */
+  function buildEventRaw(input) {
     const kind = typeof input?.kind === 'string' ? input.kind : '';
     const base = { ts: localIso(), kind };
     const task = isText(input?.task) ? input.task.trim() : undefined;
@@ -1656,6 +1794,26 @@ export function apply(ctx, rawConfig = {}) {
         if (isText(input.replyTo)) ev.replyTo = input.replyTo.trim();
         const mentions = textList(input.mentions, 16, 64);
         if (mentions.length) ev.mentions = mentions;
+        /**
+         * 定向投递（`to`）的三级来源，**顺序不能反**：
+         *   1. 调用方显式给的 `to`（依赖解锁等系统消息就是这么发的）
+         *   2. `mentions` 解析出来的 origin —— 真 @ 谁就只叫谁
+         *   3. 卡上**当前 owner** —— 参与集只含 owner，creator 不算
+         *
+         * 都没有就不写 `to`（广播显示，不额外点名）。`done` 卡上的 @ 照样投一次：
+         * 这里不看 status，完成后的追问/补验收不能断。
+         */
+        if (isText(input.to)) {
+          ev.to = input.to.trim();
+        } else if (mentions.length) {
+          const targets = resolveMentions(mentions);
+          if (targets.length === 1) ev.to = targets[0];
+          else if (targets.length > 1) ev.to = targets;
+        } else if (ev.taskId) {
+          const owner = latestTasks(readEvents()).get(ev.taskId)?.owner || '';
+          // 自己的卡不用「叫自己」；待认领的卡没有 owner，保持广播让看板可见
+          if (owner && owner !== identity.origin) ev.to = owner;
+        }
         return ev;
       }
       case 'task': {
@@ -1706,14 +1864,27 @@ export function apply(ctx, rawConfig = {}) {
         if (typeof input.archived === 'boolean') ev.archived = input.archived;
         return ev;
       }
-      case 'progress':
+      case 'progress': {
+        /**
+         * 进度必须挂在具体任务上：`validateEvent('progress')` 只认 `taskId`。
+         * 老调用方写的是 `task`（和 taskId 同义），这里统一补齐；
+         * 两者都没有 = 这不是一条进度，直接不写，别落一条校验不过的脏事件。
+         */
+        const taskId = isText(input.taskId)
+          ? input.taskId.trim()
+          : (task ?? (typeof input.id === 'string' ? input.id.trim() : ''));
+        if (!taskId) return undefined;
+        const done = Math.max(0, Math.trunc(Number(input.done) || 0));
+        const total = Math.max(done, Math.trunc(Number(input.total) || 0));
         return {
           ...base,
-          task: task ?? (typeof input.id === 'string' ? input.id : ''),
-          done: Number.isFinite(Number(input.done)) ? Number(input.done) : 0,
-          total: Number.isFinite(Number(input.total)) ? Number(input.total) : 0,
+          taskId,
+          task: taskId,
+          done,
+          total,
           note: typeof input.note === 'string' ? input.note : '',
         };
+      }
       case 'artifact': {
         const ev = {
           ...base,
@@ -1743,7 +1914,6 @@ export function apply(ctx, rawConfig = {}) {
           action: ['join', 'leave', 'rename', 'update'].includes(input.action) ? input.action : 'update',
           target: isText(input.target) ? input.target.trim() : identity.origin,
           name: isText(input.name) ? input.name.trim().slice(0, 64) : displayName(),
-          capabilities: textList(input.capabilities, 64, 32),
           status: input.status === 'busy' ? 'busy' : 'idle',
         };
       default:
@@ -1795,7 +1965,6 @@ export function apply(ctx, rawConfig = {}) {
    *   - `pending`、没有 owner、没归档
    *   - **不是自己建的**（自己建的活该派给别人）
    *   - 依赖全部 `done` / `cancelled`
-   *   - 任务要求的每个能力标签我都有
    *
    * 认失败的（conflict / blocked）也记进 `autoTried`，别每轮重试同一张卡刷日志。
    */
@@ -1805,8 +1974,7 @@ export function apply(ctx, rawConfig = {}) {
     // 判据只有一份，在 selectable.mjs。这里只加「这轮已经试过就别再试」。
     const list = claimableOnly(events, {
       selfOrigin: identity.origin,
-      capabilities: capabilityPayload().all,
-    });
+          });
     return list.filter((task) => !autoTried.has(task.taskId));
   }
 
@@ -1897,8 +2065,7 @@ export function apply(ctx, rawConfig = {}) {
         // 于是同一张卡「认领不接、提醒却喊」，两个信号互相打脸。
         const rows = claimableTasks(readEvents(), {
           selfOrigin: identity.origin,
-          capabilities: capabilityPayload().all,
-        });
+                  });
         for (const { task, ok } of rows) {
           if (!ok) continue;
           if (wakeNotified.get(task.taskId) === task.status) continue;
@@ -2057,17 +2224,6 @@ export function apply(ctx, rawConfig = {}) {
       hubRuntime.client = null;
       hubRuntime.server = null;
     };
-  });
-
-  /* ───────────────────── 启动能力自检 ───────────────────── */
-
-  ctx.effect(() => {
-    if (!getSettings().capabilityDetect) return;
-    const timer = setTimeout(() => {
-      detectCapabilities().catch(() => { /* 探测失败 = 没有标签，不吵 */ });
-    }, 400);
-    if (typeof timer.unref === 'function') timer.unref();
-    return () => clearTimeout(timer);
   });
 
   ctx.logger?.info?.(`协作看板已就绪：${LOG}`);

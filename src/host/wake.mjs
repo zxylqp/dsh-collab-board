@@ -31,6 +31,19 @@ export const WAKE_SKIP = {
 };
 
 /**
+ * 这条定向消息是不是**发给别人**的（`to` 可以是一个 origin 或数组）。
+ *
+ * 两处（wake.mjs 的判据、宿主 `considerWake` 的筛选）必须调同一个函数：
+ * 只改一处会分叉成「收得到但不叫醒」，这种毛病在看板上看不出来。
+ */
+export function directedAway(ev, selfOrigin) {
+  const to = ev?.to;
+  if (to === undefined || to === null || to === '') return false;
+  const list = Array.isArray(to) ? to : [to];
+  return !list.includes(selfOrigin);
+}
+
+/**
  * @param {object} ev      Hub 拉回来的一条事件
  * @param {object} ctx
  * @param {string} ctx.selfOrigin  本机 origin
@@ -46,10 +59,10 @@ export function shouldWake(ev, { selfOrigin, maxEpoch = 0, maxSeq = 0 }) {
   /**
    * 定向消息（`to`）：叫的是别人，我照收、照显示，但不为此烧一轮 token。
    *
-   * 依赖解锁发的那条系统消息就是这种 —— 不给定向的话，一张卡解锁会把
-   * 所有开着 wakeOnMessage 的机器都点醒一轮（§6.10.2）。
+   * 依赖解锁发的那条系统消息、以及 @ 某个人的评论都是这种 ——
+   * 不给定向的话，一张卡解锁 / 一次 @ 会把所有开着 wakeOnMessage 的机器都点醒一轮。
    */
-  if (typeof ev.to === 'string' && ev.to !== '' && ev.to !== selfOrigin) {
+  if (directedAway(ev, selfOrigin)) {
     return { wake: false, reason: WAKE_SKIP.NOT_FOR_ME };
   }
   const seq = Number(ev.seq);

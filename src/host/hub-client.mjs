@@ -30,7 +30,6 @@ function withTimeout(ms) {
  * @param {string} opts.baseUrl      形如 `http://192.168.1.5:48910`
  * @param {string} opts.origin       本机 origin
  * @param {string} opts.name         显示名
- * @param {string[]} [opts.capabilities]
  * @param {string} [opts.code]       口令
  * @param {(events:any[], meta:object)=>void} [opts.onEvents]  拉到的新事件（已排序去重）
  * @param {()=>any[]} [opts.pending]  取本机待推送事件
@@ -54,7 +53,6 @@ export function createHubClient(opts = {}) {
   let beatTimer = null;
   let connecting = null;
   let name = String(opts.name || '成员');
-  let capabilities = Array.isArray(opts.capabilities) ? opts.capabilities : [];
   let online = false;
   let lastError = '';
   /**
@@ -111,7 +109,6 @@ export function createHubClient(opts = {}) {
             eventVersion: EVENT_VERSION,
             origin,
             name,
-            capabilities,
             code: opts.code || '',
           },
         });
@@ -157,7 +154,7 @@ export function createHubClient(opts = {}) {
     try {
       const data = await call('/heartbeat', {
         method: 'POST',
-        body: { status: opts.status ? opts.status() : 'idle', capabilities },
+        body: { status: opts.status ? opts.status() : 'idle' },
       });
       epoch = Number(data.epoch) || epoch;
       online = true;
@@ -259,7 +256,7 @@ export function createHubClient(opts = {}) {
   }
 
   /** 认领。成功后 Hub 会写一条 task 事件，自己那轮拉取就能看到。 */
-  async function claim(taskId, { leaseMs, capabilities: claimCaps, claimId } = {}) {
+  async function claim(taskId, { leaseMs, claimId, reason, plan } = {}) {
     if (!token) throw new Error('还没连上 Hub');
     return call('/tasks/claim', {
       method: 'POST',
@@ -267,7 +264,9 @@ export function createHubClient(opts = {}) {
         taskId,
         claimId,
         leaseMs,
-        capabilities: claimCaps,
+        // 认领时的一句话说明：只写进 running 事件供人看，不参与任何判定
+        ...(typeof reason === 'string' && reason.trim() ? { reason: reason.trim().slice(0, 500) } : {}),
+        ...(typeof plan === 'string' && plan.trim() ? { plan: plan.trim().slice(0, 500) } : {}),
       },
     });
   }
@@ -377,7 +376,6 @@ export function createHubClient(opts = {}) {
     state: () => ({ online, epoch, since, token: token ? token.slice(0, 8) : '', lastError, baseUrl: base }),
     setProfile: (p) => {
       if (p && typeof p.name === 'string') name = p.name;
-      if (p && Array.isArray(p.capabilities)) capabilities = p.capabilities;
     },
   };
 }

@@ -93,7 +93,7 @@ async function main() {
   });
   const joinB = await call(base, '/join', {
     method: 'POST',
-    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE', capabilities: ['gpu', 'python'] },
+    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE' },
   });
   const joinC = await call(base, '/join', {
     method: 'POST',
@@ -146,9 +146,11 @@ async function main() {
     body: { taskId: 't1', claimId: 'cl_b_1', leaseMs: 600000 },
   });
   check('B 认领成功', claimB.ok === true && claimB.data.taskId === 't1');
-  check('warnings 按 requiredCapabilities 原顺序', JSON.stringify(claimB.data.warnings) === JSON.stringify(['缺 ffmpeg']),
-    JSON.stringify(claimB.data.warnings));
-  check('matchedMembers 只含具备全部标签的人', Array.isArray(claimB.data.matchedMembers));
+  // 能力标签已删（0.11.1）：老 peer 发的 requiredCapabilities 照收不误（字段兼容），
+  // 但认领结果里不再有 warnings / matchedMembers —— 没人消费，留着只会误导。
+  check('认领返回不再带 warnings', claimB.data.warnings === undefined, JSON.stringify(claimB.data.warnings));
+  check('认领返回不再带 matchedMembers', claimB.data.matchedMembers === undefined,
+    JSON.stringify(claimB.data.matchedMembers));
 
   const claimC = await call(base, '/tasks/claim', {
     method: 'POST',
@@ -863,6 +865,189 @@ async function main() {
     JSON.stringify(heard[0] || {}));
   await sender.close();
   await recv.close();
+
+  /* ─────────────── 10. 口令哈希（0.10.17） ─────────────── */
+
+  console.log('\n10. 口令哈希：Hub 存哈希，明文和哈希都能过');
+  const hashedLove = 'v1$' + createHash('sha256').update(GROUP + 'LOVE', 'utf8').digest('hex');
+  const codeDir = dir();
+  const codeHub = await startHub({
+    dir: codeDir,
+    groupId: GROUP,
+    origin: ORIGIN_A,
+    port: 0,
+    code: hashedLove, // 落盘/比对用的都是哈希
+    noDiscovery: true,
+    log: () => {},
+  });
+  const codeBase = `http://127.0.0.1:${codeHub.info.port}`;
+  const joinPlain = await call(codeBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE' },
+  });
+  check('成员发明文 → Hub 用盐算一遍比对通过', Boolean(joinPlain.data?.token), JSON.stringify(joinPlain.error));
+  const joinBearer = await call(codeBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_C, name: 'C', code: hashedLove },
+  });
+  check('成员重启后只能发哈希（bearer）→ 通过', Boolean(joinBearer.data?.token), JSON.stringify(joinBearer.error));
+  const joinWrong = await call(codeBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_A, name: 'A', code: 'NOPE' },
+  });
+  check('错口令仍然 401', joinWrong.status === 401 && joinWrong.error.code === 'bad-code');
+  check('/info 的 needCode 不因为存的是哈希就变假', (await call(codeBase, '/info')).data.needCode === true);
+  await codeHub.controller.close();
+  rmSync(codeDir, { recursive: true, force: true });
+
+  /* ─────────────── 11. 活动口径：note 不续约 ─────────────── */
+
+  console.log('\n11. 活动口径：note 不续约，owner 的 task 事件续约');
+  const actDir = dir();
+  const actHub = await startHub({
+    dir: actDir, groupId: GROUP, origin: ORIGIN_C, port: 0, noDiscovery: true, leaseTickMs: 50, log: () => {},
+  });
+  const actBase = `http://127.0.0.1:${actHub.info.port}`;
+  const actJoin = await call(actBase, '/join', {
+    method: 'POST', body: { wireProtocol: 1, origin: ORIGIN_A, name: 'A', code: '' },
+  });
+  const actTok = actJoin.data.token;
+  const mkTask = (taskId, idSuffix) => ({
+    eventVersion: 2, id: `ev_aaaaaa_${idSuffix}_aaa`, origin: ORIGIN_A, name: 'A',
+    ts: new Date().toISOString(), kind: 'task', taskId, title: `任务 ${taskId}`,
+    status: 'pending', detail: '', owner: '',
+  });
+  const latestOf = async (taskId) => {
+    const r = await call(actBase, '/events?since=0&limit=500', { token: actTok });
+    return (r.data?.events || []).filter((e) => e.kind === 'task' && e.taskId === taskId)
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0)).pop() || null;
+  };
+
+  await call(actBase, '/events', { method: 'POST', token: actTok, body: { events: [mkTask('t-note', 'mkdir0001')] } });
+  await call(actBase, '/tasks/claim', { method: 'POST', token: actTok, body: { taskId: 't-note', leaseMs: 800 } });
+  await new Promise((r) => setTimeout(r, 600));
+  await call(actBase, '/events', {
+    method: 'POST', token: actTok,
+    body: {
+      events: [{
+        eventVersion: 2, id: 'ev_aaaaaa_note0001_aaa', origin: ORIGIN_A, name: 'A',
+        ts: new Date().toISOString(), kind: 'note', taskId: 't-note', text: '写到一半了',
+      }],
+    },
+  });
+  // 900ms > 原租约 800ms，但 < 「note 也续约」才会到的 1400ms
+  await new Promise((r) => setTimeout(r, 300));
+  const afterNote = await latestOf('t-note');
+  check('note 不续约：过了原租约就退回待认领', afterNote && afterNote.status === 'pending',
+    JSON.stringify(afterNote?.status));
+
+  await call(actBase, '/events', { method: 'POST', token: actTok, body: { events: [mkTask('t-task', 'mkdir0002')] } });
+  await call(actBase, '/tasks/claim', { method: 'POST', token: actTok, body: { taskId: 't-task', leaseMs: 800 } });
+  await new Promise((r) => setTimeout(r, 600));
+  await call(actBase, '/events', {
+    method: 'POST', token: actTok,
+    body: {
+      events: [{
+        eventVersion: 2, id: 'ev_aaaaaa_tstatus1_aaa', origin: ORIGIN_A, name: 'A',
+        ts: new Date().toISOString(), kind: 'task', taskId: 't-task', title: '任务 t-task',
+        status: 'running', detail: '',
+      }],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  const afterTask = await latestOf('t-task');
+  check('owner 的 task 事件算活动：续到 1400ms，900ms 时还在 running',
+    afterTask && afterTask.status === 'running', JSON.stringify(afterTask?.status));
+  await new Promise((r) => setTimeout(r, 700));
+  const ended = await latestOf('t-task');
+  check('续约也会到期（4× 上限照样收）', ended && ended.status === 'pending', JSON.stringify(ended?.status));
+
+  // lease-exhausted：一直写进度把租约顶到上限，再看到期时的 note
+  console.log('11b. lease-exhausted：续到 4× 上限和「没写进度」分得开');
+  await call(actBase, '/events', { method: 'POST', token: actTok, body: { events: [mkTask('t-max', 'mkdir0003')] } });
+  await call(actBase, '/tasks/claim', { method: 'POST', token: actTok, body: { taskId: 't-max', leaseMs: 500 } });
+  for (let i = 0; i < 8; i += 1) {
+    await new Promise((r) => setTimeout(r, 300));
+    await call(actBase, '/events', {
+      method: 'POST', token: actTok,
+      body: {
+        events: [{
+          eventVersion: 2, id: `ev_aaaaaa_prog00${i}_aaa`, origin: ORIGIN_A, name: 'A',
+          ts: new Date().toISOString(), kind: 'progress', taskId: 't-max', done: i, total: 99, note: '',
+        }],
+      },
+    });
+  }
+  await new Promise((r) => setTimeout(r, 800));
+  const maxLog = readFileSync(join(actDir, 'hub-events.jsonl'), 'utf8')
+    .trim().split('\n').map((l) => JSON.parse(l));
+  check('到期时写了「续约已到上限」的 warn note',
+    maxLog.some((e) => e.kind === 'note' && e.level === 'warn' && String(e.text).includes('续约已到上限')));
+  check('还写了「没写进度」的普通 note（另一种到期）',
+    maxLog.some((e) => e.kind === 'note' && e.level === 'info' && String(e.text).includes('没有写入 progress')));
+  await actHub.controller.close();
+  rmSync(actDir, { recursive: true, force: true });
+
+  /* ─────────────── 12. 认领附言 / to 数组 ─────────────── */
+
+  console.log('\n12. 认领附言 reason/plan，msg.to 支持数组');
+  const reasonDir = dir();
+  const reasonHub = await startHub({
+    dir: reasonDir, groupId: GROUP, origin: ORIGIN_C, port: 0, noDiscovery: true, log: () => {},
+  });
+  const rBase = `http://127.0.0.1:${reasonHub.info.port}`;
+  const rJoin = await call(rBase, '/join', {
+    method: 'POST', body: { wireProtocol: 1, origin: ORIGIN_A, name: 'A', code: '' },
+  });
+  const rTok = rJoin.data.token;
+  await call(rBase, '/events', {
+    method: 'POST',
+    token: rTok,
+    body: {
+      events: [{
+        eventVersion: 2, id: 'ev_aaaaaa_reason01_aaa', origin: ORIGIN_A, name: 'A',
+        ts: new Date().toISOString(), kind: 'task', taskId: 't-reason',
+        title: '带附言的卡', status: 'pending', detail: '',
+      }],
+    },
+  });
+  const claimReason = await call(rBase, '/tasks/claim', {
+    method: 'POST',
+    token: rTok,
+    body: { taskId: 't-reason', leaseMs: 60000, reason: '这个我熟', plan: '先跑测试再改' },
+  });
+  check('带 reason/plan 的认领成功', claimReason.ok === true, JSON.stringify(claimReason.error));
+  const reasonPull = await call(rBase, '/events?since=0&limit=500', { token: rTok });
+  const runningEv = (reasonPull.data?.events || [])
+    .filter((e) => e.kind === 'task' && e.taskId === 't-reason' && e.status === 'running')
+    .pop();
+  check('reason/plan 写进了 running 事件',
+    runningEv?.reason === '这个我熟' && runningEv?.plan === '先跑测试再改', JSON.stringify(runningEv));
+
+  const toArray = await call(rBase, '/events', {
+    method: 'POST',
+    token: rTok,
+    body: {
+      events: [{
+        eventVersion: 2, id: 'ev_aaaaaa_tomulti1_aaa', origin: ORIGIN_A, name: 'A',
+        ts: new Date().toISOString(), kind: 'msg', text: '叫你们两个', to: [ORIGIN_B, ORIGIN_C],
+      }],
+    },
+  });
+  check('msg.to 允许数组', toArray.ok === true, JSON.stringify(toArray.error));
+  const toBad = await call(rBase, '/events', {
+    method: 'POST',
+    token: rTok,
+    body: {
+      events: [{
+        eventVersion: 2, id: 'ev_aaaaaa_tobad001_aaa', origin: ORIGIN_A, name: 'A',
+        ts: new Date().toISOString(), kind: 'msg', text: '坏的', to: ['xxx', ORIGIN_B],
+      }],
+    },
+  });
+  check('msg.to 数组里有坏值 → 400', toBad.status === 400 && toBad.error.code === 'bad-param');
+  await reasonHub.controller.close();
+  rmSync(reasonDir, { recursive: true, force: true });
 
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   if (fail > 0) process.exitCode = 1;

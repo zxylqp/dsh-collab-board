@@ -569,12 +569,13 @@ async function main() {
   // s2 被别人改过标题：最新那条事件的 origin 是 B，但建卡人还是 A
   cards.push(mk({ taskId: 's2', title: 'A 建的（被 B 改过）', status: 'pending', owner: '', origin: B_ORIGIN, seq: 6, id: 'ev_s6' }));
 
-  const selRows = claimableTasks(cards, { selfOrigin: A_ORIGIN, capabilities: ['ffmpeg'] });
+  const selRows = claimableTasks(cards, { selfOrigin: A_ORIGIN });
   const reasonOf = new Map(selRows.map((r) => [r.task.taskId, r.reason]));
   check('别人建的空卡可接', reasonOf.get('s1') === '', String(reasonOf.get('s1')));
   check('自己建的卡不可接（哪怕被别人改过标题）', reasonOf.get('s2') === 'own', String(reasonOf.get('s2')));
   check('有主的卡不可接', reasonOf.get('s3') === 'owned');
-  check('缺能力不可接', reasonOf.get('s4') === 'caps');
+  // 能力标签已删（0.11.1）：写了 requiredCapabilities 的卡不再挡认领 —— 它就是张普通卡
+  check('写了 requiredCapabilities 的卡照样可接', reasonOf.get('s4') === '', String(reasonOf.get('s4')));
   check('依赖没完成不可接', reasonOf.get('s5') === 'deps');
   check('建卡人看的是最早那条的 origin', earliestByTask(cards).get('s2') === A_ORIGIN,
     String(earliestByTask(cards).get('s2')));
@@ -592,7 +593,7 @@ async function main() {
   ]);
   check('显式 owner:"" → 真的变空（释放不被继承挡住）',
     latestTasks(foldReleased).get('o1').owner === '', JSON.stringify(latestTasks(foldReleased).get('o1').owner));
-  const foldClaimable = claimableTasks(fold, { selfOrigin: A_ORIGIN, capabilities: [] });
+  const foldClaimable = claimableTasks(fold, { selfOrigin: A_ORIGIN });
   check('继承后的卡不会被判成可接（有主）',
     foldClaimable.find((r) => r.task.taskId === 'o1')?.reason === 'owned',
     String(foldClaimable.find((r) => r.task.taskId === 'o1')?.reason));
@@ -991,6 +992,105 @@ async function main() {
     shouldWake({ kind: 'msg', origin: 'other', epoch: 1, seq: 283 },
       { selfOrigin: 'self', maxEpoch: seen.epoch, maxSeq: seen.seq }).wake === true);
   rmSync(seenDir, { recursive: true, force: true });
+
+  /* ─────────────── 0.10.17：口令 / 校验 / 定向 ─────────────── */
+
+  console.log('\n12f. 口令不回传、落盘是哈希');
+  const setBefore = await hit(routes, '/collab-board/settings');
+  check('未设口令时 hubCodeSet=false', setBefore.payload?.settings?.hubCodeSet === false);
+  check('GET /settings 不含 hubCode 原文', (setBefore.payload?.settings?.hubCode || '') === '');
+  const setCode = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { hubCode: 'LOVE' },
+  });
+  check('PATCH 口令成功', setCode.status === 200, JSON.stringify(setCode.payload));
+  check('PATCH 响应里也没有原文', (setCode.payload?.settings?.hubCode || '') === '');
+  check('hubCodeSet=true', setCode.payload?.settings?.hubCodeSet === true);
+  const rawSettings = JSON.parse(readFileSync(join(dataDir, 'settings.json'), 'utf8'));
+  check('settings.json 里存的是哈希', String(rawSettings.hubCode || '').startsWith('v1$'),
+    String(rawSettings.hubCode || ''));
+  check('settings.json 里搜不到明文口令', !String(rawSettings.hubCode || '').includes('LOVE'));
+  const codeAgain = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { hubCode: 'LOVE' },
+  });
+  check('同一个口令再存一次哈希不变（盐是 groupId，不是随机值）',
+    JSON.parse(readFileSync(join(dataDir, 'settings.json'), 'utf8')).hubCode === rawSettings.hubCode,
+    codeAgain.payload?.settings?.hubCodeSet ? '' : 'hubCodeSet 丢了');
+
+  console.log('\n12g. 本地校验：脏事件不落盘');
+  const logBefore = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).length;
+  const emptyMsg = await hit(routes, '/collab-board/post', {
+    method: 'POST', body: { kind: 'msg', text: '   ' },
+  });
+  check('空 msg 被本地校验挡掉（400）', emptyMsg.status === 400, JSON.stringify(emptyMsg.payload));
+  const orphanProgress = await hit(routes, '/collab-board/post', {
+    method: 'POST', body: { kind: 'progress', done: 1, total: 2 },
+  });
+  check('没挂任务的 progress 被挡掉', orphanProgress.status === 400, JSON.stringify(orphanProgress.payload));
+  const logAfter = readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).length;
+  check('两条脏事件都没写进日志', logAfter === logBefore, `${logBefore} → ${logAfter}`);
+
+  console.log('\n12h. @ 定向投递：mentions → to');
+  const meVer = await hit(routes, '/collab-board/version');
+  const myOrigin = String(meVer.payload?.origin || '');
+  // 复用上面已有的 otherOrigin（abcdef0123456789），别重复声明
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'member', action: 'join', name: '姐姐', target: otherOrigin },
+  });
+  const mentionPost = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', from: '我', text: '@姐姐 看这个', mentions: ['姐姐'] },
+  });
+  check('带 mentions 的消息写成功', mentionPost.status === 200, JSON.stringify(mentionPost.payload));
+  check('mentions 解析成 to（只叫点名的人）', mentionPost.payload?.event?.to === otherOrigin,
+    JSON.stringify(mentionPost.payload?.event));
+  check('原 mentions 字段保留（看板还显示 @ 了谁）',
+    Array.isArray(mentionPost.payload?.event?.mentions)
+    && mentionPost.payload.event.mentions[0] === '姐姐');
+
+  // 卡上的普通评论：参与集只含当前 owner —— 手动把一张卡折成「B 在跑」
+  appendFileSync(logPath, JSON.stringify({
+    eventVersion: 2, id: 'ev_bbbbbb_relay001_aaa', origin: otherOrigin, name: '姐姐',
+    ts: new Date().toISOString(), kind: 'task', taskId: 'relay1', title: '别人的卡',
+    status: 'running', owner: otherOrigin, detail: '', epoch: 1, seq: 99001,
+  }) + '\n', 'utf8');
+  const relayPost = await hit(routes, '/collab-board/post', {
+    method: 'POST', body: { kind: 'msg', from: '我', text: '这张卡怎么样了', taskId: 'relay1' },
+  });
+  check('卡上评论定向到当前 owner', relayPost.payload?.event?.to === otherOrigin,
+    JSON.stringify(relayPost.payload?.event));
+  const ownCard = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 'watch1', title: '我自己的卡', status: 'running', owner: myOrigin },
+  });
+  check('自己认领的卡写成功', ownCard.status === 200, JSON.stringify(ownCard.payload));
+  const stateWatchTool = findTool(tools, 'collab_state');
+  const stateOut = await stateWatchTool.execute({ since: 0, advance: false });
+  const stateWatch = JSON.parse(stateOut.text);
+  check('collab_state 带 watching（参与集）',
+    Array.isArray(stateWatch.watching)
+    && stateWatch.watching.some((t) => t.taskId === 'watch1'),
+    JSON.stringify(stateWatch.watching || []).slice(0, 200));
+  check('collab_state 带 others（别人 running 卡的 owner）',
+    Array.isArray(stateWatch.others)
+    && stateWatch.others.some((t) => t.taskId === 'relay1' && t.owner === otherOrigin),
+    JSON.stringify(stateWatch.others || []).slice(0, 200));
+
+  console.log('\n12i. 启动迁移：明文口令 → 哈希');
+  const migDir = mkdtempSync(join(tmpdir(), 'collab-mig-'));
+  writeFileSync(join(migDir, 'settings.json'), JSON.stringify({ hubCode: 'MIGRATE' }), 'utf8');
+  const mig = makeCtx({});
+  apply(mig.ctx, { dataDir: migDir, syncLanInbox: false });
+  const migSettings = JSON.parse(readFileSync(join(migDir, 'settings.json'), 'utf8'));
+  check('明文已迁移成 v1$ 哈希',
+    String(migSettings.hubCode || '').startsWith('v1$'), String(migSettings.hubCode || ''));
+  check('迁移后文件里搜不到明文', !String(migSettings.hubCode || '').includes('MIGRATE'));
+  for (const c of mig.cleanups.reverse()) {
+    try { c(); } catch { /* 卸载失败不该让测试挂 */ }
+  }
+  rmSync(migDir, { recursive: true, force: true });
 
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {

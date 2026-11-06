@@ -4,6 +4,103 @@
 
 ---
 
+## 0.11.1
+
+**删掉能力标签。** 它不是「没发挥作用」，是在**起负作用** —— 一张卡写了
+`requiredCapabilities`、本机标签里没有那个词，`claimableTasks` 就判 `ok:false`：
+自动认领不接、待办提醒不提、`readBoard` 的 pending 池标成不可接。
+而探测只有 ffmpeg / python / soffice / gpu / chrome 五个，Windows 上 `where python`
+会撞到 Store 的存根、soffice 和 gpu 靠运气，手填又没人填。净效果是**写了标签的卡静默没人接**。
+
+另外两处是纯摆设：Hub 的 `warningsFor` / `matchedMembersFor`（注释自己都写着
+「不影响 claim 结果」），以及面板上的成员小字和任务卡 pill —— 没人看。
+
+- 删 `src/host/capabilities.mjs`、`/collab-board/capabilities` 和 `/capabilities/detect`
+  两个路由、`capabilityDetect` / `capabilitiesExtra` 两个设置项、设置页「能力标签」整页、
+  任务详情的 pill 和「你缺少 xx，仍要认领吗」提示。
+- **不改协议**：`requiredCapabilities` / `capabilities` 两个字段留在事件 schema 里，
+  老 peer 继续发也不会被 400。所以**不用两台同时升级**，也不用迁移。
+- `collab_claim` 工具的 `capabilities` 参数一并删掉。
+- 认领返回不再带 `warnings` / `matchedMembers`。
+- 测试反过来断言：写了 `requiredCapabilities` 的卡照样能认领 —— 防以后有人手滑加回去。
+- 代价说清楚：以后没有「谁能干这个」的判据了。要派活就按人派（@ 某人 / 指定 owner），
+  别指望自报标签。
+- 重启 DSH 才生效。
+
+---
+
+## 0.11.0
+
+按《后续优化建议 · 最终收敛版》落地的一轮。核心是「先修会写坏数据的，再修会显示错的，
+最后让协作更顺」。**协议有变更，两台机器都要升级并重启**；口令升级顺序是
+**先升 Hub、再升成员**（Hub 端两种格式都能校验，反过来不行）。
+
+### 1. 口令不再明文落盘，也不再回传
+
+- `hubCode` 在 `settings.json` 里存 `v1$<sha256(groupId + code)>`。**显式前缀**，
+  不靠长度猜 —「明文还是哈希」猜错一次，之后谁都连不上。
+- 盐用**本组 groupId**，不是随机值：两台机器必须算出同一个哈希，Hub 和成员才认。
+- `/collab-board/settings` 的 GET / PATCH 都不再回传原文，只给 `hubCodeSet`（已设置/未设置）。
+  面板改成密码框 + 「重设 / 清除口令」，**屏幕上不留明文**。
+- 校验认三种：本机存的哈希（成员重启后只能拿这个，哈希即凭据）、人输入的明文、
+  升级前的明文存储。代价说清楚：拿到 `settings.json` 的人一样能连，这一点没变；
+  变的是 HTTP、日志、事件流里都没有它了。
+- **启动时迁移**：旧明文一次性换成哈希。迁移要在 identity 建好之后做（盐是 groupId），
+  所以「升级后要重启 Hub 才生效」不是可选项，是必须。
+
+### 2. 本地校验：脏事件不落盘
+
+`buildEvent` 之后直接调已存在的 `validateEvent`，不过就不写日志。以前只在 Hub 端校验，
+脏事件先落盘 → 推上去被 400 整批拒 → 永远堵在待同步队列（0.10.14 踩过）。
+**只借它做判定，不拿它做归一化**：`validateEvent` 会给缺省字段补值，而 `owner` 一旦
+出现在事件里就表示「显式设置」—— 改个标题会被 Hub 当成释放这张卡。
+
+### 3. 全量重写一律原子写
+
+`store.mjs` 的裁剪、墓碑擦正文、清空数据三处原来都是裸 `writeFileSync`，
+而文件头写着「只追加、永不原地改」。断电落在写一半的窗口里 = 整份日志半截。
+统一走 `writeAtomic`（tmp + rename）。
+
+### 4. 版本漂移：红条 + 一键重载
+
+原来只有标题标黄和 tooltip —— 知道不一致，却还得自己想该干嘛。现在顶栏是红条，
+按钮直接 `location.reload()`；还不对就是宿主没重启。
+
+### 5. 租约口径收敛成一个「活动」+ lease-exhausted
+
+- 活动（唯一一份，`selectable.isTaskActivity`）：`progress` / `artifact` /
+  带 `status` 或 `owner` 的 `task`，且必须是**当前 owner**。`note` 不算 ——
+  事件模型里没有「progress 类 note」，想续约就写 progress。
+- 到期释放前分两种 note：**续约到了 4× 上限**（warn，「不是没干活」）vs
+  **期间没写进度**（info）。看板上不再只有一条冷冰冰的 `task → pending`。
+- **顺带修掉一个真 bug**：`claimedAt` / `leaseMs` 是 Hub 专属字段，成员推上来的
+  普通 task 事件没有它们。折叠时不从上一版继承，改个标题就把租约终点抹成 0 ——
+  卡永远不过期、也再不会被扫描释放。Hub 和本机折叠（`selectable.latestTasks`）都补了继承。
+
+### 6. @ 只投一次，参与集只含 owner
+
+- `mentions` 解析成 origin，写进 `msg.to`（新增支持**数组**，一次 @ 多个人）。
+  解析不出来就只保留 `mentions` 显示，不猜、不乱投。
+- 卡上的普通消息**默认投给当前 owner**（定向字段），creator 不进参与集 ——
+  建 20 张卡的 agent 不该被 20 张卡的评论各叫一次。
+- `done` 卡上的 @ 仍然投递一次：完成后的追问、补验收不能断，只是不触发接力。
+- 认领成功 / 收到「卡被别人认领、已完成、已删除」时，清掉账上**等 owner 决定**的
+  排队唤醒（`delivery.dropTask(relayOnly)`）；**点名发给我的不清**。
+
+### 7. 观测增强
+
+- `collab_state` 多两段：`watching`（我参与集 = 我是 owner 的卡）和
+  `others`（别人 running 的卡 + owner），不再把「有人在跑」看成「没人接」。
+- `collab_claim` 可带 `reason` / `plan`，写进 running 事件；只给人看，不参与判定。
+- 唤醒 payload 结构化：`reason` / `cardIds` / `coalescedCount` 进账本、进唤醒文本
+  （「这一波合并了 N 条」），`/version` 的 wake 快照也能看到队头那条。
+
+测试 268 项全绿（hub 107 + host 161）。新增 33 条：口令哈希与迁移、活动口径
+（note 不续约 / task 续约 / 4× 上限照样收）、lease-exhausted 两种 note、
+本地校验不落盘、mentions→to、卡上评论定向 owner、watching/others、claim 附言。
+
+---
+
 ## 0.10.16
 
 **点「成员」白屏：`presence is not defined`。**

@@ -196,16 +196,30 @@ export function validateEvent(raw, opts = {}) {
       const text = textOf(raw.text, 8192);
       if (text.trim() === '') return bad('bad-param', 'msg 要有 text', 'text');
       /**
-       * `to`：定向消息 —— 只叫醒这一个人（§6.10.2 依赖解锁用）。
+       * `to`：定向消息 —— 只叫醒这几个人（§6.10.2 依赖解锁用；@ 也用同一套）。
        *
        * 为什么需要它：msg 本来是广播的，唤醒也就跟着广播 —— 一次依赖解锁
        * 会把所有开着 wakeOnMessage 的机器都点醒一轮。给了 `to`，
        * 别的机器照常收事件、照常显示，但**不为此烧一轮 token**。
+       *
+       * 可以是单个 origin，也可以是 origin 数组（一次 @ 好几个人）。
        * 可省：老消息没有这个字段，行为不变。
        */
-      if (raw.to !== undefined && raw.to !== null && raw.to !== ''
-        && !(typeof raw.to === 'string' && HEX16.test(raw.to))) {
-        return bad('bad-param', 'to 要 16 位小写十六进制 origin', 'to');
+      if (raw.to !== undefined && raw.to !== null && raw.to !== '') {
+        const list = Array.isArray(raw.to) ? raw.to : [raw.to];
+        const clean = [];
+        for (const one of list) {
+          if (typeof one !== 'string' || !HEX16.test(one)) {
+            return bad('bad-param', 'to 要 16 位小写十六进制 origin（或它的数组）', 'to');
+          }
+          if (!clean.includes(one)) clean.push(one);
+          if (clean.length >= 16) break;
+        }
+        if (clean.length === 0) return bad('bad-param', 'to 不能是空数组', 'to');
+        return {
+          ok: true,
+          event: { ...raw, text, to: clean.length === 1 ? clean[0] : clean },
+        };
       }
       return { ok: true, event: { ...raw, text } };
     }

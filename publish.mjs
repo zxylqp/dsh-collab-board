@@ -129,13 +129,22 @@ const FILES = [
   '.gitignore', 'CHANGELOG.md', 'LICENSE', 'README.md', 'cordis.patch.yml', 'package.json',
   'publish.mjs',
   'src/client/index.js',
-  'src/host/capabilities.mjs', 'src/host/delivery.mjs', 'src/host/discovery.mjs',
+  'src/host/delivery.mjs', 'src/host/discovery.mjs',
   'src/host/events.mjs', 'src/host/http-util.mjs', 'src/host/hub-client.mjs',
   'src/host/hub.mjs', 'src/host/identity.mjs', 'src/host/index.mjs',
   'src/host/selectable.mjs', 'src/host/settings.mjs', 'src/host/store.mjs', 'src/host/wake.mjs',
   'test/host.test.mjs', 'test/hub.test.mjs',
 ].filter((f) => existsSync(join(ROOT, f)));
 if (FILES.length === 0) die('没有可推送的文件');
+
+/**
+ * 本地已删、远端还留着的文件。
+ *
+ * Git Data API 的 `base_tree` 是**叠加**语义：不在这次 tree 列表里的文件原样继承。
+ * 于是「本地删了」在 GitHub 上什么都不会发生 —— 0.11.1 删 capabilities.mjs 时才踩到。
+ * 必须显式给一条 `sha: null` 才算删除，否则 clone 下来永远有个死文件。
+ */
+const DELETED = ['src/host/capabilities.mjs'];
 
 const ref = await api(`/repos/${OWNER}/${REPO}/git/ref/heads/${BRANCH}`);
 const baseSha = ref.object.sha;
@@ -152,6 +161,12 @@ for (const rel of FILES) {
   });
   tree.push({ path: rel, mode: '100644', type: 'blob', sha: blob.sha });
   say(`  · ${rel}（${statSync(abs).size} B）`);
+}
+// 本地已删的文件：显式置 null 才真的从远端树里拿掉
+for (const rel of DELETED) {
+  if (existsSync(join(ROOT, rel))) continue;
+  tree.push({ path: rel, mode: '100644', type: 'blob', sha: null });
+  say(`  · 删除 ${rel}`);
 }
 
 const newTree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
