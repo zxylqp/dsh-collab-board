@@ -196,26 +196,26 @@ export function apply(ctx, rawConfig = {}) {
     return { sessionId, stopReason: (r && r.stopReason) || '' };
   }
 
-  /** 唤醒文本。重试时把「第几次」写进消息头，否则 agent 会当成一条新消息。 */
+  /**
+   * 唤醒文本（0.11.6 压成一行）。
+   *
+   * 原来是一整段三行说明，每次唤醒都往对话里糊一遍，连着七八条很吵。
+   * 现在只留「谁 · 在哪 · 干什么」，一行完事。补叫 / 重试 / 合并
+   * 用极短后缀标出来，不展开讲理由。该怎么做靠 agent 自己的规矩。
+   */
   function wakeText(meta, attempt = 1, deferred = false) {
     const cards = Array.isArray(meta.cardIds) && meta.cardIds.length
       ? meta.cardIds.filter(Boolean)
       : (meta.taskId ? [meta.taskId] : []);
-    const where = cards.length ? `任务 ${cards.join('、')}` : '全局';
+    const where = cards.length ? cards.join('、') : '全局';
+    const bits = [];
+    if (meta.reason === 'mention') bits.push('@你');
+    if (attempt > 1) bits.push(`第 ${attempt} 次`);
+    if (deferred) bits.push('补');
     const count = Math.max(1, Number(meta.coalescedCount) || 1);
-    const merged = count > 1 ? `（这一波合并了 ${count} 条，读一次增量就够）` : '';
-    const why = meta.reason === 'mention'
-      ? '，并且点名 @ 了你'
-      : (meta.reason === 'card' ? '，在你这张卡上' : '');
-    const retry = attempt > 1
-      ? `（第 ${attempt} 次投递：前面 ${attempt - 1} 次没送到，可能是对端会话忙或宿主重启）`
-      : '';
-    const late = deferred
-      ? '（补叫：你上次被叫醒后还没到冷却时间，这条现在才送到）'
-      : '';
-    return `【协作看板自动触发${retry}${late}】${meta.from || '对方'} 在${where}发了新消息${why}${merged}。`
-      + '先调 collab_state 读增量（不要全量读），看完再决定要不要回。'
-      + '回完就停，不要连续追问。';
+    if (count > 1) bits.push(`×${count}`);
+    const tag = bits.length ? ` ${bits.join(' ')}` : '';
+    return `【看板】${meta.from || '对方'} ${where}${tag} · 读增量，回完停`;
   }
 
   function considerWake(events) {
@@ -229,7 +229,7 @@ export function apply(ctx, rawConfig = {}) {
     );
     if (fresh.length === 0) return;
 
-    const cooldown = Math.max(60000, Number(s.wakeCooldownMs) || 300000);
+    const cooldown = Math.max(1000, Number(s.wakeCooldownMs) || 300000);
     const now = Date.now();
     let called = 0;
 

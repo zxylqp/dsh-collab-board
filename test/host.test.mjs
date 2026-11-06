@@ -942,7 +942,7 @@ async function main() {
   await new Promise((r) => setTimeout(r, 3600));
   check('重启后真的补投了一次', restartCalls.length === 1, `calls=${restartCalls.length}`);
   check('补投的文本标明是第 2 次',
-    String(restartCalls[0]?.request?.content?.[0]?.text || '').includes('第 2 次投递'),
+    String(restartCalls[0]?.request?.content?.[0]?.text || '').includes('第 2 次'),
     String(restartCalls[0]?.request?.content?.[0]?.text || '').slice(0, 80));
   const afterRestart = JSON.parse(readFileSync(join(restartDir, 'inflight.json'), 'utf8'));
   check('补投成功后账本清空', Array.isArray(afterRestart.items) && afterRestart.items.length === 0,

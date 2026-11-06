@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 27;
-    const VERSION = '0.11.5';
+    const VERSION = '0.11.6';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1393,12 +1393,31 @@ window.__ModuleLoader__.load({
             list.push({ kind: 'artifact', ts: f.ts, data: f });
           }
         }
-        return list;
+        /**
+         * 倒序：最新的在最上面（0.11.6）。
+         *
+         * 原来按时间升序往下堆、自动滚到底，翻旧消息要一路往上拖；
+         * 消息一多，最该看的那条永远在最下面。改成降序，新的直接顶上来。
+         *
+         * 排序键用 ts；拿不到就按 0 处理 —— 宁可让它沉底，别让整个列表乱序。
+         */
+        const tsOf = (x) => {
+          const v = x && x.ts;
+          if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+          const n = Date.parse(String(v || ''));
+          return Number.isFinite(n) ? n : 0;
+        };
+        return list.sort((a, b) => tsOf(b) - tsOf(a));
       }, [model, settings.showSystemEvents, settings.showArtifacts]);
 
+      /**
+       * 倒序之后「跟到最新」= 滚到顶部。
+       *
+       * 只在用户本来就在顶部附近时才跳 —— 翻历史翻到一半被拽回去，比不跟还烦。
+       */
       useEffect(() => {
         if (!settings.autoScroll || !scrollRef.current) return;
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        if (scrollRef.current.scrollTop < 80) scrollRef.current.scrollTop = 0;
       }, [entries.length, settings.autoScroll]);
 
       const taskComments = useMemo(() => {
@@ -1431,14 +1450,21 @@ window.__ModuleLoader__.load({
               title: '还没有全局消息',
               desc: '看板里只有任务评论；全局消息会在下面出现。系统提示也走这里。',
             })
-            : entries.map((item, i) => {
+            : entries.map((item) => {
+              /**
+               * key 必须是稳定的。倒序之后用下标当 key，新消息插到最前面时
+               * 每一条的下标都变，React 会把上一条的内容复用到下一条上（闪一下、错位）。
+               */
+              const k = (item.data && item.data.id)
+                ? String(item.data.id)
+                : `${item.kind}:${item.data && item.data.ts}`;
               if (item.kind === 'msg') {
-                return h(Message, { key: 'e' + i, msg: item.data, me, timeMode: settings.timeFormat });
+                return h(Message, { key: k, msg: item.data, me, timeMode: settings.timeFormat });
               }
               if (item.kind === 'note') {
-                return h(SysNote, { key: 'e' + i, note: item.data });
+                return h(SysNote, { key: k, note: item.data });
               }
-              return h('div', { key: 'e' + i, className: 'cb-sys', style: { textAlign: 'left' } },
+              return h('div', { key: k, className: 'cb-sys', style: { textAlign: 'left' } },
                 h('em', null, '产出'), item.data.path || '(文件)');
             }),
           taskComments.map((row) => h('button', {
@@ -1614,8 +1640,8 @@ window.__ModuleLoader__.load({
               }),
             }),
             h(Field, {
-              label: '自动滚到底',
-              desc: '有新消息时把动态流滚到最新。',
+              label: '跟到最新',
+              desc: '有新消息时回到顶部（最新的在最上面）。往上翻到一半时不会把你拽回去。',
               control: h(Toggle, {
                 on: settings.autoScroll,
                 onClick: (v) => saveSetting('autoScroll', v),
