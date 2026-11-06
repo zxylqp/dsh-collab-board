@@ -132,6 +132,7 @@ const FILES = [
   'src/host/delivery.mjs', 'src/host/discovery.mjs',
   'src/host/events.mjs', 'src/host/http-util.mjs', 'src/host/hub-client.mjs',
   'src/host/hub.mjs', 'src/host/identity.mjs', 'src/host/index.mjs',
+  'src/host/ratelimit.mjs',
   'src/host/selectable.mjs', 'src/host/settings.mjs', 'src/host/store.mjs', 'src/host/wake.mjs',
   'test/host.test.mjs', 'test/hub.test.mjs',
 ].filter((f) => existsSync(join(ROOT, f)));
@@ -162,9 +163,14 @@ for (const rel of FILES) {
   tree.push({ path: rel, mode: '100644', type: 'blob', sha: blob.sha });
   say(`  · ${rel}（${statSync(abs).size} B）`);
 }
-// 本地已删的文件：显式置 null 才真的从远端树里拿掉
+// 本地已删的文件：显式置 null 才真的从远端树里拿掉。
+// **只删远端确实还在的**：对一个不存在的路径给 `sha: null`，GitHub 会回
+// 422 GitRPC::BadObjectState —— 0.11.2 推的时候就这么炸过一次（0.11.1 已经删掉了）。
+const remoteTree = await api(`/repos/${OWNER}/${REPO}/git/trees/${baseCommit.tree.sha}?recursive=1`);
+const remotePaths = new Set((remoteTree.tree || []).map((e) => e.path));
 for (const rel of DELETED) {
   if (existsSync(join(ROOT, rel))) continue;
+  if (!remotePaths.has(rel)) continue;
   tree.push({ path: rel, mode: '100644', type: 'blob', sha: null });
   say(`  · 删除 ${rel}`);
 }
@@ -174,7 +180,18 @@ const newTree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
   body: { base_tree: baseCommit.tree.sha, tree },
 });
 
-const headline = (changelog.match(/^## \d+\.\d+\.\d+\s*\n+\*\*(.+?)\*\*/m) || [])[1] || '';
+/**
+ * 提交标题从 **这一版** 的正文里取第一句粗体。
+ *
+ * 以前是全文件找第一个 `## x.y.z` + 粗体 —— 只要新版本的正文不是粗体开头，
+ * 就会抓到上一个版本的标题（0.11.2 那条写成了「删掉能力标签」，是 0.11.1 的）。
+ * 现在先按 `## ${version}` 切出本段，再取段内第一处粗体。
+ */
+const headline = (() => {
+  const after = changelog.split(`## ${version}`)[1] || '';
+  const section = after.split(/\n## /)[0];
+  return (section.match(/\*\*(.+?)\*\*/) || [])[1] || '';
+})();
 const commitMsg = `${version}：${headline}\n\n由 publish.mjs 打包推送（测试全绿后自动生成）。`;
 const newCommit = await api(`/repos/${OWNER}/${REPO}/git/commits`, {
   method: 'POST',

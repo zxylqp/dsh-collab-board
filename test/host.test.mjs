@@ -1092,6 +1092,97 @@ async function main() {
   }
   rmSync(migDir, { recursive: true, force: true });
 
+  /* ───────────────── 事件日志增量读（0.11.2） ───────────────── */
+
+  console.log('\n12j. 事件日志增量读：只读新增的那段');
+  const incDir = mkdtempSync(join(tmpdir(), 'collab-incr-'));
+  const incLog = join(incDir, 'events.jsonl');
+  const incSeq = join(incDir, '.synced.json');
+  const incRej = join(incDir, '.rejected.json');
+  const mkInc = () => createStore({
+    logPath: incLog,
+    seqFile: incSeq,
+    rejectedFile: incRej,
+    origin: () => 'self',
+    nameOf: () => '我',
+    maxEventsOf: () => 5000,
+    localIso: () => new Date().toISOString(),
+  });
+
+  writeFileSync(incLog, ['a', 'b', 'c']
+    .map((x) => JSON.stringify({ id: `ev_${x}`, kind: 'msg', origin: 'self', text: x }))
+    .join('\n') + '\n', 'utf8');
+
+  const inc = mkInc();
+  check('首次读是全量，3 条', inc.readEvents().length === 3 && inc.stats().fullReads === 1,
+    JSON.stringify(inc.stats()));
+  inc.readEvents();
+  check('没变化就不再读文件', inc.stats().fullReads === 1 && inc.stats().incrReads === 0,
+    JSON.stringify(inc.stats()));
+
+  inc.appendEvent({ id: 'ev_d', kind: 'msg', text: 'd' });
+  check('自己追加不触发重读', inc.stats().fullReads === 1 && inc.stats().incrReads === 0,
+    JSON.stringify(inc.stats()));
+  check('追加后立刻读到 4 条', inc.readEvents().length === 4, String(inc.readEvents().length));
+
+  appendFileSync(incLog,
+    JSON.stringify({ id: 'ev_e', kind: 'msg', origin: 'other', text: 'e' }) + '\n', 'utf8');
+  const incAfter = inc.readEvents();
+  check('外部追加走增量读（全量次数不变）',
+    inc.stats().incrReads === 1 && inc.stats().fullReads === 1, JSON.stringify(inc.stats()));
+  check('增量拿到第 5 条', incAfter.length === 5 && incAfter.some((e) => e.id === 'ev_e'),
+    String(incAfter.length));
+
+  appendFileSync(incLog, '{"id":"ev_f","kind":"msg","ori', 'utf8');
+  check('半截行不算事件', inc.readEvents().length === 5, String(inc.readEvents().length));
+  appendFileSync(incLog, 'gin":"other","text":"f"}\n', 'utf8');
+  check('补齐后立刻出现（半行没丢）',
+    inc.readEvents().length === 6 && inc.readEvents().some((e) => e.id === 'ev_f'));
+
+  inc.markSynced([{ id: 'ev_d', epoch: 3, seq: 30 }]);
+  const syncedEv = inc.readEvents().find((e) => e.id === 'ev_d');
+  check('markSynced 就地补戳、不整份重读',
+    syncedEv?.seq === 30 && inc.stats().fullReads === 1,
+    JSON.stringify({ seq: syncedEv?.seq, ...inc.stats() }));
+
+  // 文件末尾没有换行（手工编辑 / 外部工具写出来的）：最后一条不能永久卡在 tail 里
+  const noEolLog = join(incDir, 'noeol.jsonl');
+  writeFileSync(noEolLog,
+    JSON.stringify({ id: 'ev_noeol', kind: 'msg', origin: 'self', text: 'x' }), 'utf8');
+  const noEol = createStore({
+    logPath: noEolLog,
+    seqFile: join(incDir, '.noeol-synced.json'),
+    rejectedFile: null,
+    origin: () => 'self',
+    nameOf: () => '我',
+    maxEventsOf: () => 5000,
+    localIso: () => new Date().toISOString(),
+  });
+  check('末尾缺换行时最后一条照样读得到',
+    noEol.readEvents().length === 1, String(noEol.readEvents().length));
+
+  console.log('\n12k. 裁剪按余量摊薄，不是每条都重写整份日志');
+  const trimLog = join(incDir, 'trim.jsonl');
+  const trim = createStore({
+    logPath: trimLog,
+    seqFile: join(incDir, '.trim-synced.json'),
+    rejectedFile: join(incDir, '.trim-rejected.json'),
+    origin: () => 'self',
+    nameOf: () => '我',
+    maxEventsOf: () => 10,
+    localIso: () => new Date().toISOString(),
+  });
+  for (let i = 0; i < 80; i += 1) trim.appendEvent({ kind: 'msg', text: `m${i}` });
+  const trimStats = trim.stats();
+  const trimEvents = trim.readEvents();
+  check('80 条追加只触发少量全量重写', trimStats.fullReads <= 5, JSON.stringify(trimStats));
+  check('追加路径不再有增量读（都走缓存）', trimStats.incrReads === 0, JSON.stringify(trimStats));
+  check('裁剪后不超过「上限 + 余量」', trimEvents.length <= 61, String(trimEvents.length));
+  check('最新一条还在（裁的是老的）', trimEvents[trimEvents.length - 1]?.text === 'm79',
+    String(trimEvents[trimEvents.length - 1]?.text));
+
+  rmSync(incDir, { recursive: true, force: true });
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }

@@ -44,7 +44,15 @@ export function readBody(req, limit = DEFAULT_BODY_LIMIT) {
       size += c.length;
       if (size > limit) {
         reject(Object.assign(new Error('请求体太大'), { httpStatus: 413, code: 'too-large' }));
-        req.destroy();
+        /**
+         * **不立刻 destroy**。以前这里直接 `req.destroy()` 把 socket 拆了，调用方紧接着
+         * 写的 413 根本发不出去 —— 客户端看到的是 ECONNRESET，分不清「网络断了」和
+         * 「自己发太大」。先停掉 data、把连接挂住，让 413 写完；1 秒后还没走就强制断。
+         */
+        req.pause();
+        req.removeAllListeners('data');
+        const t = setTimeout(() => { try { req.destroy(); } catch { /* 已经断了 */ } }, 1000);
+        if (typeof t.unref === 'function') t.unref();
         return;
       }
       chunks.push(c);

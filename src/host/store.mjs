@@ -9,10 +9,13 @@
  *   1. `events.jsonl` 只追加，**永不原地改**。回写会把整份日志变成断电即碎的半截文件。
  *   2. 同步状态（Hub 分的 epoch/seq）记在 sidecar `.synced.json` 里，
  *      读的时候补上；丢一条映射的代价是重推一遍，幂等兜住。
+ *   3. **读路径按字节偏移增量读**（0.11.2）。这条建立在上面两条上：只追加、不原地改，
+ *      读指针才敢往前推。谁要是在这里引入原地改写（修历史、压缩行），**必须同时调
+ *      `invalidate()`**，否则读到的还是旧内容 —— 缓存判断只认「变了多少字节」。
  *
  * @module dsh-collab-board/host/store
  */
-import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { hasSyncStamp, makeEventId } from './events.mjs';
 import { writeAtomic } from './http-util.mjs';
 
@@ -26,7 +29,18 @@ import { writeAtomic } from './http-util.mjs';
  * @param {()=>string} opts.localIso  时间戳格式
  */
 export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, maxEventsOf, localIso }) {
-  let cache = { mtime: -1, size: -1, events: [] };
+  /**
+   * 读缓存。`null` = 还没读过 / 被显式作废。
+   *
+   * 0.11.2 之前每次读都 `readFileSync` 整份日志，而 `appendEvent` 是
+   * 「追加 → 作废 → 再全量读」——**每写一条进度就把整份日志重读一遍**。
+   * 现在文件只往前长时只读新增那段（按字节偏移），变短才全量重来。
+   *
+   * `byId` 顺带解决 `appendEvent` 的同 id 去重（以前是 `all.some()`，同样 O(n)）。
+   */
+  let cache = null;
+  /** 只给测试和诊断看：全量读几次、增量读几次、读了多少字节。 */
+  const counters = { fullReads: 0, incrReads: 0, bytesRead: 0 };
 
   /** id → [epoch, seq]。推给 Hub 成功后回写，读日志时补上。 */
   let seqMap = {};
@@ -58,7 +72,7 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
     if (typeof id !== 'string' || id === '' || rejectedIds.has(id)) return;
     rejectedIds.add(id);
     persistRejected();
-    invalidate();
+    // 不用 invalidate：keptEvents() 每次现算拒绝集，缓存里的事件对象不动。
   }
 
   function persistSeqMap() {
@@ -67,38 +81,121 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
 
   /** 缓存作废。外部改动日志（清空、重建）之后必须调。 */
   function invalidate() {
-    cache = { mtime: -1, size: -1, events: [] };
+    cache = null;
   }
 
-  /** 读全量事件。坏行（并发写撕裂、半行）跳过，绝不让一行坏 JSON 弄死面板。 */
-  function readEvents() {
-    if (!existsSync(logPath)) return [];
-    let st;
-    try { st = statSync(logPath); } catch { return []; }
-    if (st.mtimeMs === cache.mtime && st.size === cache.size) return cache.events;
-    let text = '';
-    try { text = readFileSync(logPath, 'utf8'); } catch { return cache.events; }
-    const out = [];
-    for (const line of text.split(/\r?\n/)) {
-      const t = line.trim();
-      if (t === '') continue;
-      try {
-        const e = JSON.parse(t);
-        if (e && typeof e === 'object') out.push(e);
-      } catch { /* 半行，跳过 */ }
+  function emptyCache() {
+    return { readAt: -1, mtime: -1, events: [], tail: '', byId: new Map() };
+  }
+
+  /** 只读 [from, to) 这一段字节，不碰文件其它部分。 */
+  function readRange(from, to) {
+    const len = Math.max(0, to - from);
+    if (len <= 0) return '';
+    const fd = openSync(logPath, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(len);
+      let got = 0;
+      while (got < len) {
+        const n = readSync(fd, buf, got, len - got, from + got);
+        if (n <= 0) break;
+        got += n;
+      }
+      return buf.subarray(0, got).toString('utf8');
+    } finally {
+      closeSync(fd);
     }
-    for (const e of out) {
-      // 推给 Hub 成功后拿到的 (epoch, seq) 存在 sidecar 里，读的时候补上
-      const stamp = e && e.id && seqMap[e.id];
+  }
+
+  /**
+   * 拆行解析，返回**没写完的那半行**。
+   *
+   * 半行不能当场解析、更不能丢：留在 `cache.tail` 里等下次新数据拼上。
+   * 不这么做的话，一次读到半截 JSON 就永久少一条事件（并发写撕裂、别人正在追加）。
+   */
+  function absorb(text, into, byId) {
+    if (text === '') return '';
+    const lines = text.split('\n');
+    const last = lines.pop();
+    const take = (raw) => {
+      const line = raw.trim();
+      if (line === '') return false;
+      try {
+        const e = JSON.parse(line);
+        if (!e || typeof e !== 'object') return false;
+        into.push(e);
+        if (typeof e.id === 'string' && e.id !== '') byId.set(e.id, e);
+        return true;
+      } catch { return false; }
+    };
+    for (const raw of lines) take(raw);
+    /**
+     * 文件末尾没有换行时，最后一段先试着当完整事件收下。
+     *
+     * 两个场景要分开：
+     *   - 别人正在写（半行）：解析失败 → 留给下次拼，**不能丢**
+     *   - 文件本来就缺结尾换行（手工编辑 / 外部工具写出来的）：解析成功 → 收下，
+     *     不然它永远卡在 tail 里，那条事件永久不出现（比旧的全量读还差）
+     */
+    if (last !== '' && take(last)) return '';
+    return last;
+  }
+
+  /** 把 sidecar 里的 (epoch, seq) 补到还没有戳的事件上。 */
+  function applyStamps(list) {
+    for (const e of list) {
+      const stamp = e && e.id ? seqMap[e.id] : null;
       if (stamp && Array.isArray(stamp) && !hasSyncStamp(e)) {
         e.epoch = stamp[0];
         e.seq = stamp[1];
       }
     }
-    // 被 Hub 拒掉的不进视图：文件里保留原文（事实源不改），但看板/待同步/折叠都不该再看它
-    const kept = out.filter((e) => !(e && e.id && rejectedIds.has(e.id)));
-    cache = { mtime: st.mtimeMs, size: st.size, events: kept };
-    return kept;
+  }
+
+  /** 被 Hub 拒掉的不进视图：文件里保留原文（事实源不改），看板/待同步/折叠都不该再看它。 */
+  function keptEvents() {
+    if (!cache) return [];
+    return cache.events.filter((e) => !(e && e.id && rejectedIds.has(e.id)));
+  }
+
+  /**
+   * 读事件。
+   *
+   * 三条路径：
+   *   1. 文件没变（size + mtime 都对得上）→ 直接用缓存
+   *   2. 只变长了 → 只读新增的字节
+   *   3. 变短了（裁剪 / 清空 / 被替换）或没有缓存 → 全量重读
+   */
+  function readEvents() {
+    if (!existsSync(logPath)) {
+      cache = emptyCache();
+      return [];
+    }
+    let st;
+    try { st = statSync(logPath); } catch { return keptEvents(); }
+
+    if (cache && st.size === cache.readAt && st.mtimeMs === cache.mtime) return keptEvents();
+    if (!cache) cache = emptyCache();
+
+    if (cache.readAt >= 0 && st.size > cache.readAt) {
+      const text = readRange(cache.readAt, st.size);
+      counters.incrReads += 1;
+      counters.bytesRead += st.size - cache.readAt;
+      cache.tail = absorb(cache.tail + text, cache.events, cache.byId);
+      cache.readAt = st.size;
+      cache.mtime = st.mtimeMs;
+    } else {
+      let text = '';
+      try { text = readFileSync(logPath, 'utf8'); } catch { return keptEvents(); }
+      counters.fullReads += 1;
+      counters.bytesRead += Buffer.byteLength(text, 'utf8');
+      cache = emptyCache();
+      cache.tail = absorb(text, cache.events, cache.byId);
+      cache.readAt = st.size;
+      cache.mtime = st.mtimeMs;
+    }
+    applyStamps(cache.events);
+    return keptEvents();
   }
 
   /**
@@ -114,8 +211,8 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
    * 老数据（0.1.0）反过来把任务 id 放在 `id` 里，面板那边已经兼容，这里不迁就。
    */
   function appendEvent(ev, opts = {}) {
-    const all = readEvents();
-    if (ev && ev.id && all.some((e) => e.id === ev.id)) return ev;
+    readEvents(); // 保证 cache 建好（顺带补戳）
+    if (ev && ev.id && cache && cache.byId.has(ev.id)) return ev;
 
     let stamped = ev;
     if (!opts.raw) {
@@ -130,12 +227,34 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
       if (!stamped.ts) stamped.ts = localIso();
     }
 
-    appendFileSync(logPath, JSON.stringify(stamped) + '\n', 'utf8');
-    invalidate();
-    const after = readEvents();
-    const limit = maxEventsOf();
-    if (after.length > limit) {
-      const kept = after.slice(-limit);
+    const line = JSON.stringify(stamped) + '\n';
+    appendFileSync(logPath, line, 'utf8');
+    /**
+     * 追加后**不重读**：这条就是我们刚写的，直接并进缓存并把读指针推过去。
+     * 以前这里 invalidate + readEvents，等于每写一条就把整份日志读一遍。
+     */
+    if (cache) {
+      cache.events.push(stamped);
+      if (typeof stamped.id === 'string' && stamped.id !== '') cache.byId.set(stamped.id, stamped);
+      // 用文件真实长度对齐读指针，别拿 -1（「还没读过」）去加字节数 —— 那样会永久错位 1 字节
+      try {
+        const st = statSync(logPath);
+        cache.readAt = st.size;
+        cache.mtime = st.mtimeMs;
+      } catch { /* 拿不到就让下次自己发现 */ }
+    }
+
+    /**
+     * 裁剪：**超过上限 + 余量**才做一次，一次裁回上限。
+     *
+     * 以前是「只要超过上限 1 条就全量重写」—— 到了上限之后，每写一条进度都要把
+     * 整份日志重写一遍（`maxEvents` 默认 5000，约 3~4 MB），而且裁剪窗口里断电
+     * 还多一次风险。按 `limit × 0.15`（至少 50 条）的余量摊薄，触发频率降到 1/50 左右。
+     */
+    const limit = Math.max(1, maxEventsOf());
+    const slack = Math.max(50, Math.ceil(limit * 0.15));
+    if (cache && cache.events.length > limit + slack) {
+      const kept = cache.events.slice(-limit);
       /**
        * 裁剪用**原子写**（tmp + rename）。
        *
@@ -173,11 +292,21 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
       if (Number.isFinite(row.epoch) && Number.isFinite(row.seq)) {
         seqMap[row.id] = [row.epoch, row.seq];
         dirty = true;
+        /**
+         * 缓存里那条要是已经在，就地把戳补上。
+         *
+         * 以前这里 `invalidate()` 整份重读：推送一轮就把日志全量读一遍，
+         * 刚做的增量读白干。对象是同一个引用，补完面板立刻能看到。
+         */
+        const hit = cache && cache.byId.get(row.id);
+        if (hit && !hasSyncStamp(hit)) {
+          hit.epoch = row.epoch;
+          hit.seq = row.seq;
+        }
       }
     }
     if (dirty) {
       persistSeqMap();
-      invalidate();
     }
   }
 
@@ -204,5 +333,13 @@ export function createStore({ logPath, seqFile, rejectedFile, origin, nameOf, ma
     return { epoch, seq };
   }
 
-  return { readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate, markSynced, markRejected, maxSynced };
+  /** 读路径计数（测试 / 诊断用）——「增量读」到底有没有生效看这里。 */
+  function stats() {
+    return { ...counters, cached: cache ? cache.events.length : 0, tail: cache ? cache.tail.length : 0 };
+  }
+
+  return {
+    readEvents, appendEvent, pendingEvents, persistSeqMap, invalidate,
+    markSynced, markRejected, maxSynced, stats,
+  };
 }

@@ -19,6 +19,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { createSocket } from 'node:dgram';
 import { startHub, leaseEndAt, leaseRenewAt } from '../src/host/hub.mjs';
 import { broadcastTargets, signPacket, createHubWatch, createDiscovery } from '../src/host/discovery.mjs';
 
@@ -1048,6 +1049,98 @@ async function main() {
   check('msg.to 数组里有坏值 → 400', toBad.status === 400 && toBad.error.code === 'bad-param');
   await reasonHub.controller.close();
   rmSync(reasonDir, { recursive: true, force: true });
+
+  console.log('\n11. /join 失败限流（0.11.2）');
+  const rlDir = dir();
+  const rlHub = await startHub({
+    dir: rlDir,
+    groupId: GROUP,
+    origin: ORIGIN_A,
+    port: 0,
+    code: 'LOVE',
+    noDiscovery: true,
+    joinRateLimit: { maxFailures: 5, baseDelayMs: 1500, maxDelayMs: 5000 },
+    log: () => {},
+  });
+  const rlBase = `http://127.0.0.1:${rlHub.info.port}`;
+  const wrongJoin = () => call(rlBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'NOPE' },
+  });
+  let wrong = null;
+  for (let i = 0; i < 4; i += 1) wrong = await wrongJoin();
+  check('前 4 次只回 401，不带退避', wrong.status === 401 && !wrong.error?.retryAfterMs,
+    JSON.stringify(wrong.error));
+  const fifth = await wrongJoin();
+  check('第 5 次开始退避（仍回 401，带 retryAfterMs）',
+    fifth.status === 401 && Number(fifth.error?.retryAfterMs) > 0, JSON.stringify(fifth.error));
+  const blocked = await wrongJoin();
+  check('第 6 次直接 429', blocked.status === 429 && blocked.error?.code === 'too-many-requests',
+    JSON.stringify(blocked.error));
+  const blockedRight = await call(rlBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE' },
+  });
+  check('退避期内连对口令也拒（不给爆破免费的 oracle）',
+    blockedRight.status === 429, JSON.stringify(blockedRight.error));
+  await new Promise((r) => setTimeout(r, 1700));
+  const afterWait = await call(rlBase, '/join', {
+    method: 'POST',
+    body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE' },
+  });
+  check('退避过后正确口令能进', afterWait.ok === true && Boolean(afterWait.data?.token),
+    JSON.stringify(afterWait.error));
+  const rlToken = afterWait.data?.token || '';
+  // 成功清零：再连错 4 次仍然只是 401 —— 别让正常成员背着之前的失败计数
+  let cleared = null;
+  for (let i = 0; i < 4; i += 1) cleared = await wrongJoin();
+  check('成功一次后计数清零（再错 4 次仍只是 401）',
+    cleared.status === 401 && !cleared.error?.retryAfterMs, JSON.stringify(cleared.error));
+
+  console.log('\n12. 请求体超限（413）');
+  const hugeBody = { events: [], pad: 'x'.repeat(1400 * 1024) };
+  const tooBig = await call(rlBase, '/events', { method: 'POST', token: rlToken, body: hugeBody });
+  check('超限回 413（不是无声断连接）', tooBig.status === 413 && tooBig.error?.code === 'too-large',
+    JSON.stringify(tooBig.status) + ' ' + JSON.stringify(tooBig.error));
+  const aliveAfter = await call(rlBase, '/info');
+  check('413 之后 Hub 还活着', aliveAfter.ok === true);
+  await rlHub.controller.close();
+  rmSync(rlDir, { recursive: true, force: true });
+
+  console.log('\n13. UDP 广播验签：伪造包丢弃');
+  const recvAuth = await createDiscovery({
+    groupId: GROUP, origin: 'c'.repeat(16), code: 'LOVE', discoveryPort: 0, quiet: true, log: () => {},
+  });
+  const recvOpen = await createDiscovery({
+    groupId: GROUP, origin: 'c'.repeat(16), code: '', discoveryPort: 0, quiet: true, log: () => {},
+  });
+  const fakeSock = createSocket({ type: 'udp4' });
+  const sendPkt = (port, obj) => new Promise((resolve, reject) => {
+    const buf = Buffer.from(JSON.stringify(obj), 'utf8');
+    fakeSock.send(buf, 0, buf.length, port, '127.0.0.1', (e) => (e ? reject(e) : resolve()));
+  });
+  const spoofOrigin = 'f'.repeat(16);
+  const basePkt = {
+    t: 'hub', wireProtocol: 1, groupId: GROUP, origin: spoofOrigin,
+    name: '伪造 Hub', port: 48910, needCode: true, epoch: 1,
+  };
+  await sendPkt(recvAuth.port, { ...basePkt, hmac: 'deadbeefdeadbeef' });
+  await new Promise((r) => setTimeout(r, 200));
+  check('错签名的广播不进 peers（有口令时）', recvAuth.allPeers().length === 0,
+    JSON.stringify(recvAuth.allPeers()));
+  const goodSig = signPacket('LOVE', { groupId: GROUP, origin: spoofOrigin, port: 48910, epoch: 1 });
+  await sendPkt(recvAuth.port, { ...basePkt, hmac: goodSig });
+  await new Promise((r) => setTimeout(r, 200));
+  check('正确签名的广播能收到',
+    recvAuth.allPeers().length === 1 && recvAuth.allPeers()[0].origin === spoofOrigin,
+    JSON.stringify(recvAuth.allPeers()));
+  await sendPkt(recvOpen.port, { ...basePkt, origin: 'a'.repeat(16) });
+  await new Promise((r) => setTimeout(r, 200));
+  check('无口令时不验签 —— 已知边界，钉住它（别哪天顺手补个默认口令）',
+    recvOpen.allPeers().length === 1, JSON.stringify(recvOpen.allPeers()));
+  await recvAuth.close();
+  await recvOpen.close();
+  fakeSock.close();
 
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   if (fail > 0) process.exitCode = 1;

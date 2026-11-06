@@ -32,6 +32,7 @@ import {
 import { SYSTEM_ORIGIN, isOrigin } from './identity.mjs';
 import { createDiscovery, createHubWatch } from './discovery.mjs';
 import { json, readBody, writeAtomic } from './http-util.mjs';
+import { createJoinLimiter, clientKey } from './ratelimit.mjs';
 import { ownerTransitionError, isTaskActivity } from './selectable.mjs';
 import { verifyHubCode } from './settings.mjs';
 
@@ -95,6 +96,7 @@ function ok(res, data) {
  * @param {string} [opts.name]     Hub 显示名
  * @param {number} [opts.port]     48910；0 = 系统分配
  * @param {string} [opts.code]     口令；空 = 不设口令
+ * @param {object} [opts.joinRateLimit] `/join` 失败限流参数（见 ratelimit.mjs）
  * @param {(level:string,msg:string)=>void} [opts.log]
  * @returns {Promise<{info: object, controller: object}>}
  */
@@ -104,6 +106,14 @@ export async function startHub(opts = {}) {
   const selfOrigin = String(opts.origin || '');
   const code = typeof opts.code === 'string' ? opts.code : '';
   const log = typeof opts.log === 'function' ? opts.log : () => {};
+  /**
+   * `/join` 失败限流（0.11.2）。
+   *
+   * `/join` 是唯一不要 token 的写入口，也就是唯一的外部攻击面。之前口令错了就回 401、
+   * 不计数 —— 局域网内一个脚本每秒上千次尝试，4~6 位口令几分钟见底。
+   * 取舍（退避期内连对口令也拒、不永久封禁）写在 `ratelimit.mjs` 的模块注释里。
+   */
+  const joinLimit = createJoinLimiter(opts.joinRateLimit || {});
   /**
    * 租约扫描间隔。默认 30 秒；测试里传小值，不然验一次「到期释放」要等半分钟。
    * 调小只影响判断频率，不改变租约时长本身。
@@ -915,6 +925,17 @@ export async function startHub(opts = {}) {
 
     if (path === '/collab/v1/join' || path === '/join') {
       if (method !== 'POST') return fail(res, 405, 'bad-param', 'method');
+      /**
+       * 限流判在**读请求体之前**：退避期里连 body 都不读，省的是自己的 CPU。
+       * 而且这里不能「先比对口令、错了才退避」—— 那等于给爆破一个免费的 oracle。
+       */
+      const peer = clientKey(req);
+      const wait = joinLimit.waitMs(peer);
+      if (wait > 0) {
+        const secs = Math.max(1, Math.ceil(wait / 1000));
+        res.setHeader('retry-after', String(secs));
+        return fail(res, 429, 'too-many-requests', `口令尝试过快，${secs} 秒后再试`, { retryAfterMs: wait });
+      }
       let body;
       try {
         body = await readBody(req);
@@ -930,8 +951,17 @@ export async function startHub(opts = {}) {
        * 升级前的明文存储。盐是本组 groupId —— 两台机器算出来必须一样。
        */
       if (code !== '' && !verifyHubCode(code, String(body.code || ''), groupId)) {
+        // 第 5 次错之后开始退避；这次仍然回 401（告诉对方口令错了），但带上 retryAfter。
+        const delay = joinLimit.fail(peer);
+        if (delay > 0) {
+          const secs = Math.max(1, Math.ceil(delay / 1000));
+          res.setHeader('retry-after', String(secs));
+          return fail(res, 401, 'bad-code', '口令不对', { retryAfterMs: delay });
+        }
         return fail(res, 401, 'bad-code', '口令不对');
       }
+      // 口令对了就清零：正常成员永远不该背着之前的失败计数
+      joinLimit.ok(peer);
       const origin = String(body.origin || '');
       if (!/^[0-9a-f]{16}$/.test(origin)) {
         return fail(res, 400, 'bad-param', 'origin 要 16 位小写十六进制', { field: 'origin' });
