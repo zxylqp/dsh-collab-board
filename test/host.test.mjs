@@ -12,9 +12,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
 import { createDelivery } from '../src/host/delivery.mjs';
-import { shouldWake, maxSeenOf, newerSeen } from '../src/host/wake.mjs';
+import { shouldWake, maxSeenOf, newerSeen, resumeSeq } from '../src/host/wake.mjs';
 import { createStore } from '../src/host/store.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
+import { noteTaskIdOf } from '../src/host/events.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -697,9 +698,61 @@ async function main() {
     verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231, to: selfOrigin }).wake === true);
   check('没写 to 的老消息照旧叫',
     verdict({ kind: 'msg', origin: 'other', epoch: 1, seq: 231 }).wake === true);
+
+  /* note 属于哪张卡（0.11.5）：动态流过滤和「自动认领只写一条」都靠它 */
+  console.log('  · noteTaskIdOf');
+  check('有 taskId 字段就直接用（不看文案）',
+    noteTaskIdOf({ taskId: 'card1' }, '随便什么话') === 'card1',
+    noteTaskIdOf({ taskId: 'card1' }, '随便什么话'));
+  check('自动认领文案 → 反解出卡号',
+    noteTaskIdOf({}, '自动认领：r9-wake R9 唤醒实测') === 'r9-wake',
+    noteTaskIdOf({}, '自动认领：r9-wake R9 唤醒实测'));
+  check('被 Hub 拒的文案 → 反解出卡号',
+    noteTaskIdOf({}, '一条事件被 Hub 拒了（task t-f5k1v0i）：x') === 't-f5k1v0i',
+    noteTaskIdOf({}, '一条事件被 Hub 拒了（task t-f5k1v0i）：x'));
+  check('全局提示认不出来 → 空串（宁可留着，不猜）',
+    noteTaskIdOf({}, '补回 1 条历史消息（seq 不大于本机已见），未唤醒 agent。') === '',
+    noteTaskIdOf({}, '补回 1 条历史消息（seq 不大于本机已见），未唤醒 agent。'));
+  check('不是我们生成的文案 → 空串（不按人影猜）',
+    noteTaskIdOf({}, '关于 t-iichr4w 的一点想法') === '',
+    noteTaskIdOf({}, '关于 t-iichr4w 的一点想法'));
+
   check('maxSeenOf 取 (epoch, seq) 字典序最大',
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }, { id: 'x' }])) === '{"epoch":2,"seq":3}',
     JSON.stringify(maxSeenOf([{ epoch: 1, seq: 900 }, { epoch: 2, seq: 3 }])));
+
+  /* 重连起点（0.11.5）：本机日志有断层就从 0 重拉，别拿 max 把缺口永久跳过 */
+  console.log('  · resumeSeq');
+  const seqEv = (n) => ({ epoch: 1, seq: n, id: `ev_${n}` });
+  check('日志连续 → 从本机最大 seq 往后拉（不重放历史）',
+    resumeSeq([seqEv(8), seqEv(9), seqEv(10)], { epoch: 1, seq: 10 }) === 10,
+    String(resumeSeq([seqEv(8), seqEv(9), seqEv(10)], { epoch: 1, seq: 10 })));
+  check('日志有断层 → 从 0 重拉（缺口不再永久跳过）',
+    resumeSeq([seqEv(2), seqEv(3), seqEv(44), seqEv(122), seqEv(316)], { epoch: 1, seq: 316 }) === 0,
+    String(resumeSeq([seqEv(2), seqEv(3), seqEv(44), seqEv(122), seqEv(316)], { epoch: 1, seq: 316 })));
+  check('sidecar 比日志新、但日志连续 → 用 sidecar 的（已同步过的不重放）',
+    resumeSeq([seqEv(8), seqEv(9)], { epoch: 1, seq: 20 }) === 20,
+    String(resumeSeq([seqEv(8), seqEv(9)], { epoch: 1, seq: 20 })));
+  check('没同步过任何一条 → 用 sidecar',
+    resumeSeq([], { epoch: 2, seq: 77 }) === 77,
+    String(resumeSeq([], { epoch: 2, seq: 77 })));
+  check('只有一条 seq → 谈不上断层，照常增量',
+    resumeSeq([seqEv(50)], { epoch: 1, seq: 50 }) === 50,
+    String(resumeSeq([seqEv(50)], { epoch: 1, seq: 50 })));
+  check('旧 epoch 的断层不算（跨 epoch 的 seq 不可比）',
+    resumeSeq([
+      { epoch: 1, seq: 5, id: 'a' },
+      { epoch: 1, seq: 40, id: 'b' },
+      { epoch: 2, seq: 1, id: 'c' },
+      { epoch: 2, seq: 2, id: 'd' },
+    ], { epoch: 2, seq: 2 }) === 2,
+    String(resumeSeq([
+      { epoch: 1, seq: 5, id: 'a' },
+      { epoch: 1, seq: 40, id: 'b' },
+      { epoch: 2, seq: 1, id: 'c' },
+      { epoch: 2, seq: 2, id: 'd' },
+    ], { epoch: 2, seq: 2 })));
+
 
   /* ───────────────────── 视图源（0.11.3） ───────────────────── */
 

@@ -1060,6 +1060,19 @@ export async function startHub(opts = {}) {
           if (ev.kind === 'task' && !isTombstone) {
             const creator = creators.get(ev.taskId);
             const prevTask = folded.get(ev.taskId);
+            /**
+             * 卡已经被删了（0.11.5）：**任何后续 task 事件一律拒**，并说清是「已删除」。
+             *
+             * 以前这条落到下面的「改标题」检查上，报的是「别的成员不能改标题/描述/依赖」——
+             * 方向完全反了：不是权限问题，是这张卡已经不在。更要紧的是**不能放行**：
+             * `applyIndex` 是 `{...prevF, ...ev}`，一旦放进来，`title`/`detail` 会把
+             * 墓碑擦空的正文字段当场复活 —— 删除就白删了。
+             */
+            if (prevTask && prevTask.deleted === true) {
+              return fail(res, 409, 'conflict',
+                `任务 ${ev.taskId} 已删除（墓碑），不能再写；要接着做就新建一张卡`,
+                { field: 'taskId' });
+            }
             if (prevTask && creator && ev.origin !== creator) {
               // detail 只比「有内容的变更」：validateBatch 会把缺省字段归一成空串，
               // 认领 / 完成这类事件本来就不带 detail，空串 ≠ 改描述。

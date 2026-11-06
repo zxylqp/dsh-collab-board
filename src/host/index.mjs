@@ -75,8 +75,8 @@ import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
 import { createSettings, hashCode, isHashedCode, publicSettings } from './settings.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
-import { shouldWake, maxSeenOf, newerSeen, directedAway, WAKE_SKIP } from './wake.mjs';
-import { validateEvent } from './events.mjs';
+import { shouldWake, maxSeenOf, newerSeen, resumeSeq, directedAway, WAKE_SKIP } from './wake.mjs';
+import { validateEvent, noteTaskIdOf } from './events.mjs';
 
 export function apply(ctx, rawConfig = {}) {
   const cfg = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
@@ -595,6 +595,27 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * 重连时从哪个 seq 往后拉（0.11.5）。
+   *
+   * 老规矩是「本机最大 seq 和 sidecar 取大」，为的是别把同步过的历史再拉一遍。
+   * 毛病在于它只看**最大值**，看不见「中间缺了一段」：本机日志被清过
+   * （`DELETE /events` 只留 member 事件）之后，本机最大 seq 还是 316，于是永远
+   * 从 316 往后拉 —— 4–307 再也没人要过，缺口一形成就永久存在。
+   *
+   * 0.11.3 让 Hub 那台改读 Hub 全量绕过了它，但**成员机器没有全量可读**，
+   * 同一个洞在那边照旧：已删的卡还当成活的显示，而且看不出来少了什么。
+   * 判据和取舍写在 wake.mjs 的 `resumeSeq`。
+   */
+  function resumeSince() {
+    const events = readEvents();
+    const seq = resumeSeq(events, store.maxSynced());
+    if (seq === 0) {
+      hubLog('warn', `本机日志 seq 有断层（${events.length} 条），从 0 重拉一遍补缺`);
+    }
+    return seq;
+  }
+
+  /**
    * 挂一个 Hub 客户端。Hub 本机也走这条 —— **同步**一条路径，不分支。
    *
    * 注意「同步一条路径」不等于「读视图也只能读本机日志」：本机日志是这条增量路径的
@@ -611,8 +632,8 @@ export function apply(ctx, rawConfig = {}) {
       name: displayName(),
             code: code || '',
       // 本机见过的最大 seq：重连只拉增量，不从 0 回放历史。
-      // 同样要和 sidecar 取大 —— 只用日志的话，日志裁过就会把已经同步过的历史再拉一遍。
-      startSince: newerSeen(maxSeenOf(readEvents()), store.maxSynced()).seq,
+      // 但**日志有断层时例外**（0.11.5）—— 取 max 会永远跳过缺口，见 resumeSince。
+      startSince: resumeSince(),
       pending: pendingEvents,
       onPushed,
       onEvents: onPulled,
@@ -2022,6 +2043,26 @@ export function apply(ctx, rawConfig = {}) {
    */
   const autoTried = new Set();
 
+  /**
+   * 这张卡是不是已经有一条「自动认领」提示了（0.11.5）。
+   *
+   * 以前每认领一次写一条 —— 租约到期 → 卡退回待认领 → 又认领 → 又一条。
+   * 真机上 18 张卡攒出 42 条这种 note，把动态流整屏刷满，全是一模一样的字。
+   * 一张卡只留一条就够：状态看卡片本身，这里只需要「被谁接走了」这一个事实。
+   *
+   * 直接查事件流、不另存状态：重启后来认、重连后再认，判据都一样。
+   * 老 note 没有 `taskId` 字段，按固定文案前缀反解（和客户端的 `noteTaskIdOf` 同一套规则）。
+   */
+  function hasAutoClaimNote(taskId) {
+    for (const e of viewEvents()) {
+      if (!e || e.kind !== 'note') continue;
+      const text = String(e.text || '');
+      if (!text.startsWith('自动认领')) continue;
+      if (noteTaskIdOf(e, text) === taskId) return true;
+    }
+    return false;
+  }
+
   function pickClaimable(events) {
     // 判据只有一份，在 selectable.mjs。这里只加「这轮已经试过就别再试」。
     const list = claimableOnly(events, {
@@ -2054,13 +2095,16 @@ export function apply(ctx, rawConfig = {}) {
           try {
             await claimTask(task.taskId, {});
             autoTried.add(task.taskId);
-            const note = buildEvent({
-              kind: 'note',
-              text: `自动认领：${task.taskId} ${task.title}`,
-              level: 'info',
-              taskId: task.taskId,
-            });
-            if (note) appendEvent(note);
+            // 一张卡只写一条（0.11.5）：租约到期再认、重连再认，都别重复刷
+            if (!hasAutoClaimNote(task.taskId)) {
+              const note = buildEvent({
+                kind: 'note',
+                text: `自动认领：${task.taskId} ${task.title}`,
+                level: 'info',
+                taskId: task.taskId,
+              });
+              if (note) appendEvent(note);
+            }
             hubLog('info', `自动认领 ${task.taskId}`);
           } catch (e) {
             autoTried.add(task.taskId);

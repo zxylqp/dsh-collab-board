@@ -125,3 +125,33 @@ export function newerSeen(a, b) {
   if (be < ae) return { epoch: ae, seq: as };
   return { epoch: ae, seq: Math.max(as, bs) };
 }
+
+/**
+ * 重连时该从哪个 seq 往后拉（0.11.5）。
+ *
+ * `newerSeen` 只看**最大值**，看不见「中间缺了一段」：本机日志被清过之后
+ * （`DELETE /events` 只留 member 事件），本机最大 seq 还是 316，于是永远从
+ * 316 往后拉 —— 4–307 再也没人要过，缺口一形成就永久存在。2026-11-06 真机
+ * 就是这样：本机 16 条、Hub 313 条、140 条 task 事件全在缺口里，任务列表空白。
+ *
+ * 判据是「本机日志的 seq 连不连续」。健康的日志按 seq 递增追加（裁剪只从**头部**删），
+ * 所以一定是一段连续区间；出现断层就说明中间丢了，只能从 0 重拉一遍。
+ *
+ * 重拉不会出事：落盘按 id 去重（`appendEvent`），唤醒按 (epoch, seq) 判历史
+ * （`shouldWake`），不大于本机已见的一律不叫醒。
+ *
+ * @returns {number} 0 = 从头拉；否则本机已见的最大 seq
+ */
+export function resumeSeq(events, synced) {
+  const newest = newerSeen(maxSeenOf(events), synced).seq;
+  const local = maxSeenOf(events);
+  if (!Number.isFinite(local.seq) || local.seq <= 0) return newest; // 一条都没同步过
+  const seqs = [...new Set(
+    (Array.isArray(events) ? events : [])
+      .filter((e) => e && e.epoch === local.epoch && Number.isFinite(e.seq) && e.seq > 0)
+      .map((e) => e.seq),
+  )].sort((a, b) => a - b);
+  if (seqs.length < 2) return newest; // 只有一条，谈不上断层
+  const contiguous = seqs[seqs.length - 1] - seqs[0] === seqs.length - 1;
+  return contiguous ? newest : 0;
+}

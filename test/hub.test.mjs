@@ -680,6 +680,41 @@ async function main() {
   });
   check('已删除的卡拒绝认领', claimDeleted.status === 409, JSON.stringify(claimDeleted.error));
 
+  /**
+   * 墓碑之后写普通 task 事件（0.11.5）。
+   *
+   * 以前这条落到「非创建者不能改标题」检查上，报 409 说「别的成员不能改标题/描述/依赖」
+   * —— 方向反了：根本不是权限问题。更危险的是**放行也不行**：`applyIndex` 是
+   * `{...prevF, ...ev}`，放进来正文就当场复活。所以现在明确回「已删除」。
+   */
+  const writeToTomb = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_tomb_after_00001',
+        origin: ORIGIN_B,
+        name: 'B',
+        ts: new Date().toISOString(),
+        kind: 'task',
+        taskId: 't-tomb',
+        title: '想把正文写回来',
+        status: 'pending',
+      }],
+    },
+  });
+  check('墓碑之后写普通 task 事件被拒', writeToTomb.ok === false && writeToTomb.status === 409,
+    JSON.stringify(writeToTomb.error));
+  check('拒的理由是「已删除」，不是「不能改标题」',
+    /已删除/.test(String(writeToTomb.error?.message || writeToTomb.error || '')),
+    JSON.stringify(writeToTomb.error));
+  const tombStillEmpty = await call(base, '/events?since=0&limit=500', { token: tokenA });
+  const tombAfter = (tombStillEmpty.data.events || []).filter((e) => e.taskId === 't-tomb');
+  check('正文没被写回来（仍然是空壳）',
+    tombAfter.every((e) => !String(e.title || '').includes('想把正文写回来')),
+    JSON.stringify(tombAfter.map((e) => e.title)));
+
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;
   const beforeEpoch = hub.controller.info().epoch;

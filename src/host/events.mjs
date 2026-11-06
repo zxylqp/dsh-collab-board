@@ -347,3 +347,28 @@ export function stampLocal(ev, { origin, name, now = new Date() }) {
     ...ev,
   };
 }
+
+/**
+ * 一条 note 说的是哪张卡（0.11.5）。返回空串 = 全局提示，不属于任何卡。
+ *
+ * 为什么要它：动态流要按「挂在已删卡上的提示跟着卡一起消失」过滤，自动认领要
+ * 「一张卡只写一条提示」—— 两处都得先知道这条 note 属于谁。
+ *
+ * 判据分两档，原则是**认不出来就当全局**：宁可多留一条，也不能猜错卡，
+ * 把不相干的记录一起藏掉。
+ *   1. 读字段：0.11.5 起插件写提示会带 `taskId`
+ *   2. 读文案：老数据没字段，只能反解 —— **只认我们自己生成的那两种格式**，
+ *      格式由生成端保证（index.mjs 的「自动认领：」和「一条事件被 Hub 拒了（task …）」）。
+ *      客户端有一份同样的实现（src/client/index.js 的 `noteTaskIdOf`），改格式要一起改。
+ */
+export function noteTaskIdOf(ev, text) {
+  const direct = typeof (ev && ev.taskId) === 'string' ? ev.taskId.trim()
+    : (typeof (ev && ev.task) === 'string' ? ev.task.trim() : '');
+  if (direct) return direct;
+  const src = typeof text === 'string' ? text : String(text == null ? '' : text);
+  const auto = /^自动认领：(\S+)/.exec(src);
+  if (auto) return auto[1];
+  const rejected = /被 Hub 拒了（task (\S+?)）/.exec(src);
+  if (rejected) return rejected[1];
+  return '';
+}
