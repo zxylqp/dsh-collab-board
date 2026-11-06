@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 25;
-    const VERSION = '0.10.15';
+    const VERSION = '0.10.16';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1921,7 +1921,9 @@ window.__ModuleLoader__.load({
     /* ────────────────────────────── 成员与连接 ────────────────────────────── */
 
     function MembersView(props) {
-      const { model, settings, caps, me, toast, onCopy } = props;
+      // presence 必须在这儿解构：它是父组件用 useState 管着的在线态，
+      // 0.10.13 往 props 里传了却忘了接，点「成员」直接 ReferenceError。
+      const { model, settings, caps, me, toast, onCopy, presence } = props;
       /** 宿主回报的 Hub 运行态（`GET /hub`）。跟事件流里那张 `hub` 卡片不是一回事。 */
       const runtime = props.runtime || null;
       const onHubAction = props.onHubAction;

@@ -64,6 +64,14 @@ if (CHECK_ONLY) { say('\n检查通过。'); process.exit(0); }
 
 /* ── 2. 测试 ── */
 
+// 客户端没有测试，至少先保证它语法是通的（VERSION 常量就在这个文件里）
+try {
+  execFileSync(process.execPath, ['--check', join(ROOT, 'src', 'client', 'index.js')], { stdio: 'pipe' });
+  say('  · 客户端语法检查通过');
+} catch (e) {
+  die(`客户端语法错误：\n${e.stderr || e.message}`);
+}
+
 if (!SKIP_TESTS) {
   for (const [name, file] of [['hub', 'test/hub.test.mjs'], ['host', 'test/host.test.mjs']]) {
     let out;
