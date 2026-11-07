@@ -1118,6 +1118,34 @@ export async function startHub(opts = {}) {
               }
             }
           }
+          /**
+           * done 只许 owner 或创建者写（0.11.11）。
+           *
+           * 以前谁都能标：done 事件不带 owner 时会被继承成当前 owner（等于没改），
+           * 于是绕过了 owner 校验 —— 别人的活也能被别人收尾。现在明确拦。
+           * 已 done 的卡重复标放行（幂等重发不该 403）。
+           * owner 和 creator 都推不出来（日志裁过）时放行：宁可不拦，也不让卡卡死。
+           */
+          if (ev.kind === 'task' && !isTombstone && ev.status === 'done') {
+            const prevDone = tasks.get(ev.taskId);
+            const wasDone = Boolean(prevDone) && prevDone.status === 'done';
+            if (prevDone && !wasDone) {
+              const ownerNow = prevDone.owner || '';
+              const creatorNow = creators.get(ev.taskId) || '';
+              const allowed = !ownerNow && !creatorNow
+                ? true
+                : (me.origin === ownerNow || me.origin === creatorNow);
+              if (!allowed) {
+                const ownerName = ownerNow
+                  ? ([...members.values()].find((m) => m.origin === ownerNow)?.name || `${ownerNow.slice(0, 6)}…`)
+                  : '无人认领';
+                return fail(res, 403, 'forbidden',
+                  `只有任务负责人或创建者能标完成（当前负责人：${ownerName}）；`
+                  + '要收尾让负责人自己标，或者先走 /tasks/claim 接过来',
+                  { field: 'status' });
+              }
+            }
+          }
           // owner 迁移：普通写路径不许抢别人已认领的卡（CAS 的补口）。墓碑同理豁免。
           if (ev.kind === 'task' && !isTombstone) {
             const blocked = checkOwnerWrite(ev, me.origin);

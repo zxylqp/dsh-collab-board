@@ -499,6 +499,72 @@ async function main() {
       && fullDone.priority === 'high',
     JSON.stringify({ detail: fullDone?.detail, tags: fullDone?.tags, priority: fullDone?.priority }));
 
+  console.log('\n5d3. done 只许 owner 或创建者写（0.11.11）');
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_perm00001_aaa',
+        origin: ORIGIN_A, kind: 'task', taskId: 'perm1', title: '完成权限卡', status: 'pending',
+      }],
+    },
+  });
+  await call(base, '/tasks/claim', { method: 'POST', token: tokenB, body: { taskId: 'perm1' } });
+
+  // C 既不是 owner（B）也不是创建者（A）→ 拒
+  const doneByC = await call(base, '/events', {
+    method: 'POST',
+    token: tokenC,
+    body: {
+      events: [{
+        id: 'ev_cccccc_perm00002_ccc',
+        origin: ORIGIN_C, kind: 'task', taskId: 'perm1', title: '完成权限卡', status: 'done',
+      }],
+    },
+  });
+  check('C 替别人标 done → 403 forbidden',
+    doneByC.status === 403 && doneByC.error.code === 'forbidden',
+    JSON.stringify(doneByC.error || doneByC));
+  check('403 指向 status 字段', doneByC.error?.field === 'status');
+
+  const doneByOwner = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_perm00003_bbb',
+        origin: ORIGIN_B, kind: 'task', taskId: 'perm1', title: '完成权限卡', status: 'done',
+      }],
+    },
+  });
+  check('owner B 标 done → 放行', doneByOwner.ok === true, JSON.stringify(doneByOwner.error));
+
+  // 创建者也可以替自己派的活收尾
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_perm00004_bbb',
+        origin: ORIGIN_B, kind: 'task', taskId: 'perm2', title: 'B 建的卡', status: 'pending',
+      }],
+    },
+  });
+  await call(base, '/tasks/claim', { method: 'POST', token: tokenA, body: { taskId: 'perm2' } });
+  const doneByCreator = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_perm00005_bbb',
+        origin: ORIGIN_B, kind: 'task', taskId: 'perm2', title: 'B 建的卡', status: 'done',
+      }],
+    },
+  });
+  check('创建者 B 标 A 的卡 done → 放行（创建者有权收自己的活）',
+    doneByCreator.ok === true, JSON.stringify(doneByCreator.error));
+
   console.log('\n5b. 身份撞号：taskId 归创建者');
   const mkOwn2 = await call(base, '/events', {
     method: 'POST',
@@ -550,7 +616,25 @@ async function main() {
       }],
     },
   });
-  check('非创建者标完成（标题没动）→ 放行', doneByB.ok === true, JSON.stringify(doneByB.error));
+  // 0.11.11 收紧：这张卡 owner 是空、创建者是 A，B 两样都不是 —— 不能替它收尾
+  check('非创建者 / 非 owner 标完成 → 403（0.11.11 起）',
+    doneByB.status === 403 && doneByB.error.code === 'forbidden', JSON.stringify(doneByB.error));
+  const doneByCreatorA = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00016b_yyy',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'own2',
+        title: 'A 的卡',
+        detail: '原描述',
+        status: 'done',
+      }],
+    },
+  });
+  check('创建者 A 标完成 → 放行', doneByCreatorA.ok === true, JSON.stringify(doneByCreatorA.error));
 
   const renameByA = await call(base, '/events', {
     method: 'POST',
