@@ -115,6 +115,16 @@ async function main() {
   const { ctx, routes, tools, cleanups } = makeCtx(services);
 
   console.log('1. 加载');
+  /**
+   * 版本号踩过的坑（0.11.7）：`package.json` 改成 0.11.7，客户端 `VERSION` 常量
+   * 还留着 0.11.6；面板于是假报「页面 0.11.6 / 宿主 0.11.7 ⚠ 版本不一致」。
+   * 真源是 package.json，这里把它和客户端常量钉死，手推也拦得住。
+   */
+  const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  const clientVersion = (readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
+    .match(/const VERSION = '([^']+)'/) || [])[1];
+  check('客户端 VERSION 与 package.json 一致', clientVersion === pkgVersion, `${clientVersion} vs ${pkgVersion}`);
+
   apply(ctx, { dataDir, syncLanInbox: false });
   check('apply 不抛', true);
   check('注册了路由', routes.length >= 9, `${routes.length} 条`);

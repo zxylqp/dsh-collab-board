@@ -4,6 +4,36 @@
 
 ---
 
+## 0.11.8
+
+**0.11.7 的面板版本号写错了。** 不动数据；重启 DSH 生效。
+
+0.11.7 只改了 `package.json`，`src/client/index.js` 里的 `const VERSION = '0.11.6'` 没跟着动。
+面板标题因此显示 `v0.11.6 · 宿主 0.11.7 ⚠ 版本不一致` —— 这行警告本来是抓
+「页面 bundle 和宿主进程对不上」的，结果自己成了误报。
+
+### 1. 版本号对齐
+
+- 客户端 `VERSION` 改成 `0.11.8`，`BUILD` +1。
+- 根因不是「忘了改」，是**绕过发布脚本手推的**：`publish.mjs` 一直按 `package.json`
+  对齐客户端常量，0.11.7 直接 `git push` 就漏了这一步。以后发版一律走脚本。
+
+### 2. 加一道测试护栏
+
+`test/host.test.mjs` 新增断言：客户端 `VERSION` 必须等于 `package.json` 的 `version`。
+以后再手推，测试当场红 —— 不用等别人装完看到面板才发现。
+
+### 3. 发布流程补全
+
+- 新增 `release.mjs`（原来是本机未入库的 `.make-release.mjs`）：读 CHANGELOG 当前版本段，
+  建 tag + Release。路径改成跟着脚本走，换机也能跑。
+- `publish.mjs` 走 Git Data API 推送成功后，把本地 `.git` 对齐到远端 ——
+  以前本地历史会和 GitHub 分叉，下次 `git push` 又要处理一堆假冲突。
+- `publish.mjs` 的测试列表和推送清单补上 `test/two-machine.test.mjs`、`release.mjs`。
+- README「发布」写明：**每次发版都要发 Release**，不是可选步骤。
+
+---
+
 ## 0.11.7
 
 **口令功能这次真的拦得住人。** 不改线上协议；重启 DSH 生效。

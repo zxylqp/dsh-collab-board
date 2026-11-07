@@ -73,7 +73,7 @@ try {
 }
 
 if (!SKIP_TESTS) {
-  for (const [name, file] of [['hub', 'test/hub.test.mjs'], ['host', 'test/host.test.mjs']]) {
+  for (const [name, file] of [['hub', 'test/hub.test.mjs'], ['host', 'test/host.test.mjs'], ['two-machine', 'test/two-machine.test.mjs']]) {
     let out;
     try {
       out = execFileSync(process.execPath, [join(ROOT, file)], { cwd: ROOT, encoding: 'utf8' });
@@ -127,14 +127,14 @@ async function api(path, { method = 'GET', body } = {}) {
 // 只在 base_tree 上覆盖文本文件；png 没变就让它继承（省请求也省流量）
 const FILES = [
   '.gitignore', 'CHANGELOG.md', 'LICENSE', 'README.md', 'cordis.patch.yml', 'package.json',
-  'publish.mjs',
+  'publish.mjs', 'release.mjs',
   'src/client/index.js',
   'src/host/delivery.mjs', 'src/host/discovery.mjs',
   'src/host/events.mjs', 'src/host/http-util.mjs', 'src/host/hub-client.mjs',
   'src/host/hub.mjs', 'src/host/identity.mjs', 'src/host/index.mjs',
   'src/host/ratelimit.mjs',
   'src/host/selectable.mjs', 'src/host/settings.mjs', 'src/host/store.mjs', 'src/host/wake.mjs',
-  'test/host.test.mjs', 'test/hub.test.mjs',
+  'test/host.test.mjs', 'test/hub.test.mjs', 'test/two-machine.test.mjs',
 ].filter((f) => existsSync(join(ROOT, f)));
 if (FILES.length === 0) die('没有可推送的文件');
 
@@ -210,3 +210,23 @@ say(`\n推送成功：${newCommit.sha.slice(0, 8)}  ${commitMsg.split('\n')[0]}`
 if (remoteVersion !== version) die(`推完校验失败：GitHub 上是 ${remoteVersion}，本地是 ${version}`);
 say(`校验通过：GitHub package.json = ${remoteVersion}`);
 say(`https://github.com/${OWNER}/${REPO}/commit/${newCommit.sha}`);
+
+/**
+ * 本地 git 对齐远端。
+ *
+ * API 推送只写 GitHub、不产生本地 commit —— 以前推完本地 HEAD 还停在旧版本，
+ * 下次 `git push` 看到「本地落后 + 远端有新提交」，不是假冲突就是分叉
+ * （2026-11-07 推 0.11.7 时就这样：远端 27 个 commit、本地 1 个，行尾还混着）。
+ * 发布完把本地拉到远端，之后它就是干净的工作副本。
+ */
+try {
+  execFileSync('git', ['fetch', 'origin', BRANCH], {
+    cwd: ROOT,
+    stdio: 'pipe',
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+  execFileSync('git', ['reset', '--hard', `origin/${BRANCH}`], { cwd: ROOT, stdio: 'pipe' });
+  say(`  · 本地 git 已对齐远端 ${BRANCH}`);
+} catch (e) {
+  say(`  ! 本地 git 对齐失败（不影响远端已推的内容）：${e.message}`);
+}

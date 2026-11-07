@@ -1,6 +1,6 @@
 {
   "name": "dsh-collab-board",
-  "version": "0.11.7",
+  "version": "0.11.8",
   "description": "协作看板：多台 DSH 之间的任务、对话、产出，右侧边栏一屏看得见。",
   "type": "module",
   "license": "MIT",
