@@ -440,6 +440,65 @@ async function main() {
   });
   check('自己释放自己认领的卡：放行', releaseSelf.ok === true, JSON.stringify(releaseSelf.error));
 
+  console.log('\n5d2. 只改状态的事件不抹掉其他字段（0.11.10）');
+  /**
+   * 汐汐 2026-11-07 实测：done 事件只带 title/status/taskId，
+   * Hub 折叠用 `{...ev}` → owner/detail/tags 全被清，collab_state 的 mine 里当场少一张。
+   * task 事件是增量覆盖，没带的字段应该从上一版继承。
+   */
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_full00001_aaa',
+        origin: ORIGIN_A,
+        kind: 'task',
+        taskId: 'full1',
+        title: '全字段卡',
+        detail: '描述不能丢',
+        tags: ['甲', '乙'],
+        priority: 'high',
+        status: 'pending',
+      }],
+    },
+  });
+  const claimFull = await call(base, '/tasks/claim', {
+    method: 'POST',
+    token: tokenB,
+    body: { taskId: 'full1' },
+  });
+  check('B 认领 full1', claimFull.ok === true, JSON.stringify(claimFull.error));
+
+  const fullAfterClaim = hub.controller.tasks().find((t) => t.taskId === 'full1');
+  check('认领后 detail/tags 没被抹掉',
+    fullAfterClaim && fullAfterClaim.detail === '描述不能丢'
+      && Array.isArray(fullAfterClaim.tags) && fullAfterClaim.tags.length === 2,
+    JSON.stringify({ detail: fullAfterClaim?.detail, tags: fullAfterClaim?.tags }));
+
+  // 只带 title + status 的 done（不带 owner，也不带 detail/tags）
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_full00002_bbb',
+        origin: ORIGIN_B,
+        kind: 'task',
+        taskId: 'full1',
+        title: '全字段卡',
+        status: 'done',
+      }],
+    },
+  });
+  const fullDone = hub.controller.tasks().find((t) => t.taskId === 'full1');
+  check('done 后 owner 还在', fullDone && fullDone.owner === ORIGIN_B, String(fullDone?.owner));
+  check('done 后 detail/tags/priority 还在',
+    fullDone && fullDone.detail === '描述不能丢'
+      && Array.isArray(fullDone.tags) && fullDone.tags.length === 2
+      && fullDone.priority === 'high',
+    JSON.stringify({ detail: fullDone?.detail, tags: fullDone?.tags, priority: fullDone?.priority }));
+
   console.log('\n5b. 身份撞号：taskId 归创建者');
   const mkOwn2 = await call(base, '/events', {
     method: 'POST',

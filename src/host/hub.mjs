@@ -352,6 +352,21 @@ export async function startHub(opts = {}) {
       });
       const prev = tasks.get(ev.taskId);
       if (!prev || compareEvents(ev, prev) > 0) {
+        const next = { ...ev };
+        /**
+         * 增量覆盖，不是整条替换（0.11.10）。
+         *
+         * task 事件是「后写覆盖前写」，但只改状态的事件往往只带 title/status/taskId。
+         * 没带的字段必须从上一版继承，否则 owner / detail / tags / dependsOn 当场被抹空：
+         * `collab_state` 的 mine 里少一张、面板负责人变空、描述消失
+         * （2026-11-07 汐汐实测：done 事件只带三个字段，owner 被清）。
+         * 墓碑在上面已经提前 return，这里不担心把删掉的正文复活。
+         */
+        if (prev) {
+          for (const f of ['title', 'detail', 'owner', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+            if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
+          }
+        }
         /**
          * Hub 专属字段（`claimedAt` / `leaseMs`）**不会被成员带上来**
          * （`HUB_ONLY_FIELDS` 拦着）。折叠时如果不从上一版继承，任何一条普通
@@ -359,7 +374,6 @@ export async function startHub(opts = {}) {
          * 卡永远不过期，也不再被扫描释放。这是「改个标题把租约丢了」的真身。
          * 换 owner 时不继承：那是重新认领，claimedAt 必须换新的。
          */
-        const next = { ...ev };
         if (prev && (next.owner === undefined || next.owner === prev.owner)) {
           for (const f of HUB_ONLY_FIELDS) {
             if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
@@ -1028,17 +1042,28 @@ export async function startHub(opts = {}) {
         }
         const list = Array.isArray(body) ? body : body.events;
         /**
-         * owner 继承：改标题时不该被迫把 owner 一起带上，更不该因为没带就被
-         * 当成「释放」。**没显式给 owner 就沿用当前值**；显式给了（包括空串）
-         * 才按 checkOwnerWrite 的迁移规则判。
+         * 字段继承：改标题 / 标完成时不该被迫把整张卡重新发一遍，更不能因为没带
+         * 就被当成「清空」。**raw 里没有这个键就沿用当前值**；显式给了（包括空串）
+         * 才按原值处理 —— 所以判据是 `in`，不是「有没有内容」。
+         *
+         * 为什么必须在 validateEvent 之前补：它会把缺省字段归一成 ''/[]/'normal'/false，
+         * 之后再想区分「没带」和「显式清空」就没戏了。0.11.10 之前只补了 owner，
+         * 于是 done 事件里的 detail / tags / priority 全被抹平（汐汐 2026-11-07 实测）。
          */
+        const TASK_CARRY = ['title', 'detail', 'owner', 'priority', 'tags', 'dependsOn',
+          'requiredCapabilities', 'dueAt', 'archived'];
         const prepped = Array.isArray(list)
           ? list.map((raw) => {
             if (!raw || raw.kind !== 'task') return raw;
+            if (raw.deleted === true) return raw; // 墓碑就是要擦空，别往回填
             const id = String(raw.taskId || raw.id || '').trim();
             const prev = id ? tasks.get(id) : null;
-            if (prev && !('owner' in raw)) return { ...raw, owner: prev.owner };
-            return raw;
+            if (!prev) return raw;
+            const next = { ...raw };
+            for (const f of TASK_CARRY) {
+              if (!(f in raw) && prev[f] !== undefined) next[f] = prev[f];
+            }
+            return next;
           })
           : list;
         const r = validateBatch(prepped, { expectedOrigin: me.origin });

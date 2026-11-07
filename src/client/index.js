@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 29;
-    const VERSION = '0.11.9';
+    const BUILD = 30;
+    const VERSION = '0.11.10';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -984,8 +984,17 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'cb-filter',
             'data-on': showDone ? '' : undefined,
-            onClick: () => setShowDone(!showDone),
-            title: '显示 / 收起已完成',
+            /**
+             * 已完成的卡只在「全部」筛选下可见（filter 是「进行中」时 done 永远过不来）。
+             * 所以点开它时顺手切到「全部」—— 否则按钮亮了、列表还是空的，
+             * 人只会以为按钮坏了（2026-11-07 用户实测）。
+             */
+            onClick: () => {
+              const next = !showDone;
+              setShowDone(next);
+              if (next && filter !== 'all') setFilter('all');
+            },
+            title: '显示 / 收起已完成（会切到「全部」）',
           }, '已完成' + (counts.done ? ' ' + counts.done : '')),
           counts.archived
             ? h('button', {
