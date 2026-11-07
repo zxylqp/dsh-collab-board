@@ -229,16 +229,34 @@ export function validateEvent(raw, opts = {}) {
       // 墓碑不带标题（正是要擦掉它），所以只对普通任务卡要求 title
       const tombstone = raw.deleted === true;
       if (!tombstone && !isText(raw.title)) return bad('bad-param', 'task 要有 title', 'title');
-      const status = TASK_STATUS.includes(raw.status) ? raw.status : (tombstone ? 'cancelled' : 'pending');
-      const priority = ['high', 'normal', 'low'].includes(raw.priority) ? raw.priority : 'normal';
+      /**
+       * `status` / `priority` 缺省时不写这两个键（0.11.22）。
+       *
+       * 以前这里把它们归一成 `pending` / `normal` 再落盘：等于给每条 task 事件都
+       * 盖上一个「状态」——「只改描述」的更新也会变成一次状态回退（running → pending），
+       * 而 Hub 的继承判据是「raw 里有没有这个键」，键永远在，就永远继承不了。
+       *
+       * 现在的语义：**不给 = 这条事件没提这件事，读者从上一版继承**。
+       * 真正新建卡的那层（`buildEvent`）会给默认值，Hub 的 `TASK_CARRY` 也会补。
+       */
+      let status;
+      if (TASK_STATUS.includes(raw.status)) status = raw.status;
+      else if (raw.status !== undefined && raw.status !== '') {
+        return bad('bad-param', `status 不认识：${String(raw.status)}`, 'status');
+      } else if (tombstone) status = 'cancelled';
+      let priority;
+      if (['high', 'normal', 'low'].includes(raw.priority)) priority = raw.priority;
+      else if (raw.priority !== undefined && raw.priority !== '') {
+        return bad('bad-param', `priority 不认识：${String(raw.priority)}`, 'priority');
+      }
       return {
         ok: true,
         event: {
           ...raw,
           taskId,
           title: textOf(raw.title, 200),
-          status,
-          priority,
+          ...(status ? { status } : {}),
+          ...(priority ? { priority } : {}),
           owner: isText(raw.owner) ? raw.owner.trim().slice(0, 64) : '',
           detail: textOf(raw.detail, 8192),
           dependsOn: strList(raw.dependsOn, 32, 64),

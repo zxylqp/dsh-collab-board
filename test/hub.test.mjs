@@ -1004,6 +1004,84 @@ async function main() {
     check('描述没被清空', Boolean(cur) && cur.detail === '这段描述不该被别人清掉', String(cur?.detail));
   }
 
+  /**
+   * 5c. 不带 status 的更新：Hub 按上一版继承（0.11.22）。
+   *
+   * 汐汐 2026-11-07 V04 抓到的：发送侧无条件写 status（缺省 pending），
+   * 于是「只改描述」的更新把正在跑的卡打回待认领。修法是发送侧不再兜底 +
+   * Hub 的 `TASK_CARRY` 补 status —— 这条钉住 Hub 这半边。
+   */
+  console.log('\n5c. 更新不带 status：Hub 侧按上一版继承（0.11.22）');
+  {
+    const stTask = 't-status-inherit';
+    const mkStatus = await call(base, '/events', {
+      method: 'POST',
+      token: tokenA,
+      body: {
+        events: [{
+          eventVersion: 2,
+          id: 'ev_aaaaaa_tst0001_a',
+          origin: ORIGIN_A,
+          name: 'A',
+          ts: new Date().toISOString(),
+          kind: 'task',
+          taskId: stTask,
+          title: '状态继承',
+          status: 'running',
+        }],
+      },
+    });
+    check('先建一张 running 的卡', mkStatus.ok === true, JSON.stringify(mkStatus).slice(0, 120));
+
+    const updStatus = await call(base, '/events', {
+      method: 'POST',
+      token: tokenA,
+      body: {
+        events: [{
+          eventVersion: 2,
+          id: 'ev_aaaaaa_tst0002_a',
+          origin: ORIGIN_A,
+          name: 'A',
+          ts: new Date().toISOString(),
+          kind: 'task',
+          taskId: stTask,
+          detail: '只改描述',
+        }],
+      },
+    });
+    check('不带 status 的事件被收下（不再兜底 pending）', updStatus.ok === true,
+      JSON.stringify(updStatus).slice(0, 160));
+
+    const pullSt = await call(base, '/events?since=0', { token: tokenA });
+    const stEvents = Array.isArray(pullSt.data?.events) ? pullSt.data.events : [];
+    const stLast = stEvents.filter((e) => e.kind === 'task' && e.taskId === stTask).pop();
+    check('Hub 落盘那条按上一版继承了 status', stLast?.status === 'running',
+      JSON.stringify(stLast || null).slice(0, 160));
+    check('描述写进去了', stLast?.detail === '只改描述', String(stLast?.detail));
+
+    await call(base, '/events', {
+      method: 'POST',
+      token: tokenA,
+      body: {
+        events: [{
+          eventVersion: 2,
+          id: 'ev_aaaaaa_tst0003_a',
+          origin: ORIGIN_A,
+          name: 'A',
+          ts: new Date().toISOString(),
+          kind: 'task',
+          taskId: stTask,
+          status: 'done',
+        }],
+      },
+    });
+    const pullSt2 = await call(base, '/events?since=0', { token: tokenA });
+    const stLast2 = (pullSt2.data?.events || [])
+      .filter((e) => e.kind === 'task' && e.taskId === stTask).pop();
+    check('显式给 status 照常生效', stLast2?.status === 'done',
+      JSON.stringify(stLast2 || null).slice(0, 160));
+  }
+
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;
   const beforeEpoch = hub.controller.info().epoch;

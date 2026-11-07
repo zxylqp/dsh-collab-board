@@ -354,6 +354,14 @@ export async function startHub(opts = {}) {
       if (!prev || compareEvents(ev, prev) > 0) {
         const next = { ...ev };
         /**
+         * 全新的一张卡、又没带 status：按协议默认成待认领（0.11.22）。
+         *
+         * 协议改了「缺省不写 status」之后，读侧必须给新建卡一个默认值，
+         * 否则 `status` 是 undefined —— 认领判定（`!== 'pending'`）和租约扫描
+         * 都认不出它，卡会变成谁都接不了的幽灵。
+         */
+        if (!prev && next.status === undefined) next.status = 'pending';
+        /**
          * 增量覆盖，不是整条替换（0.11.10）。
          *
          * task 事件是「后写覆盖前写」，但只改状态的事件往往只带 title/status/taskId。
@@ -363,7 +371,13 @@ export async function startHub(opts = {}) {
          * 墓碑在上面已经提前 return，这里不担心把删掉的正文复活。
          */
         if (prev) {
-          for (const f of ['title', 'detail', 'owner', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+          /**
+           * `status` 也要继承（0.11.22）：一条不提状态的更新（只改描述 / 标签）不该
+           * 把卡打回待认领。没带 = 沿用上一版 —— 和 `TASK_CARRY` 同一个判据，
+           * 这里多一份是因为**老数据**（0.11.21 及以前写的事件都自带 status）在
+           * 事件本身上没有缺失，但 0.11.22 之后新写的可能缺，两种都要能读。
+           */
+          for (const f of ['title', 'detail', 'owner', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
             if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
           }
         }
@@ -1050,7 +1064,14 @@ export async function startHub(opts = {}) {
          * 之后再想区分「没带」和「显式清空」就没戏了。0.11.10 之前只补了 owner，
          * 于是 done 事件里的 detail / tags / priority 全被抹平（汐汐 2026-11-07 实测）。
          */
-        const TASK_CARRY = ['title', 'detail', 'owner', 'priority', 'tags', 'dependsOn',
+        /**
+         * 缺键就沿用当前值。`status` / `priority` 是 0.11.22 补进来的：
+         * 以前 `buildEvent` 无条件写 `status`（缺省 pending），任何「只改描述」的更新
+         * 都会把正在跑的卡打回待认领，Hub 的释放扫描随即清掉租约。
+         * 现在发送侧不再兜底，**这一层必须补**，否则落盘事件的 status 会凭空消失，
+         * 折叠时那张卡就变成「没有状态」。
+         */
+        const TASK_CARRY = ['title', 'detail', 'owner', 'status', 'priority', 'tags', 'dependsOn',
           'requiredCapabilities', 'dueAt', 'archived'];
         /**
          * 客户端**原始**事件里显式给了 `detail` 的 id 集合（0.11.20）。

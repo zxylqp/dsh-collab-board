@@ -1563,6 +1563,44 @@ async function main() {
   // 12p（unread 投影）需要事件带 seq，本机 Hub 已停时写的事件没有 seq，
   // 这条放到 two-machine.test.mjs 里验 —— 那边的事件都由 Hub 分配序号。
 
+  /**
+   * 12r. 更新不带 status 不再把卡打回待认领（0.11.22）。
+   *
+   * 汐汐 2026-11-07 V04 实测抓到的：`buildEvent` 无条件写 `status`（缺省 pending），
+   * 于是「只改描述 / 加个标签」的更新会把正在跑的卡打回待认领，
+   * Hub 的 30 秒释放扫描随即清掉租约 —— 等于顺手释放了别人的卡。
+   * Hub 的继承判据是「raw 里有没有这个键」，键永远在，就永远继承不了。
+   */
+  console.log('\n12r. 更新不带 status 不再把卡打回待认领（0.11.22）');
+  const postStatus = findTool(tools, 'collab_post');
+  await postStatus.execute({ kind: 'task', id: 't-st1', title: '状态继承', status: 'running' });
+  // 只改描述，不带 status
+  await postStatus.execute({ kind: 'task', id: 't-st1', detail: '只改描述' });
+  const stState = await hit(routes, '/collab-board/state');
+  const stRows = (stState.payload?.events || [])
+    .filter((e) => e.kind === 'task' && e.taskId === 't-st1');
+  const stLatest = stRows[stRows.length - 1];
+  check('只改描述的事件不带 status 字段（交给 Hub 继承）',
+    Boolean(stLatest) && !('status' in stLatest), JSON.stringify(stLatest || null));
+  const stFolded = latestTasks(stRows).get('t-st1');
+  check('本机折叠继承 status（卡还在 running）', stFolded?.status === 'running', String(stFolded?.status));
+  check('描述确实改了', stFolded?.detail === '只改描述', String(stFolded?.detail));
+
+  // 新建卡没有上一版可继承，必须给默认值 —— 别把「不写」做成「没状态」
+  await postStatus.execute({ kind: 'task', id: 't-st2', title: '新卡' });
+  const st2State = await hit(routes, '/collab-board/state');
+  const st2Ev = (st2State.payload?.events || [])
+    .find((e) => e.kind === 'task' && e.taskId === 't-st2');
+  check('新建卡没给 status 仍然兜底 pending', st2Ev?.status === 'pending', JSON.stringify(st2Ev || null));
+
+  // 显式给 status 照常生效（别把「有才写」修成「永远不写」）
+  await postStatus.execute({ kind: 'task', id: 't-st1', status: 'done' });
+  const st3State = await hit(routes, '/collab-board/state');
+  const st3Rows = (st3State.payload?.events || [])
+    .filter((e) => e.kind === 'task' && e.taskId === 't-st1');
+  check('显式给 status 照常生效', st3Rows[st3Rows.length - 1]?.status === 'done',
+    JSON.stringify(st3Rows[st3Rows.length - 1] || null));
+
   console.log('\\n12q. 终态卡不让再评论（0.11.17）');
   // 以前 buildEvent 完全不看任务状态：标了 done 的卡下照样能发 msg。
   // 实测本机 events.jsonl 33 条、Hub 39 条评论挂在已结束的卡下。

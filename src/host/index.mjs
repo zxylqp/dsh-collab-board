@@ -2019,10 +2019,27 @@ export function apply(ctx, rawConfig = {}) {
         const ev = {
           ...base,
           taskId,
-          status: ['pending', 'running', 'blocked', 'done', 'cancelled'].includes(input.status)
-            ? input.status
-            : (tombstone ? 'cancelled' : 'pending'),
         };
+        /**
+         * `status` 也改成「有才写」（0.11.22）。
+         *
+         * 以前无条件写 + 缺省 `pending`：任何「只想改描述 / 加个标签」的更新
+         * 都会把**正在跑的卡**打回待认领，Hub 的 30 秒释放扫描随即把租约水印清掉 ——
+         * 等于顺手释放了别人的卡。Hub 的继承判据是「raw 里有没有这个键」，
+         * 键永远在，就永远继承不了。
+         *
+         * 汐汐 2026-11-07 V04 实测：20:29:16 认领，20:29:20 只发一条 detail，
+         * 卡当场变 pending（owner 还挂着，看着像「认领着、但没租约」）。
+         * 跟 title（0.11.14）、owner / detail / tags 同一个判据：**有才写，不给就继承**。
+         */
+        if (isText(input.status) && ['pending', 'running', 'blocked', 'done', 'cancelled'].includes(input.status)) {
+          ev.status = input.status;
+        } else if (tombstone) {
+          ev.status = 'cancelled';
+        } else if (!knownTask) {
+          // 新建卡没有上一版可继承，必须给一个 —— 默认就是待认领。
+          ev.status = 'pending';
+        }
         if (isText(input.title)) ev.title = input.title.trim().slice(0, 200);
         else if (tombstone) ev.title = '';
         else if (!knownTask) ev.title = taskId;

@@ -25,7 +25,12 @@ export function latestTasks(events) {
     if (!ev || ev.kind !== 'task' || !ev.taskId) continue;
     const prev = out.get(ev.taskId);
     if (!prev) {
-      out.set(ev.taskId, ev);
+      /**
+       * 第一眼看到的这张卡没带 status（0.11.22 起「不给就不写」）：
+       * 按协议默认成待认领，否则 `status === undefined` 会让认领判定和
+       * `collab_state` 的 mine/pending 全认不出来，卡变成谁都接不了的幽灵。
+       */
+      out.set(ev.taskId, ev.status === undefined ? { ...ev, status: 'pending' } : ev);
       continue;
     }
     if (compareEvents(ev, prev) > 0) {
@@ -47,9 +52,13 @@ export function latestTasks(events) {
        * 本机 `collab_state` 的 mine/watching 里标题直接消失，卡片变成裸 taskId。
        * 汐汐 2026-11-07 T01 复验报的就是这个：协议修好了，本地折叠没跟上。
        *
+       * `status` 是 0.11.22 补进来的：更新事件不再无条件带 status 之后，
+       * 本机折叠必须从上一版继承，否则「只改描述」的更新会让这张卡在
+       * `collab_state` 的 mine 里凭空消失（status 变 undefined）。
+       *
        * 显式写了（含空串）才算变更，判据是 `!== undefined`。
        */
-      for (const f of ['title', 'detail', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+      for (const f of ['title', 'detail', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
         if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
       }
       /**
