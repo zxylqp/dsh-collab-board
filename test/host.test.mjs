@@ -1432,6 +1432,66 @@ async function main() {
   // 12p（unread 投影）需要事件带 seq，本机 Hub 已停时写的事件没有 seq，
   // 这条放到 two-machine.test.mjs 里验 —— 那边的事件都由 Hub 分配序号。
 
+  console.log('\\n12q. 终态卡不让再评论（0.11.17）');
+  // 以前 buildEvent 完全不看任务状态：标了 done 的卡下照样能发 msg。
+  // 实测本机 events.jsonl 33 条、Hub 39 条评论挂在已结束的卡下。
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-lock', title: '评论锁测试', status: 'pending' },
+  });
+  const beforeDone = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', taskId: 't-lock', from: '测试', text: '完成前这句该过' },
+  });
+  check('任务还没结束 → 评论放行', beforeDone.status === 200,
+    `${beforeDone.status} ${JSON.stringify(beforeDone.payload)}`);
+
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-lock', status: 'done' },
+  });
+  const afterDone = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', taskId: 't-lock', from: '测试', text: '完成后不该过' },
+  });
+  check('任务 done 之后评论被拒', afterDone.status === 403 || afterDone.status === 400,
+    `${afterDone.status} ${JSON.stringify(afterDone.payload)}`);
+  check('拒的理由点明「评论已锁」和重开办法',
+    String(JSON.stringify(afterDone.payload)).includes('评论已锁')
+    && String(JSON.stringify(afterDone.payload)).includes('running'),
+    String(JSON.stringify(afterDone.payload)));
+
+  // 改回 running 是唯一合法的补充途径，门要真的重新打开
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-lock', status: 'running' },
+  });
+  const reopen = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', taskId: 't-lock', from: '测试', text: '重开后能说' },
+  });
+  check('状态改回 running → 评论重新放行', reopen.status === 200,
+    `${reopen.status} ${JSON.stringify(reopen.payload)}`);
+
+  await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'task', taskId: 't-lock', status: 'cancelled' },
+  });
+  const afterCancel = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', taskId: 't-lock', from: '测试', text: '取消后也不该过' },
+  });
+  check('任务 cancelled 之后评论被拒', afterCancel.status === 403 || afterCancel.status === 400,
+    `${afterCancel.status} ${JSON.stringify(afterCancel.payload)}`);
+
+  // 不挂卡的全局消息不受影响 —— 别把「锁评论」做成「禁言」
+  const globalMsg = await hit(routes, '/collab-board/post', {
+    method: 'POST',
+    body: { kind: 'msg', from: '测试', text: '全局消息照旧' },
+  });
+  check('不带 taskId 的全局消息不受影响', globalMsg.status === 200,
+    `${globalMsg.status} ${JSON.stringify(globalMsg.payload)}`);
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }

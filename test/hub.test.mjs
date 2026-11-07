@@ -287,6 +287,39 @@ async function main() {
   });
   check('B 把 t1 标完成', doneT1.ok === true, JSON.stringify(doneT1.error || doneT1).slice(0, 300));
 
+  /**
+   * 终态卡评论锁（0.11.17）：面板禁输入框只挡住前端，
+   * 这里验的是「直接打 /events」这条路 —— 老版本客户端 / 手写 curl 都走它，
+   * 只拦本机 buildEvent 等于没拦。
+   */
+  const cmtOnDone = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00009_iii', origin: ORIGIN_A, name: 'A',
+        kind: 'msg', taskId: 't1', from: 'A', text: '做完了再补一句',
+      }],
+    },
+  });
+  check('往已 done 的卡写评论 → 403', cmtOnDone.status === 403,
+    `${cmtOnDone.status} ${JSON.stringify(cmtOnDone).slice(0, 200)}`);
+  check('拒的理由是「评论已锁」', JSON.stringify(cmtOnDone).includes('评论已锁'),
+    JSON.stringify(cmtOnDone).slice(0, 200));
+
+  const cmtGlobal = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00010_jjj', origin: ORIGIN_A, name: 'A',
+        kind: 'msg', from: 'A', text: '全局照旧',
+      }],
+    },
+  });
+  check('不挂卡的全局消息不受影响', cmtGlobal.ok === true,
+    JSON.stringify(cmtGlobal).slice(0, 200));
+
   const pullAfterDone = await call(base, '/events?since=0', { token: tokenC });
   const t3Events = pullAfterDone.data.events
     // 只看 task 事件：解锁现在会额外写一条 msg（0.10.15），不该混进「最新状态」

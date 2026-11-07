@@ -1871,6 +1871,26 @@ export function apply(ctx, rawConfig = {}) {
     const ev = buildEventRaw(input);
     if (!ev) return undefined;
     /**
+     * 终态卡不许再评论（0.11.17）。
+     *
+     * 以前是**故意**放开的 —— `buildEventRaw` 的 msg 分支里写着「done 卡上的 @
+     * 照样投一次：完成后的追问 / 补验收不能断」。实测两头都停不下来：
+     * 本机日志里 33 条评论挂在已 done 的卡下（t2 标 done 之后又聊了 6 条），
+     * Hub 侧 39 条 —— 「已完成」就只剩个标签。
+     * 现在收死：真要补充，先把卡改回 running，评论跟着任务走。
+     */
+    if (ev.kind === 'msg' && ev.taskId) {
+      const cur = latestTasks(viewEvents()).get(String(ev.taskId));
+      if (cur && (cur.status === 'done' || cur.status === 'cancelled')) {
+        const e = new Error(
+          `任务 ${ev.taskId} 已${cur.status === 'done' ? '完成' : '取消'}，评论已锁；`
+          + '要接着补充，先把这张卡的状态改回 running。',
+        );
+        e.code = 'forbidden';
+        throw e;
+      }
+    }
+    /**
      * 本地也校验（0.10.16 的缺口）：以前只在 Hub 端调 `validateEvent`，
      * 脏事件先落盘、推上去被 400 整批拒、从此堵在待同步队列 —— 0.10.14 踩过。
      * 现在写日志之前就挡掉，坏事件根本进不了本地日志。

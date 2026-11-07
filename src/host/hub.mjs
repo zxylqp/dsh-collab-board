@@ -1082,6 +1082,25 @@ export async function startHub(opts = {}) {
             accepted.push({ id: ev.id, duplicate: true, epoch: dup.epoch, seq: dup.seq });
             continue;
           }
+          /**
+           * 终态卡不许再评论（0.11.17）。
+           *
+           * 三条路都能往一张卡下塞 msg：面板输入框、`collab_post` 工具、直接打
+           * `/events`。本机 `index.mjs` 的 `buildEvent` 拦前两条，这里拦最后一条
+           * （老版本客户端 / 手写 curl 也走这儿）。只拦前端等于没拦。
+           *
+           * 为什么不再放行「补验收」：实测一张卡标 done 之后照样能接着聊十几轮，
+           * 「已完成」就只剩个标签。要补先把状态改回 running。
+           */
+          if (ev.kind === 'msg' && ev.taskId) {
+            const cur = tasks.get(String(ev.taskId));
+            if (cur && (cur.status === 'done' || cur.status === 'cancelled')) {
+              return fail(res, 403, 'forbidden',
+                `任务 ${ev.taskId} 已${cur.status === 'done' ? '完成' : '取消'}，评论已锁；`
+                + '要接着补充，先把这张卡的状态改回 running',
+                { field: 'taskId' });
+            }
+          }
           // 身份撞号：taskId 归创建者。别人可以认领 / 完成 / 评论，但不能把
           // 标题、描述、依赖整条改写 —— 那正是 R5 真机撞号的样子：两张本地编号
           // 相同的卡被折叠成一张，后推的赢，前一张凭空消失。

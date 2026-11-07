@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 31;
-    const VERSION = '0.11.16';
+    const BUILD = 32;
+    const VERSION = '0.11.17';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1074,6 +1074,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('');
       const comments = model.commentsByTask.get(task.taskId) || [];
       const artifacts = model.artifactsByTask.get(task.taskId) || [];
+      /** 终态（done / cancelled）卡的评论锁死：任务结束就是结束，0.11.17 */
+      const taskLocked = task.status === 'done' || task.status === 'cancelled';
       const now = Date.now();
 
       const deps = task.dependsOn.map((id) => {
@@ -1250,21 +1252,33 @@ window.__ModuleLoader__.load({
           /* 4. 评论 */
           h('div', { className: 'cb-card' },
             h('div', { className: 'cb-card-h' }, '任务评论', h('span', { className: 'cb-grow' }),
-              h('span', { className: 'cb-hint' }, comments.length ? comments.length + ' 条 · 最新在上' : '只在本任务可见')),
+              h('span', { className: 'cb-hint' }, comments.length
+                ? comments.length + ' 条 · 最新在上'
+                : (taskLocked ? '已锁' : '只在本任务可见'))),
             comments.length === 0
               ? h('div', { className: 'cb-hint', style: { padding: '4px 0' } }, '还没有人在这条任务下说话。')
               : h('div', { style: { display: 'flex', flexDirection: 'column' } },
                 comments.slice().reverse().map((m, i) => h(Message, { key: 'c-' + i, msg: m, me, timeMode: settings.timeFormat }))),
-            h('div', { className: 'cb-composer', style: { marginTop: 8 } },
-              h(CommentBox, {
-                placeholder: '在这条任务下回复…（自动带上 ' + task.taskId + '）',
-                disabled: Boolean(busy),
-                onSend: async (text) => {
-                  await props.onPost({ kind: 'msg', taskId: task.taskId, from: me, text });
-                },
-                onError: (e) => toast('没发出去：' + e.message, 'error'),
-              }),
-            ),
+            /**
+             * 终态卡不再给输入框（0.11.17）。
+             *
+             * 原来只有 `disabled: Boolean(busy)`：任务 done 了，输入框照样能打、
+             * 能发，两个成员就在「已完成」的卡下继续聊。Hub 端同一版加了 403，
+             * 但只拦服务端的话用户会打完一大段才被拒 —— 这里先让他看见。
+             */
+            taskLocked
+              ? h('div', { className: 'cb-hint', style: { marginTop: 8 } },
+                '任务已' + (task.status === 'done' ? '完成' : '取消') + '，评论已锁。要接着补充，先把状态改回 running。')
+              : h('div', { className: 'cb-composer', style: { marginTop: 8 } },
+                h(CommentBox, {
+                  placeholder: '在这条任务下回复…（自动带上 ' + task.taskId + '）',
+                  disabled: Boolean(busy),
+                  onSend: async (text) => {
+                    await props.onPost({ kind: 'msg', taskId: task.taskId, from: me, text });
+                  },
+                  onError: (e) => toast('没发出去：' + e.message, 'error'),
+                }),
+              ),
           ),
         ),
       );
