@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 28;
-    const VERSION = '0.11.8';
+    const BUILD = 29;
+    const VERSION = '0.11.9';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1982,46 +1982,72 @@ window.__ModuleLoader__.load({
       const [ignoredFork, setIgnoredFork] = useState(false);
 
       const members = useMemo(() => {
+        /** 本机 origin：用来把自己从「别人」里剔掉。按名字剔会误伤同名成员。 */
+        const selfOrigin = runtime && typeof runtime.origin === 'string' ? runtime.origin : '';
+        const liveMap = presence && presence.map ? presence.map : null;
+
+        /**
+         * 名单 = 事件流里的 member 事件 ∪ Hub 现报的成员表。
+         *
+         * 只认事件流会漏人：member 事件只在 join 那一刻写一条，历史没落进本机日志、
+         * 日志被清过、或者对方 join 的那条没推上来，面板上就永远看不到这个人 ——
+         * 哪怕 Hub 的 /members 明明报着他在线。2026-11-07 用户反馈的
+         * 「成员一直在线，成员页却只有自己」就是这个。
+         *
+         * 但仍然**不**把「只在消息里出现过的名字」折成成员：那种名单认不出 origin，
+         * 删不掉也对不上号；Hub 的成员表是有 origin 的权威表，可以信。
+         */
+        const byOrigin = new Map();
+        for (const m of model.members) {
+          if (selfOrigin && m.origin === selfOrigin) continue; // 本机单独画，见下
+          byOrigin.set(m.origin, { ...m, self: false, inferred: false });
+        }
+        if (liveMap) {
+          for (const [origin, live] of Object.entries(liveMap)) {
+            if (!origin || (selfOrigin && origin === selfOrigin)) continue;
+            const prev = byOrigin.get(origin);
+            const prevName = prev && prev.name && prev.name !== origin ? prev.name : '';
+            byOrigin.set(origin, {
+              origin,
+              name: prevName || live.name || origin,
+              status: live.online ? (live.status === 'busy' ? 'busy' : 'idle') : 'offline',
+              capabilities: prev && Array.isArray(prev.capabilities) ? prev.capabilities : [],
+              seenAt: prev ? prev.seenAt : '',
+              live: true,
+              self: false,
+              inferred: false,
+            });
+          }
+        }
+
+        const others = [...byOrigin.values()].map((m) => {
+          /**
+           * 在线态以 Hub 现报的为准；拉不到（没连 Hub / 老宿主）才退回事件流里的旧值。
+           * 不覆盖的话，断了机的成员会永远挂着「在线」——那比显示离线更误导。
+           */
+          const live = liveMap ? liveMap[m.origin] : null;
+          const liveStatus = live
+            ? (live.online ? (live.status === 'busy' ? 'busy' : 'idle') : 'offline')
+            : m.status;
+          return { ...m, status: liveStatus, live: Boolean(live) };
+        });
+
+        const selfLive = selfOrigin && liveMap ? liveMap[selfOrigin] : null;
         const self = {
           origin: 'local',
           name: settings.selfName || '本机',
-          status: 'idle',
+          status: selfLive ? (selfLive.online ? 'idle' : 'offline') : 'idle',
           self: true,
+          live: Boolean(selfLive),
         };
-        const liveMap = presence && presence.map ? presence.map : null;
-        const others = model.members
-          .filter((m) => m.name !== self.name)
-          .map((m) => {
-            /**
-             * 在线态以 Hub 现报的为准；拉不到（没连 Hub / 老宿主）才退回事件流里的旧值。
-             * 不覆盖的话，断了机的成员会永远挂着「在线」——那比显示离线更误导。
-             */
-            const live = liveMap ? liveMap[m.origin] : null;
-            const liveStatus = live
-              ? (live.online ? (live.status === 'busy' ? 'busy' : 'idle') : 'offline')
-              : m.status;
-            return {
-              ...m,
-              status: liveStatus,
-              live: Boolean(live),
-              self: false,
-              inferred: false,
-            };
-          });
-        /**
-         * 这里**不再**把「只在消息里出现过的名字」折成成员。
-         * 以前这么干过：两台机器的 member 事件名和消息里的发言名对不上
-         * （比如机器名 DESKTOP-… 和 涟涟），于是列表里多出一排
-         * 「离线 · 只在消息里见过」的幽灵，删不掉也认不出是谁。
-         * 成员只认 member 事件 + 本机自己，看不出谁是谁是发包方的责任，不是这里猜。
-         */
+
         return [self, ...others].sort((a, b) => {
           const oa = a.self ? -1 : (isOnline(a.status) ? 0 : 1);
           const ob = b.self ? -1 : (isOnline(b.status) ? 0 : 1);
           if (oa !== ob) return oa - ob;
           return a.name.localeCompare(b.name);
         });
-      }, [model.members, settings.selfName, presence]);
+      }, [model.members, settings.selfName, presence, runtime]);
 
       /** 本地隐藏的成员（只影响这台机器的视图，不改事件流）。 */
       const hiddenSet = new Set(
