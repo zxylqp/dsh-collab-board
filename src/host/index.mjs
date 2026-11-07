@@ -1507,8 +1507,11 @@ export function apply(ctx, rawConfig = {}) {
           'artifact 是产出物；note 是系统提示（卡在哪、为什么等）。' +
           'msg 的 mentions 指名谁就定向叫谁；卡上的普通消息只投给当前 owner（creator 不自动参与）。' +
           '**progress 会续租约、note 不会** —— 还在干就写一条 progress。' +
+          '认领后默认 10 分钟租约：这段时间内一条 progress / artifact 都没写，卡会被退回待认领（msg 和 note 都不续约）。' +
           '**标 done 前先确认结果真的达成**（有产出 / 验证 / 对方确认，不是「我做了」）；' +
-          'done 只许任务负责人或创建者写，别人标会 403；不做了就标 cancelled，别留 pending 卡堵下游。' +
+          'done 只许任务负责人或创建者写，别人标会 403；**标 done 只发 {taskId, status:"done"}** —— '
+          + '不是创建者还带 title / detail / dependsOn，会整条 403，done 也一起没了。' +
+          '不做了就标 cancelled，别留 pending 卡堵下游。' +
           '规矩：**先写日志再干活**，别干完才补记。',
         parameters: {
           type: 'object',

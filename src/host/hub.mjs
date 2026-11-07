@@ -1126,13 +1126,31 @@ export async function startHub(opts = {}) {
             if (prevTask && creator && ev.origin !== creator) {
               // detail 只比「有内容的变更」：validateBatch 会把缺省字段归一成空串，
               // 认领 / 完成这类事件本来就不带 detail，空串 ≠ 改描述。
-              const changed = ('title' in ev && ev.title !== prevTask.title)
-                || ('detail' in ev && ev.detail !== '' && ev.detail !== prevTask.detail)
-                || ('dependsOn' in ev
-                  && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || []));
-              if (changed) {
+              const changed = [];
+              if ('title' in ev && ev.title !== prevTask.title) changed.push('标题');
+              if ('detail' in ev && ev.detail !== '' && ev.detail !== prevTask.detail) changed.push('描述');
+              if ('dependsOn' in ev
+                && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || [])) changed.push('依赖');
+              if (changed.length > 0) {
+                /**
+                 * 拒绝必须说清「改了哪条」和「整条都没进去」（0.11.18）。
+                 *
+                 * 汐汐 2026-11-07 标 R01 完成时踩的就是这个：那条事件夹带了正文改动，
+                 * 整条 409，`status: done` 一起没记上。旧提示只说「不能改标题/描述/依赖」，
+                 * 她看不出 done 已经废了，没重发 —— 10 分钟后租约到期把卡退回待认领，
+                 * 爸爸看到的就是「任务结束了但没标完成」。
+                 * 现在点名字段、明说 done 没记、直接给重发写法。
+                 */
+                const wantsDone = ev.status === 'done';
+                const lost = wantsDone
+                  ? '这条里的 status=done 也没记上'
+                  : '这条的 status 也没记上';
                 return fail(res, 409, 'conflict',
-                  `任务 ${ev.taskId} 是 ${creator.slice(0, 6)}… 创建的，别的成员不能改标题/描述/依赖；认领走 /tasks/claim，完成改 status`,
+                  `任务 ${ev.taskId} 是 ${creator.slice(0, 6)}… 创建的，你这条改了${changed.join(' / ')}，`
+                  + `而别人不能改这张卡的正文 —— 整条被拒，${lost}。`
+                  + (wantsDone
+                    ? '要标完成，重发一条只带 {taskId, status:"done"} 的事件，别带 title / detail / dependsOn。'
+                    : '认领走 /tasks/claim；只想改状态就只发 status。'),
                   { field: 'taskId' });
               }
             }

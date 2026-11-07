@@ -634,6 +634,46 @@ async function main() {
     JSON.stringify(clobber.error));
   check('409 带 field=taskId', clobber.error.field === 'taskId');
 
+  /**
+   * 0.11.18：非创建者标 done 时夹带正文，必须说清「整条被拒、done 也没记」。
+   *
+   * 汐汐 2026-11-07 标 R01 完成就是这样：那条事件带了正文改动，整条 409，
+   * done 一起没了。旧提示只说「不能改标题/描述/依赖」，她看不出 done 已经废了，
+   * 没重发 —— 10 分钟后租约到期把卡退回待认领。
+   */
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00017_zzz', origin: ORIGIN_A, name: 'A',
+        kind: 'task', taskId: 'own3', title: 'A 的第三张卡', status: 'pending',
+      }],
+    },
+  });
+  const claimOwn3 = await call(base, '/tasks/claim', {
+    method: 'POST', token: tokenB, body: { taskId: 'own3', leaseMs: 0 },
+  });
+  check('B 认领 own3（不开租约）', claimOwn3.ok === true, JSON.stringify(claimOwn3.error));
+
+  const doneWithTitle = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00018_aaa', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own3', title: 'B 顺手改的标题', status: 'done',
+      }],
+    },
+  });
+  check('owner 标 done 但夹带改标题 → 409', doneWithTitle.status === 409,
+    JSON.stringify(doneWithTitle.error));
+  const dtMsg = String(JSON.stringify(doneWithTitle.error || {}));
+  check('409 点名字段（改了标题）', dtMsg.includes('标题'), dtMsg.slice(0, 180));
+  check('409 明说 status=done 没记上', dtMsg.includes('done）也没记上') || dtMsg.includes('done 也没记上')
+    || dtMsg.includes('也没记上'), dtMsg.slice(0, 180));
+  check('409 给出重发写法（只带 status）', dtMsg.includes('只带'), dtMsg.slice(0, 220));
+
   const doneByB = await call(base, '/events', {
     method: 'POST',
     token: tokenB,
