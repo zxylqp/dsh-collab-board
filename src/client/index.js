@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 34;
-    const VERSION = '0.11.19';
+    const VERSION = '0.11.20';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1135,7 +1135,17 @@ window.__ModuleLoader__.load({
       });
       const unmet = deps.filter((d) => d.status !== 'done' && d.status !== 'cancelled');
 
-      const leaseEnd = task.claimedAt && task.leaseMs > 0 ? new Date(task.claimedAt).getTime() + task.leaseMs : 0;
+      /**
+       * 租约行只对 running 有意义（0.11.20）。
+       *
+       * `claimedAt` / `leaseMs` 是 HUB_ONLY_FIELDS，标 done 之后仍然留在任务对象上，
+       * 所以「有没有租约」和「租约还算不算数」是两件事：Hub 侧 30 秒扫到
+       * `status !== 'running'` 就把水印删了，但前端只按 `claimedAt + leaseMs` 算，
+       * 于是已完成的卡上挂着一个走不完的倒计时，走完还会永久显示「租约已到期」——
+       * 读起来像出事了。判状态，别判字段在不在。
+       */
+      const leaseEnd = task.status === 'running' && task.claimedAt && task.leaseMs > 0
+        ? new Date(task.claimedAt).getTime() + task.leaseMs : 0;
       const leaseLeft = leaseEnd ? leaseEnd - now : 0;
       const leaseWarn = leaseLeft > 0 && leaseLeft < 5 * 60 * 1000;
       const dueSoon = task.dueAt ? (new Date(task.dueAt).getTime() - now < 24 * 60 * 60 * 1000) : false;

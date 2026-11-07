@@ -121,9 +121,16 @@ async function main() {
    * 真源是 package.json，这里把它和客户端常量钉死，手推也拦得住。
    */
   const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  const clientVersion = (readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8')
-    .match(/const VERSION = '([^']+)'/) || [])[1];
+  const clientSrc = readFileSync(new URL('../src/client/index.js', import.meta.url), 'utf8');
+  const clientVersion = (clientSrc.match(/const VERSION = '([^']+)'/) || [])[1];
   check('客户端 VERSION 与 package.json 一致', clientVersion === pkgVersion, `${clientVersion} vs ${pkgVersion}`);
+  /**
+   * 0.11.20 踩的坑：done 卡的 `claimedAt` / `leaseMs` 还留在任务对象上，前端只按
+   * `claimedAt + leaseMs` 算时间差，于是已完成的卡上挂着一个走不完的倒计时，走完
+   * 还永久显示「租约已到期」。租约行必须先判 `running` —— 判状态，别判字段在不在。
+   */
+  const leaseLine = (clientSrc.match(/const leaseEnd = [^;]+;/) || [''])[0];
+  check('租约行只对 running 任务渲染', /task\.status === 'running'/.test(leaseLine), leaseLine.trim().slice(0, 80));
 
   apply(ctx, { dataDir, syncLanInbox: false });
   check('apply 不抛', true);
