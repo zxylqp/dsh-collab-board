@@ -450,6 +450,29 @@ async function main() {
     Boolean(editRes.payload?.event) && !('owner' in editRes.payload.event),
     JSON.stringify(editRes.payload?.event));
 
+  console.log('\n7b2. 假成功：本地写入不等于送达（0.11.23）');
+  const postToolFake = findTool(tools, 'collab_post');
+  const fakeOk = await postToolFake.execute({ kind: 'note', text: '本地写入文案测试' });
+  check('返回文案不再说「已写进看板」',
+    !/已写进看板/.test(String(fakeOk.text)), String(fakeOk.text).slice(0, 60));
+  check('返回文案说清「本地写入」+ 给 .synced.json 判据',
+    /已写进本机/.test(String(fakeOk.text))
+    && /\.synced\.json/.test(String(fakeOk.text))
+    && /seq/.test(String(fakeOk.text)),
+    String(fakeOk.text).slice(0, 120));
+
+  // 同一张卡连着被拒两次，state.rejected 只给最新一条（不然越攒越长没人看）
+  // 注意：rejected 只挂在 agent 用的 collab_state 上，panelState（面板）不返回它
+  for (const t of ['第一次拒', '第二次拒']) {
+    await postToolFake.execute({ kind: 'note', taskId: 'rejagg1', text: `一条事件被 Hub 拒了（task rejagg1）：${t}` });
+  }
+  const stateToolFake = findTool(tools, 'collab_state');
+  const stAggOut = JSON.parse((await stateToolFake.execute({ since: 0, advance: false })).text);
+  const agg = (stAggOut?.rejected || []).filter((r) => r.taskId === 'rejagg1');
+  check('同一张卡只留最新一条被拒记录',
+    agg.length === 1 && /第二次拒/.test(String(agg[0].text)),
+    JSON.stringify(agg).slice(0, 160));
+
   console.log('\n7c. 脏事件不堵队列（整批被拒时的逐条降级）');
   // 手工往日志里塞一条 Hub 必拒的事件：新建任务却写着别人的 owner。
   // 模拟旧版本客户端、或者直接改日志写进来的数据 —— 它不该让这台机器失去同步。
@@ -501,6 +524,17 @@ async function main() {
   const stateAfterDirty = await hit(routes, '/collab-board/state');
   check('被拒事件不进制看板的视图',
     !(stateAfterDirty.payload?.events || []).some((e) => e.id === dirtyId));
+
+  // 0.11.23：被拒的事必须主动送到 agent 眼前，别只躺在流里等人翻
+  // （涟涟 2026-11-07 就是没看见 532/533 那两条 note，在看板上宣布了一张没标成的卡「已改好」）
+  const stateToolD = findTool(tools, 'collab_state');
+  const stD = JSON.parse((await stateToolD.execute({ since: 0, advance: false })).text);
+  const rejRows = stD?.rejected || [];
+  const rejRow = rejRows.find((r) => r.taskId === 'dirty1');
+  check('collab_state.rejected 列出被拒的卡', Boolean(rejRow), JSON.stringify(rejRows).slice(0, 200));
+  check('rejected 只收拒绝提示，不混别的 note',
+    rejRows.every((r) => /被 Hub 拒/.test(String(r.text))),
+    JSON.stringify(rejRows.map((r) => String(r.text).slice(0, 30))));
 
   // ── 409 毒丸：改别人建的卡标题（0.10.8 修） ──
   // 以前 `conflict` 不在 isRejection 名单里，409 会走进「网络错误」分支：

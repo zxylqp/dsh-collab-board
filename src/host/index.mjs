@@ -1076,6 +1076,37 @@ export function apply(ctx, rawConfig = {}) {
     unread.sort((a, b) => a.seq - b.seq);
     const shown = unread.slice(-limit);
 
+    /**
+     * 被 Hub 拒掉的事件（0.11.23）。
+     *
+     * 拒的时候客户端只往流里补一条 note，agent 那边什么都看不见 —— 2026-11-07
+     * 涟涟把两张卡的 done 推上去，Hub 403（她不是创建者），工具回「已写进看板」，
+     * 她转身就在看板上宣布「改好了」。按 taskId 聚合、每张卡只留最新一条，
+     * agent 每轮读 collab_state 就自己看见，不用等人来指。
+     */
+    const rejectedByTask = new Map();
+    for (const ev of all) {
+      if (!ev || ev.kind !== 'note') continue;
+      const text = String(ev.text || '');
+      if (!text.includes('被 Hub 拒')) continue;
+      // 老 note 没 taskId 字段，反解文案（和客户端同一套规则）
+      const key = noteTaskIdOf(ev, text) || '(全局)';
+      const prev = rejectedByTask.get(key);
+      // 本机刚写的 note 没有 seq（Hub 才分号），所以 seq 缺失时按出现顺序判「后来者胜」
+      const seqOf = (row) => (Number.isFinite(row?.seq) ? row.seq : -1);
+      if (!prev || seqOf(prev) <= seqOf(ev)) {
+        const taskId = noteTaskIdOf(ev, text);
+        rejectedByTask.set(key, {
+          ...(taskId ? { taskId } : {}),
+          seq: ev.seq ?? null,
+          text: text.slice(0, 200),
+        });
+      }
+    }
+    const rejected = [...rejectedByTask.values()]
+      .sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0))
+      .slice(0, 10);
+
     return {
       ok: true,
       me: { origin: identity.origin, name: displayName() },
@@ -1088,6 +1119,8 @@ export function apply(ctx, rawConfig = {}) {
       pending,
       unread: shown,
       ...(unread.length > shown.length ? { truncated: unread.length - shown.length } : {}),
+      /** 被 Hub 拒掉的事件（按 taskId 聚合，最新一条）：没写进去的东西，得让人看得见。 */
+      ...(rejected.length ? { rejected } : {}),
     };
   }
 
@@ -1544,7 +1577,11 @@ export function apply(ctx, rawConfig = {}) {
           'done 只许任务负责人或创建者写，别人标会 403；**标 done 只发 {taskId, status:"done"}** —— '
           + '不是创建者还带 title / detail / dependsOn，会整条 403，done 也一起没了。' +
           '不做了就标 cancelled，别留 pending 卡堵下游。' +
-          '规矩：**先写日志再干活**，别干完才补记。',
+          '规矩：**先写日志再干活**，别干完才补记。' +
+          '**写进去 ≠ 别人看得见**（0.11.23）：工具只保证写进本机日志，经 Hub 收下才算送达。' +
+          '判据是 `.synced.json` —— 那条事件的 id 在里头拿到 seq 才算真进去（**日志里没有 seq**，' +
+          'Hub 分号只记在这个 sidecar 里）。被拒的话流里会多一条 warn note，' +
+          '`collab_state` 的 `rejected` 也会列出来。别把「已写进本机」当成「对方收到了」。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -1604,7 +1641,21 @@ export function apply(ctx, rawConfig = {}) {
           // 本地先挡：抢别人认领的卡这种事件推上去必被拒，写进日志只会堵住队列
           assertOwnerTransition(ev);
           appendEvent(ev);
-          return { ok: true, text: '已写进看板：' + JSON.stringify(ev).slice(0, 200) };
+          /**
+           * 0.11.23：文案降级。
+           *
+           * 以前这里写「已写进看板」—— 但工具只知道本地落盘了，push 是异步的，
+           * 那一刻根本不知道 Hub 收没收。汐汐 2026-11-07 就吃这个亏：Hub 403 拒了
+           * 她标 done 的事件，工具照样回「已写进看板」，她以为成了，看板上其实没变。
+           * 现在只说本地，并给出可验证的判据（Hub 收下才补 seq）。
+           */
+          return {
+            ok: true,
+            text:
+              '已写进本机，等待同步（到 Hub 之前别人看不见）：' + JSON.stringify(ev).slice(0, 200) +
+              '\n判据：这条（' + String(ev.id || '') + '）在 .synced.json 里拿到 seq 才算送达；' +
+              '被拒的话 collab_state 的 rejected 会写原因。',
+          };
         },
       }),
 
@@ -1816,7 +1867,9 @@ export function apply(ctx, rawConfig = {}) {
         description:
           '读协作看板：哪些卡归我、哪些待认领、有没有新消息。' +
           '**默认只返回上次读到的之后的增量**（游标存在本机），所以每轮调用很便宜 —— ' +
-          '被定时任务叫醒时先调它，没有新东西就什么都不用做，写一句「无新活」结束。',
+          '被定时任务叫醒时先调它，没有新东西就什么都不用做，写一句「无新活」结束。' +
+          '**看到 `rejected` 就是有东西没写进去**（Hub 拒了一条事件，按 taskId 聚合）：别装作没看见，' +
+          '先照它的说法改——多半是「不是创建者却标 done」或「给终态卡发评论」——再重发。',
         parameters: {
           type: 'object',
           additionalProperties: false,

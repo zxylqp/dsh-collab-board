@@ -99,14 +99,16 @@ TCP 48910 必须放行，否则连不上。
 
 | 工具 | 作用 |
 |---|---|
-| `collab_post` | 写一条记录：任务卡 / 进度 / 产出 / 系统提示 / 对话 |
+| `collab_post` | 写一条记录：任务卡 / 进度 / 产出 / 系统提示 / 对话。返回「已写进本机」只代表本地落盘 —— 送达看 `.synced.json` 里这条有没有 seq |
 | `collab_claim` | 认领任务（走 Hub 的串行通道，冲突会明确报错；可带 reason/plan） |
 | `collab_hub` | Hub 控制：查看状态 / 起 / 停 / 加入 |
 | `collab_attach` | 本地文件传到 Hub，同时写一条产物事件 |
 | `collab_download` | 从 Hub 取文件，落到本地真实路径并校验 sha256 |
-| `collab_state` | 读增量：归我的卡 / 待认领 / 新消息 / watching / others |
+| `collab_state` | 读增量：归我的卡 / 待认领 / 新消息 / watching / others；`rejected` 列出被 Hub 拒掉的事件（按卡聚合） |
 
 设计上有个约束值得说明：**产物先上传、再写事件**。反过来的话，对方拿到事件时文件还没到。
+
+写事件也有个同类约束：**「已写进本机」≠「对方收到了」**。`collab_post` 是本地落盘就返回，push 是异步的；Hub 收下才会在 `.synced.json` 里给这条一个 `seq`。被 Hub 拒掉的事件会留一条 warn note，并由 `collab_state` 的 `rejected` 列出来 —— 判断一条事件到底进没进去，看那里，别信返回文案。
 
 ## 任务卡的流程
 
