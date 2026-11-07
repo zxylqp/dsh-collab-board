@@ -946,6 +946,64 @@ async function main() {
     tombAfter.every((e) => !String(e.title || '').includes('想把正文写回来')),
     JSON.stringify(tombAfter.map((e) => e.title)));
 
+  /**
+   * 非创建者能不能把别人的描述清空？（0.11.20 排查时发现的口子）
+   *
+   * 权限检查里 detail 的判据是 `ev.detail !== '' && ev.detail !== prevTask.detail`：
+   * **空串不算「改」**，本来是为了让认领 / 完成这类事件（validateBatch 会把缺省
+   * detail 归一成空串）不被误判成改描述。但显式传 `detail: ''` 走的是同一条短路：
+   * `TASK_CARRY` 只在「键不存在」时补，`'detail' in raw` 为真就不补，空串直接落盘。
+   * 这条测试钉住期望行为：非创建者传空 detail 必须被拒、描述必须还在。
+   */
+  console.log('\n5b. 非创建者清空 description');
+  {
+    const wipeTask = 't-wipe-detail';
+    const mk = await call(base, '/events', {
+      method: 'POST',
+      token: tokenA,
+      body: {
+        events: [{
+          eventVersion: 2,
+          id: 'ev_aaaaaa_twipe0001_a',
+          origin: ORIGIN_A,
+          name: 'A',
+          ts: new Date().toISOString(),
+          kind: 'task',
+          taskId: wipeTask,
+          title: '有描述的一张卡',
+          status: 'pending',
+          detail: '这段描述不该被别人清掉',
+        }],
+      },
+    });
+    check('A 建卡带描述', mk.ok === true && mk.data?.accepted?.length === 1, JSON.stringify(mk.data).slice(0, 120));
+
+    const wipe = await call(base, '/events', {
+      method: 'POST',
+      token: tokenB,
+      body: {
+        events: [{
+          eventVersion: 2,
+          id: 'ev_bbbbbb_twipe0002_b',
+          origin: ORIGIN_B,
+          name: 'B',
+          ts: new Date().toISOString(),
+          kind: 'task',
+          taskId: wipeTask,
+          title: '有描述的一张卡',
+          status: 'running',
+          detail: '',
+        }],
+      },
+    });
+    check('非创建者传空 detail 被拒（期望）', wipe.ok === false, JSON.stringify(wipe).slice(0, 160));
+
+    const pull = await call(base, '/events?since=0', { token: tokenA });
+    const pullEvents = Array.isArray(pull.data?.events) ? pull.data.events : [];
+    const cur = pullEvents.filter((e) => e.taskId === wipeTask).pop();
+    check('描述没被清空', Boolean(cur) && cur.detail === '这段描述不该被别人清掉', String(cur?.detail));
+  }
+
   console.log('\n6. 重启接续');
   const beforeSeq = hub.controller.info().headSeq;
   const beforeEpoch = hub.controller.info().epoch;

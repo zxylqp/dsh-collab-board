@@ -169,21 +169,53 @@ export function apply(ctx, rawConfig = {}) {
    */
   const wakeState = { lastAt: new Map() };
 
+  /** 自动续跑撞上「会话在跑」时抛它：delivery 认 `postponeMs`，不消耗重试次数。 */
+  class WakePostponed extends Error {
+    constructor(message, postponeMs) {
+      super(message);
+      this.postponeMs = postponeMs;
+    }
+  }
+  /** 延后多久再看一眼。会话跑完一轮的时长不可控，60 秒是「别太密、也别太迟」的折中。 */
+  const WAKE_POSTPONE_MS = 60000;
+
+  /**
+   * 挑一个能唤醒的会话。返回整条 summary（不只是 id）——
+   * `running` 是 0.11.21 新增的用途：自动续跑不能往一个正在跑一轮的会话里塞消息。
+   */
   async function pickWakeSession() {
     const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
-    if (!svc || typeof svc.list !== 'function') return '';
+    if (!svc || typeof svc.list !== 'function') return null;
     const out = await svc.list();
     const items = Array.isArray(out?.items) ? out.items : [];
     const alive = items.filter((s) => s && typeof s.sessionId === 'string' && s.agentAvailable !== false);
     alive.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
-    return alive[0] ? alive[0].sessionId : '';
+    return alive[0] || null;
   }
 
-  async function wakeAgent(text) {
+  /**
+   * 叫醒本机 agent。
+   *
+   * @param {string} text
+   * @param {{kind?:string}} [item] 账本里那条。只有 `kind === 'self'` 会走「会话在跑就延后」：
+   *   别人发的消息该排队（人就在等回话），自动续跑是插件自己的空转，不该插进正在跑的轮次里。
+   */
+  async function wakeAgent(text, item) {
     const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
     if (!svc || typeof svc.prompt !== 'function') throw new Error('宿主没有 sessionController.prompt');
-    const sessionId = await pickWakeSession();
-    if (!sessionId) throw new Error('找不到可唤醒的会话');
+    const picked = await pickWakeSession();
+    if (!picked) throw new Error('找不到可唤醒的会话');
+    const sessionId = picked.sessionId;
+    /**
+     * 0.11.21：自动续跑不往正在跑的会话里塞。
+     *
+     * 原来只有一个来源：`mode: 'queue'`，宿主会把消息排进那一轮后面 —— 于是
+     * 「会话在干活」和「续跑又推了一条」撞在一起，agent 干完手头的活还要再回一条
+     * 插件自己排的空转消息，越跑越多。延后不算失败：账留在原处，60 秒后再看。
+     */
+    if (item && item.kind === 'self' && picked.running === true) {
+      throw new WakePostponed(`会话 ${String(sessionId).slice(0, 8)}… 正在跑一轮，自动续跑延后`, WAKE_POSTPONE_MS);
+    }
     // requestId 是必填（SessionRequestId），mode 显式给 queue：看板消息不该打断正在跑的轮次。
     const request = {
       requestId: `collab-wake-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
@@ -387,7 +419,7 @@ export function apply(ctx, rawConfig = {}) {
       const text = item.kind === 'self' && item.text
         ? item.text
         : wakeText({ taskId: item.taskId, from: item.from }, item.attempts, item.deferred);
-      return wakeAgent(text).then((r) => {
+      return wakeAgent(text, item).then((r) => {
         // 冷却从「真正投出去」那一刻算：投递可能等一整轮，别让它占发起时刻
         wakeState.lastAt.set(item.taskId || 'global', Date.now());
         return r;

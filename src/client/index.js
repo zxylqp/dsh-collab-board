@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 34;
-    const VERSION = '0.11.20';
+    const BUILD = 35;
+    const VERSION = '0.11.21';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -159,6 +159,25 @@ window.__ModuleLoader__.load({
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .cb-task[data-done] .cb-task-title{color:var(--dsw-alias-label-tertiary);text-decoration:line-through;
   text-decoration-color:var(--dsw-alias-border-l4);}
+/**
+ * 状态色（0.11.21）。
+ *
+ * 原来只有「已完成」一条规则：五种状态在列表里几乎同色，得靠读那几个字才分得清。
+ * 现在每种状态一个色，落在**左侧竖条 + 标题 + 状态丸**三处，扫一眼就能分：
+ *   待认领 = 灰（谁都能接，不急）｜进行中 = 蓝｜已阻塞 = 红｜已完成 = 绿｜已取消 = 暗灰 + 删除线
+ */
+.cb-task[data-status="pending"]:not([data-on])::before{background:var(--dsw-alias-border-l3);}
+.cb-task[data-status="running"]:not([data-on])::before{background:var(--dsw-alias-state-business-primary);}
+.cb-task[data-status="blocked"]:not([data-on])::before{background:var(--dsw-alias-state-error-primary);}
+.cb-task[data-status="done"]:not([data-on])::before{background:var(--dsw-alias-state-success-primary);}
+.cb-task[data-status="cancelled"]:not([data-on])::before{background:var(--dsw-alias-label-dimmed);}
+.cb-task[data-status="blocked"] .cb-task-title{color:var(--dsw-alias-label-error);}
+.cb-task[data-status="done"] .cb-task-title,
+.cb-task[data-status="cancelled"] .cb-task-title{color:var(--dsw-alias-label-tertiary);
+  text-decoration:line-through;text-decoration-color:var(--dsw-alias-border-l4);}
+.cb-task[data-status="cancelled"]{opacity:.6;}
+.cb-meta-time{flex:none;font-variant-numeric:tabular-nums;letter-spacing:.2px;
+  color:var(--dsw-alias-label-caption);white-space:nowrap;}
 .cb-task[data-pri="low"] .cb-task-title{color:var(--dsw-alias-label-secondary);}
 .cb-meta{display:flex;align-items:center;gap:6px;min-width:0;font-size:11.5px;line-height:17px;
   color:var(--dsw-alias-label-tertiary);}
@@ -410,6 +429,22 @@ window.__ModuleLoader__.load({
       const sameYear = d.getFullYear() === now.getFullYear();
       return (sameYear ? '' : String(d.getFullYear()) + '-') + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
         ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
+
+    /**
+     * 列表里的紧凑时间（0.11.21）。
+     *
+     * 今天只给 `19:11`，别的日子给 `11-07 19:11`；跨年才带年份。
+     * 任务列表一栏就那么宽，完整时间放 title 悬停里，不跟标题抢地方。
+     */
+    function fmtCompact(iso) {
+      const d = toDate(iso);
+      if (!d) return '';
+      const now = new Date();
+      const hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) return hm;
+      const sameYear = d.getFullYear() === now.getFullYear();
+      return (sameYear ? '' : String(d.getFullYear()) + '-') + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + hm;
     }
 
     function relTime(iso) {
@@ -937,7 +972,19 @@ window.__ModuleLoader__.load({
       const lastAction = task.archived
         ? '归档'
         : (task.status === 'done' ? '完成' : (task.status === 'cancelled' ? '取消' : ''));
-      const actionLine = lastAction && task.lastActor ? lastAction + ' ' + nameOf(task.lastActor) : '';
+      /**
+       * 时间戳（0.11.21）。
+       *
+       * 爸爸 2026-11-07：「任务列表里，任务信息显示要有时间戳」—— 卡上一直只有
+       * 「创建 谁」，看不出这张卡是什么时候建的、最后一次动是什么时候。列表里
+       * 用紧凑写法（今天只给 19:11，别的日子给 11-07 19:11），完整时间放 title。
+       */
+      const tsText = (iso) => (!iso ? '' : (timeMode === 'relative' ? relTime(iso) : fmtCompact(iso)));
+      const createdText = task.createdTs ? ' · ' + tsText(task.createdTs) : '';
+      const updatedText = task.updatedTs ? ' · ' + tsText(task.updatedTs) : '';
+      const actionLine = lastAction && task.lastActor
+        ? lastAction + ' ' + nameOf(task.lastActor) + updatedText
+        : '';
 
       const tags = task.tags.slice(0, 2);
       const moreTags = task.tags.length - tags.length;
@@ -950,6 +997,8 @@ window.__ModuleLoader__.load({
         'data-on': props.active ? '' : undefined,
         'data-pri': task.priority,
         'data-done': done ? '' : undefined,
+        /** 状态 → 颜色（0.11.21）。CSS 按它上色，列表里五种状态一眼分得开。 */
+        'data-status': task.deleted ? 'cancelled' : task.status,
         'data-archived': task.archived ? '' : undefined,
         onClick: () => props.onSelect(task.taskId),
         onContextMenu: (e) => { e.preventDefault(); props.onMenu(e, task); },
@@ -964,13 +1013,17 @@ window.__ModuleLoader__.load({
           unsynced ? h(Dot, { tone: 'sync', title: '还没同步' }) : null,
           h('div', { className: 'cb-meta-right' },
             task.owner
-              ? h(Avatar, { name: task.owner, seed: task.owner, small: true, title: task.owner })
+              ? h(Avatar, { name: nameOf(task.owner), seed: task.owner, small: true, title: '负责人 ' + nameOf(task.owner) })
               : (task.status === 'pending' ? h('span', { className: 'cb-hint' }, '待接取') : null),
           ),
         ),
         h('div', { className: 'cb-meta' },
-          h('span', { className: 'cb-meta-id', title: '创建者' }, '创建 ' + nameOf(task.creator)),
-          actionLine ? h('span', { className: 'cb-meta-text', title: '最后动作' }, actionLine) : null,
+          h('span', { className: 'cb-meta-id', title: '创建于 ' + fmtShort(task.createdTs) }, '创建 ' + nameOf(task.creator) + createdText),
+          actionLine ? h('span', { className: 'cb-meta-text', title: '最后动作：' + lastAction + '（' + fmtShort(task.updatedTs) + '）' }, actionLine) : null,
+          // 还在跑的卡没有「最后动作」，单独给最后更新时间，别让人以为这张卡一直没动过
+          !actionLine && task.updatedTs
+            ? h('span', { className: 'cb-meta-time', title: '最后更新 ' + fmtShort(task.updatedTs) }, '更新 ' + tsText(task.updatedTs))
+            : null,
           h('span', {
             className: 'cb-meta-text',
             style: dueSoon ? { color: 'var(--dsw-alias-label-error)' } : undefined,
@@ -992,13 +1045,17 @@ window.__ModuleLoader__.load({
     }
 
     function BoardList(props) {
-      const { model, settings, filter, setFilter, showDone, setShowDone, showArchived, setShowArchived } = props;
+      const {
+        model, settings, filter, setFilter, showDone, setShowDone,
+        showCancelled, setShowCancelled, showArchived, setShowArchived,
+      } = props;
       const tasks = model.tasks;
       const counts = useMemo(() => ({
         pending: tasks.filter((t) => t.status === 'pending').length,
         running: tasks.filter((t) => t.status === 'running').length,
         blocked: tasks.filter((t) => t.status === 'blocked').length,
         done: tasks.filter((t) => t.status === 'done').length,
+        cancelled: tasks.filter((t) => t.status === 'cancelled').length,
         archived: tasks.filter((t) => t.archived).length,
       }), [tasks]);
 
@@ -1007,6 +1064,14 @@ window.__ModuleLoader__.load({
         if (t.deleted && !settings.showDeleted) return false;
         if (t.archived && !showArchived) return false;
         if (t.status === 'done' && !showDone) return false;
+        /**
+         * 取消的卡默认收起来（0.11.21）。
+         *
+         * 爸爸 2026-11-07：「取消的任务还如何处理，不能一直显示」—— 原来 done 有开关、
+         * 归档有开关，就 cancelled 没有，于是被取消的卡永远趴在「全部」里，越积越多。
+         * 已经结束的事就该沉下去；要看的时候单独点开。
+         */
+        if (t.status === 'cancelled' && !showCancelled) return false;
         if (filter === 'all') return true;
         return t.status === filter;
       });
@@ -1039,6 +1104,20 @@ window.__ModuleLoader__.load({
             },
             title: '显示 / 收起已完成（会切到「全部」）',
           }, '已完成' + (counts.done ? ' ' + counts.done : '')),
+          counts.cancelled
+            ? h('button', {
+              type: 'button',
+              className: 'cb-filter',
+              'data-on': showCancelled ? '' : undefined,
+              // 跟「已完成」同一个道理：不切到「全部」的话，按钮亮了列表还是空的。
+              onClick: () => {
+                const next = !showCancelled;
+                setShowCancelled(next);
+                if (next && filter !== 'all') setFilter('all');
+              },
+              title: '显示 / 收起已取消（会切到「全部」）',
+            }, '已取消' + (counts.cancelled ? ' ' + counts.cancelled : ''))
+            : null,
           counts.archived
             ? h('button', {
               type: 'button',
@@ -1231,7 +1310,7 @@ window.__ModuleLoader__.load({
                     onClick: () => patchTask({ status: 'done' }, 'done'),
                   }, busy === 'done' ? '写入中…' : '标记完成')
                   : null,
-                task.status === 'done'
+                task.status === 'done' || task.status === 'cancelled'
                   ? h(Btn, { disabled: Boolean(busy), onClick: () => patchTask({ status: 'running' }, 'reopen') }, '重新打开')
                   : null,
                 h(Btn, {
@@ -1263,15 +1342,24 @@ window.__ModuleLoader__.load({
               : h('div', { className: 'cb-hint' }, '没有写描述。'),
             h('div', { style: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 } },
               /**
-               * 创建者 / 最后动作 / taskId（0.11.19）。
+               * 创建者 / 时间 / 最后动作 / taskId（0.11.19 起定形，0.11.21 补时间戳）。
                *
                * id 留在详情里而不是列表：agent 要它（评论、认领都靠它），
                * 人对一串 `t-rpp5ng3` 没兴趣 —— 列表上那一栏换成了「创建 张三」。
                */
               h('div', { className: 'cb-hint' },
-                '创建 ' + nameOf(task.creator)
-                + (lastAction ? ' · ' + lastAction + ' ' + nameOf(task.lastActor) : '')
-                + ' · id ' + task.taskId),
+                '创建 ' + nameOf(task.creator) + (task.createdTs ? ' ' + fmtShort(task.createdTs) : ''),
+              ),
+              h('div', { className: 'cb-hint' },
+                '最后更新 ' + (task.updatedTs ? fmtShort(task.updatedTs) : '—')
+                + (lastAction ? ' · ' + lastAction + ' ' + nameOf(task.lastActor) : ''),
+              ),
+              h('div', { className: 'cb-hint', title: '任务 id：评论、认领、同步都靠它' },
+                'id ' + task.taskId),
+              h('div', { className: 'cb-hint', title: '本机事件序号 / 来源' },
+                task.ev && Number.isFinite(Number(task.ev.seq))
+                  ? '事件 ' + (Number(task.ev.epoch) || 1) + '/' + task.ev.seq + ' · 来自 ' + nameOf(task.ev.origin)
+                  : '事件 本机未同步'),
               deps.length === 0
                 ? h('div', { className: 'cb-hint' }, '前置任务：无')
                 : deps.map((dep) => h('div', {
@@ -1302,7 +1390,8 @@ window.__ModuleLoader__.load({
                     key: 'v-' + i,
                     className: 'cb-hint',
                   }, fmtShort(v.ts) + ' · ' + (STATUS_LABEL[v.status] || v.status || '—') +
-                    (v.title ? ' · ' + v.title : '') + (v.owner ? ' · ' + v.owner : ''))))
+                    // owner 存的是 origin（一串 16 位十六进制）；这里翻成名字，别往人脸上糊哈希
+                    (v.title ? ' · ' + v.title : '') + (v.owner ? ' · ' + nameOf(v.owner) : ''))))
                 : null,
             ),
           ),
@@ -1460,7 +1549,7 @@ window.__ModuleLoader__.load({
     /* ────────────────────────────── 看板：全局流 ────────────────────────────── */
 
     function GlobalFeed(props) {
-      const { model, settings, me, toast } = props;
+      const { model, settings, me, toast, showCancelled } = props;
       const scrollRef = useRef(null);
 
       const entries = useMemo(() => {
@@ -1526,10 +1615,15 @@ window.__ModuleLoader__.load({
            * 点进去 29 条评论全文都在。「删除」删的是标题，评论一条没动，等于删了个寂寞。
            */
           if (model.deletedIds.has(taskId)) continue;
+          /**
+           * 取消的卡跟列表同一个开关（0.11.21）：列表里收起来了，底部这份索引
+           * 也不该还把它拎出来（否则等于换个地方继续显示）。
+           */
+          if (task && task.status === 'cancelled' && !showCancelled) continue;
           rows.push({ taskId, count: list.length, title: task ? task.title : taskId });
         }
         return rows.sort((a, b) => b.count - a.count);
-      }, [model]);
+      }, [model, showCancelled]);
 
       return h('div', { className: 'cb-detail' },
         h('div', { className: 'cb-toolbar' },
@@ -1568,7 +1662,7 @@ window.__ModuleLoader__.load({
             onClick: () => props.onOpenTask(row.taskId),
           },
             h(Icon, { name: 'chat', size: 12 }),
-            h('span', { className: 'cb-grow' }, row.taskId + ' · ' + row.title),
+            h('span', { className: 'cb-grow', title: row.taskId }, row.title),
             h('span', { className: 'cb-hint' }, row.count + ' 条任务评论'),
           )),
         ),
@@ -2421,6 +2515,8 @@ window.__ModuleLoader__.load({
       const [width, setWidth] = useState(820);
       const [filter, setFilter] = useState('all');
       const [showDone, setShowDone] = useState(false);
+      /** 取消的卡默认收起来（0.11.21）：结束的事不该一直占着列表。 */
+      const [showCancelled, setShowCancelled] = useState(false);
       const [showArchived, setShowArchived] = useState(false);
       const [creating, setCreating] = useState(false);
       const [menu, setMenu] = useState(null);
@@ -2769,6 +2865,8 @@ window.__ModuleLoader__.load({
             setFilter,
             showDone,
             setShowDone,
+            showCancelled,
+            setShowCancelled,
             showArchived,
             setShowArchived,
             selectedId,
@@ -2805,6 +2903,7 @@ window.__ModuleLoader__.load({
               settings,
               me,
               toast,
+              showCancelled,
               onPost: post,
               onOpenTask: (id) => { setFeedOpen(false); openTask(id); },
             }),

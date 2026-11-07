@@ -1052,10 +1052,21 @@ export async function startHub(opts = {}) {
          */
         const TASK_CARRY = ['title', 'detail', 'owner', 'priority', 'tags', 'dependsOn',
           'requiredCapabilities', 'dueAt', 'archived'];
+        /**
+         * 客户端**原始**事件里显式给了 `detail` 的 id 集合（0.11.20）。
+         *
+         * 为什么要单独记：`validateEvent` 会把缺省 detail 归一成空串，之后权限检查
+         * 就分不清「没带 detail」（该继承上一版）和「显式传了空串」（该当成「改描述」
+         * 拦住）。没有这层，任何成员发一条 `detail: ''` 就能清空别人的描述 ——
+         * `TASK_CARRY` 只补「键不存在」的情况，显式空串它不碰，而权限检查里的
+         * `ev.detail !== ''` 又正好把空串当成「没改」，两头一夹就从中间漏过去了。
+         */
+        const explicitDetailIds = new Set();
         const prepped = Array.isArray(list)
           ? list.map((raw) => {
             if (!raw || raw.kind !== 'task') return raw;
             if (raw.deleted === true) return raw; // 墓碑就是要擦空，别往回填
+            if ('detail' in raw && typeof raw.id === 'string' && raw.id) explicitDetailIds.add(raw.id);
             const id = String(raw.taskId || raw.id || '').trim();
             const prev = id ? tasks.get(id) : null;
             if (!prev) return raw;
@@ -1126,11 +1137,12 @@ export async function startHub(opts = {}) {
                 { field: 'taskId' });
             }
             if (prevTask && creator && ev.origin !== creator) {
-              // detail 只比「有内容的变更」：validateBatch 会把缺省字段归一成空串，
-              // 认领 / 完成这类事件本来就不带 detail，空串 ≠ 改描述。
+              // detail 只比「客户端显式带了 detail 的变更」：`validateEvent` 会把缺省
+              // detail 归一成空串，认领 / 完成这类事件本来就不带 detail，不能当改描述。
+              // 但要区分「没带」和「显式传空串」—— 后者是清空，必须拦（0.11.20）。
               const changed = [];
               if ('title' in ev && ev.title !== prevTask.title) changed.push('标题');
-              if ('detail' in ev && ev.detail !== '' && ev.detail !== prevTask.detail) changed.push('描述');
+              if ('detail' in ev && explicitDetailIds.has(ev.id) && ev.detail !== prevTask.detail) changed.push('描述');
               if ('dependsOn' in ev
                 && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || [])) changed.push('依赖');
               if (changed.length > 0) {

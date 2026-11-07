@@ -27,6 +27,14 @@ export const DEFAULT_RETRIES = 3;
 export const RETRY_DELAY_MS = 30000;
 /** done 列表留多少条。它是幂等凭据，不是历史，不需要无界增长。 */
 export const DONE_LIMIT = 500;
+/**
+ * 一条唤醒最多能「延后」几次（0.11.21）。
+ *
+ * 延后不是失败：它只发生在「目标会话正在跑一轮」的时候 —— 自动续跑宁可等着，
+ * 也不该往一个正在干活的会话里再塞一条。每次延后 60 秒，20 次 = 20 分钟；
+ * 超过就悄悄放手：**不写看板 note**，否则一个长会话会把看板刷满「又延后了一次」。
+ */
+export const MAX_POSTPONES = 20;
 
 /**
  * @param {object} opts
@@ -229,6 +237,32 @@ export function createDelivery({
           log('warn', `投递后回调炸了：${e instanceof Error ? e.message : String(e)}`);
         }
       } catch (e) {
+        /**
+         * 「延后」不是失败（0.11.21）。
+         *
+         * 目标会话正在跑一轮（`SessionSummary.running`）：自动续跑先不往里塞，
+         * 60 秒后再看。三件事跟普通失败必须不一样：
+         *   - **不消耗重试次数**，否则跑满 wakeRetries 就被当死信放弃；
+         *   - 不写「失败」日志，它不是错；
+         *   - 延后太多次就悄悄放手，不写看板 note —— 长会话期间刷 note 比不续跑还吵。
+         */
+        const postponeMs = Number(e && e.postponeMs) || 0;
+        if (postponeMs > 0) {
+          item.attempts = Math.max(0, item.attempts - 1);
+          item.postpones = (Number(item.postpones) || 0) + 1;
+          if (item.postpones <= MAX_POSTPONES) {
+            item.nextAt = Date.now() + postponeMs;
+            persist();
+            lastError = '';
+            log('info', `延后投递：${item.eventId}（会话在跑，${Math.round(postponeMs / 1000)} 秒后再看）`);
+            continue;
+          }
+          state.items = state.items.filter((it) => it !== item);
+          rememberDone(item.eventId);
+          persist();
+          log('info', `放手：${item.eventId} 延后 ${item.postpones} 次，会话一直在跑，不再塞了`);
+          continue;
+        }
         item.lastError = e instanceof Error ? e.message : String(e);
         lastError = item.lastError;
         const max = maxAttempts();

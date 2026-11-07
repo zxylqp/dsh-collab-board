@@ -131,6 +131,20 @@ async function main() {
    */
   const leaseLine = (clientSrc.match(/const leaseEnd = [^;]+;/) || [''])[0];
   check('租约行只对 running 任务渲染', /task\.status === 'running'/.test(leaseLine), leaseLine.trim().slice(0, 80));
+  /**
+   * 0.11.21 的三条外观约定，用静态断言钉住。
+   *
+   * 面板没有前端测试（手写 bundle、跑起来要真宿主），所以这几条只能钉源码 ——
+   * 跟上面 VERSION 那条同一个思路：改错了先在这里红，不要等真机上看出来。
+   */
+  check('取消的卡默认收起（不是删除）',
+    clientSrc.includes("t.status === 'cancelled' && !showCancelled"), '');
+  check('五种状态各有一个颜色规则（data-status）',
+    ['pending', 'running', 'blocked', 'done', 'cancelled']
+      .every((s) => clientSrc.includes(`.cb-task[data-status="${s}"]`)), '');
+  check('列表行带时间戳（创建 / 更新）',
+    clientSrc.includes('const createdText = task.createdTs')
+      && clientSrc.includes("'更新 ' + tsText(task.updatedTs)"), '');
 
   apply(ctx, { dataDir, syncLanInbox: false });
   check('apply 不抛', true);
@@ -901,6 +915,40 @@ async function main() {
   check('放弃后账本不堵着', d2.snapshot().queued === 0);
   d2.close();
 
+  /**
+   * 11a-2. 「延后」不是失败（0.11.21）。
+   *
+   * 从 0.11.21 起，`send` 遇到「目标会话正在跑一轮」会抛带 `postponeMs` 的错。
+   * 那三件事必须成立：不消耗重试次数、账留着、排到之后再看 ——
+   * 否则自动续跑会在第一次撞上忙会话时就当死信放弃，或者把 wakeRetries 打光。
+   */
+  const dfp = join(mkdtempSync(join(tmpdir(), 'collab-postpone-')), 'inflight.json');
+  const postponeCalls = [];
+  let postponeLeft = 2;
+  const dp = createDelivery({
+    file: dfp,
+    delayMs: 10,
+    retries: () => 3,
+    send: async (item) => {
+      postponeCalls.push(item.eventId);
+      if (postponeLeft > 0) {
+        postponeLeft -= 1;
+        const e = new Error('会话在跑');
+        e.postponeMs = 20;
+        throw e;
+      }
+    },
+  });
+  dp.offer({ eventId: 'ev_postpone', taskId: 'tp', kind: 'self', from: '我', text: '续跑' });
+  await waitFor(() => postponeCalls.length >= 1, 1000);
+  const pFirst = (dp.state().items || []).find((it) => it.eventId === 'ev_postpone');
+  check('延后不消耗重试次数（attempts 回到 0）', Number(pFirst?.attempts) === 0, String(pFirst?.attempts));
+  check('延后后账还留着', Boolean(pFirst), JSON.stringify((dp.state().items || []).map((it) => it.eventId)));
+  check('延后记了次数', Number(pFirst?.postpones) >= 1, String(pFirst?.postpones));
+  await waitFor(() => dp.snapshot().queued === 0, 2000);
+  check('会话空下来之后照常投出去', postponeCalls.length === 3, JSON.stringify(postponeCalls));
+  dp.close();
+
   // 11b. 冷却期里的消息不再被丢掉（0.10.10）
   const dfc = join(mkdtempSync(join(tmpdir(), 'collab-cool-')), 'inflight.json');
   const coolCalls = [];
@@ -1076,6 +1124,82 @@ async function main() {
 
   for (const c of contCtx2.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
   rmSync(contDir, { recursive: true, force: true });
+
+  /**
+   * 12c2. 会话在跑时，自动续跑不往里塞（0.11.21）。
+   *
+   * 爸爸 2026-11-07：「如果一个会话在跑，自动续跑会迟迟推消息到这个正在进行的会话」。
+   * 判据是 `SessionSummary.running`：自己排的续跑撞上 running 就延后，
+   * 人发来的消息不受影响（人就在等回话，排队是对的）。
+   */
+  console.log('\n12c2. 会话在跑 → 自动续跑延后，不插进正在跑的轮次');
+  const busyDir = mkdtempSync(join(tmpdir(), 'collab-busy-'));
+  const busyProbe = makeCtx({});
+  apply(busyProbe.ctx, { dataDir: busyDir, syncLanInbox: false });
+  let busyOrigin = '';
+  try {
+    busyOrigin = JSON.parse(readFileSync(join(busyDir, 'identity.json'), 'utf8')).origin || '';
+  } catch { /* 下面会红 */ }
+  for (const c of busyProbe.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
+
+  writeFileSync(join(busyDir, 'settings.json'), JSON.stringify({
+    wakeOnMessage: true,
+    wakeSelfContinue: true,
+    wakeSelfContinueMax: 2,
+    wakeCooldownMs: 60000,
+    wakeRetries: 3,
+  }), 'utf8');
+  writeFileSync(join(busyDir, 'events.jsonl'), JSON.stringify({
+    id: 'ev_busy_task_1',
+    kind: 'task', taskId: 't-busy', title: '忙时续跑', status: 'running', owner: busyOrigin,
+  }) + '\n', 'utf8');
+  writeFileSync(join(busyDir, 'inflight.json'), JSON.stringify({
+    version: 1,
+    items: [{
+      eventId: 'ev_self_t-busy_1',
+      taskId: 't-busy',
+      kind: 'self',
+      from: '我',
+      text: '【协作看板自动触发（自动续跑 1/2）】任务 t-busy「忙时续跑」还是 running',
+      attempts: 2,
+      at: Date.now(),
+      nextAt: 0,
+      lastError: '',
+    }],
+    done: [],
+  }), 'utf8');
+
+  const busyCalls = [];
+  const busyCtx = makeCtx({
+    sessionController: {
+      list: async () => ({
+        items: [{ sessionId: 'sess-busy', updatedAt: Date.now(), agentAvailable: true, running: true }],
+      }),
+      prompt: async (request, signal) => {
+        busyCalls.push(request);
+        signal.throwIfAborted();
+        return { accepted: true };
+      },
+    },
+  });
+  apply(busyCtx.ctx, { dataDir: busyDir, syncLanInbox: false });
+  await new Promise((r) => setTimeout(r, 3600));
+  check('会话在跑 → 续跑没投进去', busyCalls.length === 0, `calls=${busyCalls.length}`);
+  let busyLedger = { items: [] };
+  try {
+    busyLedger = JSON.parse(readFileSync(join(busyDir, 'inflight.json'), 'utf8'));
+  } catch { /* 下面会红 */ }
+  const busyItem = (busyLedger.items || []).find((it) => it.eventId === 'ev_self_t-busy_1');
+  check('延后不是放弃：账还留着', Boolean(busyItem), JSON.stringify((busyLedger.items || []).map((it) => it.eventId)));
+  check('延后不消耗重试次数（attempts 仍是 2，没被当死信）', Number(busyItem?.attempts) === 2,
+    String(busyItem?.attempts));
+  check('排到稍后再看（不是立刻重投）', (Number(busyItem?.nextAt) || 0) > Date.now() + 30000,
+    String(busyItem?.nextAt));
+  check('没写「自动唤醒失败」的看板提示',
+    !readFileSync(join(busyDir, 'events.jsonl'), 'utf8').includes('自动唤醒失败'));
+
+  for (const c of busyCtx.cleanups.reverse()) { try { c(); } catch { /* 忽略 */ } }
+  rmSync(busyDir, { recursive: true, force: true });
 
   /* ───────────────────── 启动接 Hub 失败重试（0.10.12） ───────────────────── */
 
