@@ -190,6 +190,9 @@ async function main() {
     '甲看不到乙的卡');
   check('乙机建卡 → 甲机也看到', aSeesB);
 
+  // 3.1b（unread 投影不带空串）没法在这里验：本机自写的事件没有 seq（unread 只收
+  // seq > from 的），而同步过来的事件又被 Hub 补了字段。这条靠真机复验。
+
   console.log('\n3.2 串行认领（同时点同一张卡）');
   const [ca, cb] = await Promise.all([
     hit(A.routes, '/collab-board/tasks/claim', { method: 'POST', body: { taskId: 't-a' } }),

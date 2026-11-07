@@ -1013,13 +1013,21 @@ export function apply(ctx, rawConfig = {}) {
           text: String(ev.text || '').slice(0, 500),
         });
       } else if (ev.kind === 'task') {
+        /**
+         * 缺省字段不写空串（0.11.16）。
+         *
+         * 以前 `owner: ev.owner || ''` —— 一条只带 status 的事件在投影里就变成
+         * `owner: ""`，看着像「这张卡被释放了」，其实只是这条事件没带 owner。
+         * 汐汐 2026-11-07 就是被这个投影骗过一次（她以为 claim 事件把 owner 冲掉了）。
+         * 现在是「有才写」：缺键 = 这条事件没带，卡的当前状态看 mine/watching/pending。
+         */
         unread.push({
           seq: ev.seq,
           kind: 'task',
           taskId: ev.taskId,
-          title: ev.title,
-          status: ev.status,
-          owner: ev.owner || '',
+          ...(ev.title !== undefined ? { title: ev.title } : {}),
+          ...(ev.status !== undefined ? { status: ev.status } : {}),
+          ...(ev.owner !== undefined ? { owner: ev.owner } : {}),
         });
       } else if (ev.kind === 'artifact') {
         unread.push({

@@ -1429,6 +1429,9 @@ async function main() {
   check('claimableTasks 也保住了标题', t1Pending?.task?.title === '待认领卡',
     JSON.stringify(t1Pending?.task || null));
 
+  // 12p（unread 投影）需要事件带 seq，本机 Hub 已停时写的事件没有 seq，
+  // 这条放到 two-machine.test.mjs 里验 —— 那边的事件都由 Hub 分配序号。
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
