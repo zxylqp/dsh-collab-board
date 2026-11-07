@@ -1083,12 +1083,18 @@ export function apply(ctx, rawConfig = {}) {
      * 涟涟把两张卡的 done 推上去，Hub 403（她不是创建者），工具回「已写进看板」，
      * 她转身就在看板上宣布「改好了」。按 taskId 聚合、每张卡只留最新一条，
      * agent 每轮读 collab_state 就自己看见，不用等人来指。
+     *
+     * 0.11.25 起跟 `unread` 同一个口径：**只给游标之后的**（`full:true` 才给全部）。
+     * 理由是汐汐指出的那个：agent 每轮醒来第一件事就是调它，十条历史全文
+     * 等于每轮都交一遍旧账；它要的是「我这轮有没有新翻车」，不是历史总账。
+     * seq 缺失的（本机刚写、还没经 Hub）照样给——那正是刚发生的事。
      */
     const rejectedByTask = new Map();
     for (const ev of all) {
       if (!ev || ev.kind !== 'note') continue;
       const text = String(ev.text || '');
       if (!text.includes('被 Hub 拒')) continue;
+      if (Number.isFinite(ev.seq) && ev.seq <= from) continue;
       // 老 note 没 taskId 字段，反解文案（和客户端同一套规则）
       const key = noteTaskIdOf(ev, text) || '(全局)';
       const prev = rejectedByTask.get(key);

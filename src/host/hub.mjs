@@ -1071,6 +1071,30 @@ export async function startHub(opts = {}) {
          * 现在发送侧不再兜底，**这一层必须补**，否则落盘事件的 status 会凭空消失，
          * 折叠时那张卡就变成「没有状态」。
          */
+        /**
+         * 墓碑预检（0.11.25）：**先判卡还在不在，再判格式对不对**。
+         *
+         * 汐汐 2026-11-07 故意给一张已删除的卡发不带 `title` 的事件，想撞墓碑判定，
+         * 结果先撞上 `validateEvent` 的「task 要有 title」（400），压根走不到下面
+         * 1155 行那个墓碑分支。人看到「格式不对」会去补字段，而病根是这张卡已经不在了
+         * —— 补了也写不进去。
+         *
+         * 这一步放在校验之前：判「删没删」只需要 taskId，不需要 title，也不需要别的字段。
+         * 下面那个 409 墓碑分支保留（双保险，也覆盖本文件之外直接写日志的路径）。
+         */
+        if (Array.isArray(list)) {
+          for (const raw of list) {
+            if (!raw || raw.kind !== 'task' || raw.deleted === true) continue;
+            const tid = String(raw.taskId || raw.id || '').trim();
+            if (!tid) continue;
+            const prev = tasks.get(tid);
+            if (prev && prev.deleted === true) {
+              return fail(res, 409, 'conflict',
+                `任务 ${tid} 已删除（墓碑），不能再写；要接着做就新建一张卡`,
+                { field: 'taskId' });
+            }
+          }
+        }
         const TASK_CARRY = ['title', 'detail', 'owner', 'status', 'priority', 'tags', 'dependsOn',
           'requiredCapabilities', 'dueAt', 'archived'];
         /**

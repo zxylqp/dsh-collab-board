@@ -940,6 +940,35 @@ async function main() {
   check('拒的理由是「已删除」，不是「不能改标题」',
     /已删除/.test(String(writeToTomb.error?.message || writeToTomb.error || '')),
     JSON.stringify(writeToTomb.error));
+
+  /**
+   * 墓碑预检（0.11.25）：**不带 title** 也得以「已删除」拒绝，不能先撞格式校验。
+   *
+   * 汐汐 2026-11-07 就是这么撞的：她故意不带 title 想测墓碑判定，结果回的是
+   * 「task 要有 title」（400）—— 人会去补字段，可这张卡已经不在了，补了也写不进去。
+   * 所以墓碑判定必须在 validateEvent 之前：判「删没删」只要 taskId。
+   */
+  const writeToTombNoTitle = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        eventVersion: 2,
+        id: 'ev_tomb_after_notitle1',
+        origin: ORIGIN_B,
+        name: 'B',
+        ts: new Date().toISOString(),
+        kind: 'task',
+        taskId: 't-tomb',
+      }],
+    },
+  });
+  check('给墓碑卡发不带 title 的事件 → 409（不是 400 格式错）',
+    writeToTombNoTitle.ok === false && writeToTombNoTitle.status === 409,
+    JSON.stringify(writeToTombNoTitle.error));
+  check('不带 title 时理由仍然是「已删除」',
+    /已删除/.test(String(writeToTombNoTitle.error?.message || writeToTombNoTitle.error || '')),
+    JSON.stringify(writeToTombNoTitle.error));
   const tombStillEmpty = await call(base, '/events?since=0&limit=500', { token: tokenA });
   const tombAfter = (tombStillEmpty.data.events || []).filter((e) => e.taskId === 't-tomb');
   check('正文没被写回来（仍然是空壳）',

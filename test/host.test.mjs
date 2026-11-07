@@ -477,6 +477,24 @@ async function main() {
     agg.length === 1 && /第二次拒/.test(String(agg[0].text)),
     JSON.stringify(agg).slice(0, 160));
 
+  // 0.11.25：rejected 跟 unread 同一个口径，**只给游标之后的**。
+  // 理由（汐汐 2026-11-07）：collab_state 是每轮醒来第一件事就调的，
+  // 十条历史全文 = 每轮都交一遍旧账。要总账就给 since:0 / full。
+  appendFileSync(logPath, JSON.stringify({
+    eventVersion: 2, id: 'ev_oldrej_00001_zzz', origin: identity.origin, name: '',
+    ts: new Date(0).toISOString(), kind: 'note', taskId: 'oldrej1', level: 'warn',
+    // 故意少一个「了」：让 7c 里那条「被拒提示带 taskId」的 findBy文案 不会先抓走这条
+    text: '一条事件被 Hub 拒（task oldrej1）：很久以前的事', epoch: 1, seq: 1,
+  }) + '\n');
+  const stWindowed = JSON.parse((await stateToolFake.execute({ since: 50, advance: false })).text);
+  check('rejected 只给游标之后的（老账不再每轮重交）',
+    !(stWindowed.rejected || []).some((r) => r.taskId === 'oldrej1'),
+    JSON.stringify(stWindowed.rejected || []).slice(0, 160));
+  const stAll = JSON.parse((await stateToolFake.execute({ since: 0, advance: false })).text);
+  check('since:0（全量）时老账还在，没丢',
+    (stAll.rejected || []).some((r) => r.taskId === 'oldrej1'),
+    JSON.stringify((stAll.rejected || []).map((r) => r.taskId)));
+
   console.log('\n7c. 脏事件不堵队列（整批被拒时的逐条降级）');
   // 手工往日志里塞一条 Hub 必拒的事件：新建任务却写着别人的 owner。
   // 模拟旧版本客户端、或者直接改日志写进来的数据 —— 它不该让这台机器失去同步。
