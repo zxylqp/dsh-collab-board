@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 31;
-    const VERSION = '0.11.11';
+    const VERSION = '0.11.12';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -2035,9 +2035,19 @@ window.__ModuleLoader__.load({
            * 不覆盖的话，断了机的成员会永远挂着「在线」——那比显示离线更误导。
            */
           const live = liveMap ? liveMap[m.origin] : null;
+          /**
+           * 在线态**只认 Hub 现报的**（0.11.12）：
+           *   - 表里有他且 online → 在线；
+           *   - 拉到表但表里没他 → 离线（Hub 重启后 token 全失效，成员得重连）；
+           *   - 连表都拉不到 → 也说离线 —— 「不知道」画成在线比画成离线误导得多。
+           *
+           * 以前拉不到就退回事件流里的 `status`，而 `member` 事件是 join 那一刻的快照，
+           * 永远写着 idle —— 于是 Hub 重启、对方早就掉了，面板还挂着「2 在线」。
+           * 2026-11-07 用户就是照这个数以为汐汐在线，其实 Hub 侧 token 表里只有 1 个。
+           */
           const liveStatus = live
             ? (live.online ? (live.status === 'busy' ? 'busy' : 'idle') : 'offline')
-            : m.status;
+            : 'offline';
           return { ...m, status: liveStatus, live: Boolean(live) };
         });
 
