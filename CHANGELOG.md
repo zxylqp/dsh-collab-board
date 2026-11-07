@@ -4,6 +4,27 @@
 
 ---
 
+## 0.11.15
+
+**0.11.14 带出的回归：本地折叠把标题弄丢了。** 重启 DSH 生效。
+
+汐汐 2026-11-07 T01 复验：落盘事件确实不带 `title` 了（修复生效），
+但 `collab_state` 的 mine / watching 里标题消失，卡片只剩 `taskId` + `status`。
+
+根因：**折叠逻辑有两份**。`selectable.mjs` 的 `latestTasks()` 是本机这份，只继承
+`owner` / `claimedAt` / `leaseMs`；Hub 那份（`hub.mjs` 的 `applyIndex`）在 0.11.10
+已经继承了展示字段。事件不带 title 之后，本机这份就真的丢了。
+
+修：`latestTasks()` 也继承 `title` / `detail` / `priority` / `tags` / `dependsOn` /
+`requiredCapabilities` / `dueAt` / `archived`（显式写了、包括空串，仍然算变更）。
+
+测试：`host.test.mjs` 12o —— latestTasks 与 claimableTasks 都保住标题。
+
+**教训**：同一份折叠逻辑写在两处，改一处必须改另一处。这次是协议修好了、本地视图没跟上，
+所以「别人看到的对、自己看到的错」又出现了一次。
+
+---
+
 ## 0.11.14
 
 **只改状态不再顺手改标题。** 工具层修正；重启 DSH 生效。

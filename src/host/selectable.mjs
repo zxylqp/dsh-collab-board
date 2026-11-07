@@ -42,6 +42,17 @@ export function latestTasks(events) {
         ? { ...ev }
         : { ...ev, owner: prev.owner };
       /**
+       * 展示字段也要继承（0.11.15）：0.11.14 起「只改状态」的事件不再自带 title
+       * （留给 Hub 从上一版继承），但这里的折叠是**本机**那份 —— 不继承的话
+       * 本机 `collab_state` 的 mine/watching 里标题直接消失，卡片变成裸 taskId。
+       * 汐汐 2026-11-07 T01 复验报的就是这个：协议修好了，本地折叠没跟上。
+       *
+       * 显式写了（含空串）才算变更，判据是 `!== undefined`。
+       */
+      for (const f of ['title', 'detail', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+        if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
+      }
+      /**
        * `claimedAt` / `leaseMs` 是 Hub 专属字段，成员推上来的普通 task 事件没有它们。
        * 不继承的话，本机看板会把「租约还剩多久」算成 0 —— 和 Hub 那边同一个坑。
        */

@@ -1413,6 +1413,22 @@ async function main() {
   check('新建卡没给 title 仍然用 taskId 兜底（不破坏建卡）',
     noTitleEv?.title === 't-notitle', JSON.stringify(noTitleEv || null));
 
+  console.log('\n12o. 本地折叠也要继承 title（0.11.15）');
+  // 汐汐 T01 复验的回归：事件不带 title 了，但 latestTasks 没继承 → mine/watching 里标题消失
+  const lt = latestTasks([
+    { id: 'ev_a', kind: 'task', taskId: 't-lt', title: '真标题', status: 'pending', epoch: 1, seq: 1 },
+    { id: 'ev_b', kind: 'task', taskId: 't-lt', status: 'running', epoch: 1, seq: 2 },
+  ]);
+  check('latestTasks 继承 title', lt.get('t-lt')?.title === '真标题', JSON.stringify(lt.get('t-lt') || null));
+  check('latestTasks 采用最新状态', lt.get('t-lt')?.status === 'running', String(lt.get('t-lt')?.status));
+  // collab_state / claimableTasks / autoClaim 都从 latestTasks 取数，这里就是根因层
+  const t1Pending = claimableTasks([
+    { id: 'ev_a', kind: 'task', taskId: 't-lt2', title: '待认领卡', status: 'pending', epoch: 1, seq: 1 },
+    { id: 'ev_b', kind: 'task', taskId: 't-lt2', status: 'pending', epoch: 1, seq: 2 },
+  ], { selfOrigin: 'ffffffffffffffff' }).find((x) => x.task.taskId === 't-lt2');
+  check('claimableTasks 也保住了标题', t1Pending?.task?.title === '待认领卡',
+    JSON.stringify(t1Pending?.task || null));
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
