@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 31;
-    const VERSION = '0.11.12';
+    const VERSION = '0.11.13';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -2510,7 +2510,14 @@ window.__ModuleLoader__.load({
 
       const saveSetting = useCallback(async (key, value) => {
         const prev = settingsRef.current;
-        if (prev[key] === value) return;
+        /**
+         * hubCode 不能按值去重（0.11.13）。
+         *
+         * 宿主永远不回传口令原文，前端看到的 `hubCode` 恒为 ''。于是「清除口令」
+         * 调 `saveSetting('hubCode', '')` 时，这里判成「没变」直接 return ——
+         * PATCH 根本没发出去，界面还显示「已设置」。点了没用就是这个。
+         */
+        if (key !== 'hubCode' && prev[key] === value) return;
         setSettingsState((s) => ({ ...s, [key]: value }));
         try {
           const res = await fetchJson('/settings', {
