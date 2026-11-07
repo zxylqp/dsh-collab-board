@@ -1305,6 +1305,85 @@ async function main() {
 
   rmSync(incDir, { recursive: true, force: true });
 
+  /* ─────────── 0.11.7：口令真的起作用（热更新 + 加入失败可见） ─────────── */
+
+  console.log('\n12l. 运行中改口令：立刻生效，不用停 Hub');
+  // 前面的用例把 Hub 停了（第 820 行），这里为口令测试重新起一个
+  const restart = await hit(routes, '/collab-board/hub/start', { method: 'POST', body: { port: 0 } });
+  const livePort = restart.payload?.info?.port;
+  check('为口令测试起了 Hub', restart.status === 200 && Number.isInteger(livePort) && livePort > 0,
+    JSON.stringify(restart.payload).slice(0, 160));
+
+  const setSecret = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { hubCode: 'NT2026' },
+  });
+  // 这条是根因：`code` 以前在 startHub 里是 const，改设置只写盘、运行中的 Hub 还比旧值
+  check('PATCH 口令当场推给了运行中的 Hub',
+    setSecret.payload?.hubCode?.applied === true, JSON.stringify(setSecret.payload?.hubCode));
+  const hubNeed = await hit(routes, '/collab-board/hub');
+  check('运行中的 Hub 开始要口令', hubNeed.payload?.server?.needCode === true,
+    JSON.stringify(hubNeed.payload?.server));
+
+  const infoNeed = await fetch(`http://127.0.0.1:${livePort}/collab/v1/info`).then((r) => r.json());
+  check('/info 也报 needCode', infoNeed?.data?.needCode === true, JSON.stringify(infoNeed?.data));
+
+  async function tryJoin(code) {
+    return fetch(`http://127.0.0.1:${livePort}/collab/v1/join`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ wireProtocol: 1, origin: 'a1a1a1a1a1a1a1a1', name: '口令探针', code }),
+    }).then(async (r) => ({ status: r.status, ...(await r.json()) }));
+  }
+  const joinNoCode = await tryJoin('');
+  check('不带口令 join 被拒（401 bad-code）',
+    joinNoCode.status === 401 && joinNoCode.error?.code === 'bad-code', JSON.stringify(joinNoCode).slice(0, 160));
+  const joinWrong = await tryJoin('WRONG');
+  check('错误口令 join 被拒', joinWrong.status === 401 && joinWrong.error?.code === 'bad-code');
+  const joinRight = await tryJoin('NT2026');
+  check('正确口令 join 放行', joinRight.ok === true && typeof joinRight.data?.token === 'string');
+
+  const clearSecret = await hit(routes, '/collab-board/settings', {
+    method: 'PATCH',
+    body: { hubCode: '' },
+  });
+  const hubFree = await hit(routes, '/collab-board/hub');
+  check('清除口令当场生效', clearSecret.payload?.hubCode?.applied === true
+    && hubFree.payload?.server?.needCode === false, JSON.stringify(hubFree.payload?.server));
+
+  console.log('\n12m. 成员侧：口令错了要当场报错，不是静默「已连上」');
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { hubCode: 'NT2026' } });
+  const { ctx: ctx2, routes: routes2, cleanups: cleanups2 } = makeCtx({});
+  const dataDir2 = mkdtempSync(join(tmpdir(), 'collab-host-member-'));
+  apply(ctx2, { dataDir: dataDir2, syncLanInbox: false });
+
+  const joinBad = await hit(routes2, '/collab-board/hub/join', {
+    method: 'POST',
+    body: { address: `http://127.0.0.1:${livePort}`, code: 'WRONG' },
+  });
+  check('口令错 → 400 且明说口令不对',
+    joinBad.status === 400 && /口令不对/.test(String(joinBad.payload?.error)),
+    JSON.stringify(joinBad.payload).slice(0, 200));
+  const memberAfterBad = await hit(routes2, '/collab-board/hub');
+  check('失败后不假装已连接',
+    memberAfterBad.payload?.client?.online !== true && memberAfterBad.payload?.role !== 'member',
+    JSON.stringify({ role: memberAfterBad.payload?.role, client: memberAfterBad.payload?.client }));
+
+  const joinGood = await hit(routes2, '/collab-board/hub/join', {
+    method: 'POST',
+    body: { address: `http://127.0.0.1:${livePort}`, code: 'NT2026' },
+  });
+  check('口令对 → 真的连上', joinGood.status === 200 && joinGood.payload?.ok === true
+    && joinGood.payload?.status?.client?.online === true, JSON.stringify(joinGood.payload).slice(0, 200));
+
+  for (const c of cleanups2.reverse()) {
+    try { c(); } catch { /* 卸载失败不该让测试挂 */ }
+  }
+  rmSync(dataDir2, { recursive: true, force: true });
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { hubCode: '' } });
+  // 自己起的 Hub 自己停，否则测试进程会挂着不退
+  await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }

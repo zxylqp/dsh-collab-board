@@ -133,7 +133,8 @@ export function createHubWatch({ threshold = 3, minDurationMs = 10000, resetAfte
 export async function createDiscovery(opts = {}) {
   const groupId = String(opts.groupId || '');
   const origin = String(opts.origin || '');
-  const code = typeof opts.code === 'string' ? opts.code : '';
+  // 可热更新：Hub 运行中改口令时，广播里的 needCode 和签名都要跟着换
+  let code = typeof opts.code === 'string' ? opts.code : '';
   const dport = Number.isFinite(Number(opts.discoveryPort)) ? Number(opts.discoveryPort) : DISCOVERY_PORT;
   const say = typeof opts.log === 'function' ? opts.log : () => {};
   const quiet = opts.quiet === true;
@@ -216,7 +217,7 @@ export async function createDiscovery(opts = {}) {
       origin,
       name: String(opts.name || ''),
       port: Number(opts.port) || 0,
-      needCode: opts.needCode === true,
+      needCode: code !== '',
       epoch: Number(opts.epoch) || 0,
       groupId,
       hmac: signPacket(code, {
@@ -248,6 +249,16 @@ export async function createDiscovery(opts = {}) {
 
   return {
     port: bound,
+    /**
+     * 运行中换口令（Hub 设置里改口令时调）。
+     *
+     * 必须一起换：`needCode` 决定别的机器看不看得见「这组要口令」，`hmac` 决定
+     * 广播还收不收得下。只换签名不换 needCode，对方会以为不需要口令直接来 join。
+     */
+    setCode: (next) => {
+      code = typeof next === 'string' ? next : '';
+    },
+    needCode: () => code !== '',
     /** 最近 15 秒内听到的其它 Hub。 */
     livePeers: () => [...peers.values()].filter((p) => Date.now() - p.at < PEER_OFFLINE_MS),
     allPeers: () => [...peers.values()],

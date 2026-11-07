@@ -1674,7 +1674,7 @@ window.__ModuleLoader__.load({
         ),
         connect: h('div', { className: 'cb-card' },
           h('div', { className: 'cb-card-h' }, '连接'),
-          h('p', { className: 'cb-card-sub' }, '这几个值真生效：起 Hub 用端口和口令，加入 / 重连用地址。改完不用重启。'),
+          h('p', { className: 'cb-card-sub' }, '起 Hub 用端口和口令，加入 / 重连用地址。端口和口令即改即生效（Hub 在跑也当场换），不用重启。'),
           h('div', { style: { marginTop: 6 } },
             h(Field, {
               label: '轮询间隔',
@@ -1716,7 +1716,9 @@ window.__ModuleLoader__.load({
               label: 'Hub 口令',
               desc: settings.hubCodeSet
                 ? '已设置（口令不回显，宿主的 HTTP 也不回传原文）。输入新口令回车可重设；留空不改。'
-                : '未设置。别人加入要输这个口令；留空 = 不设口令，同网段谁都能连 —— 家里局域网通常够用。',
+                  + '本机在当 Hub 时改了立刻生效 —— 但挡的是下一次加入，已经在线的成员不受影响。'
+                : '未设置。本机当 Hub 时，别人加入要输这个口令；留空 = 不设口令，同网段谁都能连。'
+                  + '当成员时这里也可以存一份，加入时留空就用它。',
               control: settings.hubCodeSet
                 ? h(Btn, { small: true, onClick: () => saveSetting('hubCode', '') }, '清除口令')
                 : null,
@@ -1968,6 +1970,14 @@ window.__ModuleLoader__.load({
       const onHubAction = props.onHubAction;
       const onHideMember = props.onHideMember;
       const [joinAddress, setJoinAddress] = useState('');
+      /**
+       * 加入别人 Hub 时用的口令（0.11.7 补的）。
+       *
+       * 之前这里只有地址一个输入框：Hub 设了口令，成员连上来根本没地方填 ——
+       * 后台拿本机设置里的 `hubCode` 顶上去（多半是空的），401 只在日志里留一行。
+       * 人看到的就是「口令不起作用，也没地方输」。
+       */
+      const [joinCode, setJoinCode] = useState('');
       const [hubBusy, setHubBusy] = useState('');
       const [ignoredFork, setIgnoredFork] = useState(false);
 
@@ -2038,7 +2048,11 @@ window.__ModuleLoader__.load({
           const out = await onHubAction(action, body);
           if (action === 'start') toast('Hub 已起：端口 ' + ((out && out.info && out.info.port) || '?'));
           else if (action === 'stop') toast(out && out.stopped ? 'Hub 已停' : '本来就没在当 Hub');
-          else if (action === 'join') toast('已连上 ' + ((out && out.address) || joinAddress));
+          else if (action === 'join') {
+            // 连上就把输入的明文口令从界面上擦掉；后台已经存成哈希了
+            setJoinCode('');
+            toast('已连上 ' + ((out && out.address) || joinAddress));
+          }
           else if (action === 'leave') toast('已断开');
           else if (action === 'yield') toast('已断开自己的 Hub，改连 ' + ((out && out.address) || '对方'));
           else if (action === 'dismiss-fork') toast('这次运行不再提示');
@@ -2047,6 +2061,16 @@ window.__ModuleLoader__.load({
         } finally {
           setHubBusy('');
         }
+      };
+
+      /**
+       * 「加入」的入口。地址必填，口令可空 ——
+       * 留空 = 对方没设口令（或沿用本机设置里存的，重启后自动重连就靠它）。
+       */
+      const submitJoin = () => {
+        const addr = joinAddress.trim();
+        if (!addr || hubBusy) return;
+        doHubAction('join', { address: addr, code: joinCode.trim() });
       };
 
       const copy = async (text, label) => {
@@ -2196,23 +2220,36 @@ window.__ModuleLoader__.load({
             ),
             hubRunning ? null : h('div', { style: { marginTop: 10, paddingTop: 8, borderTop: '1px solid var(--dsw-alias-border-l1)' } },
               h('div', { className: 'cb-hint', style: { marginBottom: 4 } }, '加入另一台的 Hub'),
-              h('div', { style: { display: 'flex', gap: 6 } },
+              h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('input', {
                   className: 'cb-input',
                   placeholder: 'http://192.168.1.5:48910',
                   value: joinAddress,
                   disabled: Boolean(hubBusy),
                   onChange: (e) => setJoinAddress(e.target.value),
-                  onKeyDown: (e) => {
-                    if (e.key === 'Enter' && joinAddress.trim()) doHubAction('join', { address: joinAddress.trim() });
-                  },
+                  onKeyDown: (e) => { if (e.key === 'Enter') submitJoin(); },
                 }),
-                h(Btn, {
-                  small: true,
-                  disabled: Boolean(hubBusy) || joinAddress.trim() === '',
-                  onClick: () => doHubAction('join', { address: joinAddress.trim() }),
-                }, hubBusy === 'join' ? '连接中…' : '加入'),
+                h('div', { style: { display: 'flex', gap: 6 } },
+                  h('input', {
+                    className: 'cb-input',
+                    type: 'password',
+                    placeholder: '口令（对方设了才填，留空 = 没设）',
+                    value: joinCode,
+                    maxLength: 64,
+                    autoComplete: 'current-password',
+                    disabled: Boolean(hubBusy),
+                    onChange: (e) => setJoinCode(e.target.value),
+                    onKeyDown: (e) => { if (e.key === 'Enter') submitJoin(); },
+                  }),
+                  h(Btn, {
+                    small: true,
+                    disabled: Boolean(hubBusy) || joinAddress.trim() === '',
+                    onClick: submitJoin,
+                  }, hubBusy === 'join' ? '连接中…' : '加入'),
+                ),
               ),
+              h('div', { className: 'cb-hint', style: { marginTop: 4 } },
+                '对方设了口令必须填对，错了会当场报「口令不对」；留空只是「对方没设口令」时才连得上。'),
               hubConnected
                 ? h(Btn, { small: true, ghost: true, onClick: () => doHubAction('leave') }, '断开连接')
                 : null,

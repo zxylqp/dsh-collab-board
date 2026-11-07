@@ -104,7 +104,13 @@ export async function startHub(opts = {}) {
   const dir = String(opts.dir || '');
   const groupId = String(opts.groupId || '');
   const selfOrigin = String(opts.origin || '');
-  const code = typeof opts.code === 'string' ? opts.code : '';
+  /**
+   * 口令（哈希；'' = 不设）。
+   *
+   * 以前是 `const` —— 设置里改了口令，正在跑的 Hub 还拿旧值比对，等于口令
+   * 「设了不生效」，只能停掉 Hub 重起。现在运行期可换，见 controller.setCode。
+   */
+  let code = typeof opts.code === 'string' ? opts.code : '';
   const log = typeof opts.log === 'function' ? opts.log : () => {};
   /**
    * `/join` 失败限流（0.11.2）。
@@ -1454,6 +1460,20 @@ export async function startHub(opts = {}) {
       peers: discovery ? discovery.livePeers() : [],
     }),
     members: memberList,
+    /**
+     * 运行中换口令（不重启 Hub、不换 epoch、不踢在线成员）。
+     *
+     * 在线成员手里的 token 仍然有效 —— 口令只在 /join 时比对一次。
+     * 所以改口令挡的是**下一次**加入，不是已经把门进来的人。这一点要在 UI 里说清楚，
+     * 否则人会以为「改了口令，陌生人已经被踢了」。
+     */
+    setCode: (next) => {
+      code = typeof next === 'string' ? next : '';
+      if (discovery && typeof discovery.setCode === 'function') discovery.setCode(code);
+      log('info', code === '' ? '口令已清除：新成员不再需要口令' : '口令已更新：新加入要用新口令，在线的成员不受影响');
+      return { needCode: code !== '' };
+    },
+    needCode: () => code !== '',
     tasks: () => [...tasks.values()],
     /**
      * 权威事件流（只读浅拷贝，0.11.3）。

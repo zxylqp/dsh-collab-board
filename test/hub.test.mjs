@@ -952,6 +952,27 @@ async function main() {
   });
   check('错口令仍然 401', joinWrong.status === 401 && joinWrong.error.code === 'bad-code');
   check('/info 的 needCode 不因为存的是哈希就变假', (await call(codeBase, '/info')).data.needCode === true);
+
+  console.log('\n10b. 运行中换口令（0.11.7）');
+  // 以前 `code` 是 createHub 里的 const：设置里改了口令，跑着的 Hub 还比旧值
+  const newHash = 'v1$' + createHash('sha256').update(GROUP + 'NEWPASS', 'utf8').digest('hex');
+  check('setCode 返回 needCode=true', codeHub.controller.setCode(newHash).needCode === true);
+  check('/info 立刻说要口令', (await call(codeBase, '/info')).data.needCode === true);
+  const oldPlain = await call(codeBase, '/join', {
+    method: 'POST', body: { wireProtocol: 1, origin: ORIGIN_B, name: 'B', code: 'LOVE' },
+  });
+  check('旧口令当场失效', oldPlain.status === 401 && oldPlain.error.code === 'bad-code');
+  const newPlain = await call(codeBase, '/join', {
+    method: 'POST', body: { wireProtocol: 1, origin: ORIGIN_C, name: 'C', code: 'NEWPASS' },
+  });
+  check('新口令当场可用', Boolean(newPlain.data?.token), JSON.stringify(newPlain.error));
+  codeHub.controller.setCode('');
+  check('清空口令后 /info needCode=false', (await call(codeBase, '/info')).data.needCode === false);
+  const noCodeJoin = await call(codeBase, '/join', {
+    method: 'POST', body: { wireProtocol: 1, origin: ORIGIN_A, name: 'A', code: '' },
+  });
+  check('清空后不带口令能进', Boolean(noCodeJoin.data?.token), JSON.stringify(noCodeJoin.error));
+
   await codeHub.controller.close();
   rmSync(codeDir, { recursive: true, force: true });
 

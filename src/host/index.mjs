@@ -788,9 +788,43 @@ export function apply(ctx, rawConfig = {}) {
     if (raw !== '' && info.groupId && info.groupId !== identity.groupId) {
       hubLog('warn', '跨组加入：口令只在这次连接里用，本机设置里的口令没改；重启后要重新输入');
     }
-    attachClient(url, resolved);
+    const client = attachClient(url, resolved);
+    /**
+     * **同步等一次 join**，失败就把错误抛给面板。
+     *
+     * 以前 attachClient 只启动后台循环、立刻返回：口令错了面板照样弹「已连上」，
+     * 而实际一条都同步不了（后台每 10 秒 401 一轮，只在日志里留一行）。
+     * 人看到的正是「口令好像没起作用，也看不出为什么」。
+     */
+    const joined = await client.join();
+    if (!joined) {
+      const why = String(client.state().lastError || '').trim() || '原因不明';
+      detachHub();
+      if (/口令/.test(why)) throw new Error('口令不对：Hub 那台设了口令，「成员」页的口令要填对才能加入');
+      throw new Error(`连上了 ${url}，但加入失败：${why}`);
+    }
     hubRuntime.role = 'member';
     return { address: url, epoch: info.epoch, groupId: info.groupId, needCode: info.needCode };
+  }
+
+  /**
+   * 把设置里的口令（**哈希**）推给正在跑的 Hub，并让本机那个客户端用同一个口令重连。
+   *
+   * 这是「口令设了却没拦住人」的根因修复：`code` 原来在 startHub 里是 const，
+   * 中途去设置里改口令，Hub 比对的还是启动那一刻的旧值。改了不生效，
+   * 人只能怀疑「口令功能是假的」。
+   */
+  function applyHubCode(code) {
+    if (!hubRuntime.server) return { applied: false, reason: '本机没在当 Hub' };
+    const info = hubRuntime.server.info();
+    try {
+      hubRuntime.server.setCode(code || '');
+    } catch (e) {
+      return { applied: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+    // 本机客户端连的是自己：不换的话下一轮心跳 401 → 重连时带旧口令 → 自己连不上自己
+    attachClient(`http://127.0.0.1:${info.port}`, code || '');
+    return { applied: true, needCode: (code || '') !== '' };
   }
 
   /** 断开当前 Hub（不一定停自己的服务）。 */
@@ -1199,11 +1233,21 @@ export function apply(ctx, rawConfig = {}) {
               const body = await readBody(req);
               const patch = body && typeof body === 'object' && body.patch ? body.patch : body;
               const out = patchSettings(patch);
+              /**
+               * 口令是热更新项（0.11.7）：Hub 正在跑就立刻换，不用停 Hub 重起。
+               * 以前这里只写 settings.json，运行中的 Hub 仍拿旧的 code 比对 ——
+               * 设置页写着「改完不用重启」，实际不重启就不生效。
+               */
+              let hubCode = null;
+              if (patch && typeof patch === 'object' && Object.prototype.hasOwnProperty.call(patch, 'hubCode') && hubRuntime.server) {
+                hubCode = applyHubCode(out.settings.hubCode || '');
+              }
               return jsonReply(res, 200, {
                 ok: true,
                 settings: publicSettings(out.settings),
                 ignored: out.ignored,
                 dataDir,
+                hubCode,
               });
             } catch (err) {
               return jsonReply(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
