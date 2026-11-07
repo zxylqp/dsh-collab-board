@@ -460,6 +460,10 @@ async function main() {
     && /\.synced\.json/.test(String(fakeOk.text))
     && /seq/.test(String(fakeOk.text)),
     String(fakeOk.text).slice(0, 120));
+  // 0.11.24：判据里的 id 不能是空的（0.11.23 拼的是 buildEvent 的 ev.id，那时还没有 id）
+  const judgeId = /这条（([^）]*)）/.exec(String(fakeOk.text));
+  check('判据里带上了真实事件 id',
+    Boolean(judgeId) && /^ev_[0-9a-z_]+$/.test(judgeId[1]), String(fakeOk.text).slice(0, 160));
 
   // 同一张卡连着被拒两次，state.rejected 只给最新一条（不然越攒越长没人看）
   // 注意：rejected 只挂在 agent 用的 collab_state 上，panelState（面板）不返回它

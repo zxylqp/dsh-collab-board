@@ -1640,20 +1640,22 @@ export function apply(ctx, rawConfig = {}) {
           if (!ev) throw new Error('kind 不认识：' + String(args?.kind));
           // 本地先挡：抢别人认领的卡这种事件推上去必被拒，写进日志只会堵住队列
           assertOwnerTransition(ev);
-          appendEvent(ev);
+          const stored = appendEvent(ev) || ev;
           /**
-           * 0.11.23：文案降级。
+           * 0.11.24：用 appendEvent 的返回值。
            *
-           * 以前这里写「已写进看板」—— 但工具只知道本地落盘了，push 是异步的，
-           * 那一刻根本不知道 Hub 收没收。汐汐 2026-11-07 就吃这个亏：Hub 403 拒了
-           * 她标 done 的事件，工具照样回「已写进看板」，她以为成了，看板上其实没变。
-           * 现在只说本地，并给出可验证的判据（Hub 收下才补 seq）。
+           * id / ts / origin 都是 appendEvent 里才补的（buildEvent 只管业务字段）。
+           * 0.11.23 直接拿 `ev.id` 拼判据 → 拿到空串，回出来是
+           * 「这条（）在 .synced.json 里拿到 seq 才算送达」。给判据却给个空 id，
+           * 比不给还误导 —— 汐汐装上 0.11.23 第一条就撞上了。
+           *
+           * 文案本身 0.11.23 定下的口径不变：只说本地，不知道 Hub 收没收。
            */
           return {
             ok: true,
             text:
-              '已写进本机，等待同步（到 Hub 之前别人看不见）：' + JSON.stringify(ev).slice(0, 200) +
-              '\n判据：这条（' + String(ev.id || '') + '）在 .synced.json 里拿到 seq 才算送达；' +
+              '已写进本机，等待同步（到 Hub 之前别人看不见）：' + JSON.stringify(stored).slice(0, 200) +
+              '\n判据：这条（' + String(stored.id || '') + '）在 .synced.json 里拿到 seq 才算送达；' +
               '被拒的话 collab_state 的 rejected 会写原因。',
           };
         },
