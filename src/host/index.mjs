@@ -1867,7 +1867,17 @@ export function apply(ctx, rawConfig = {}) {
      * 脏事件先落盘、推上去被 400 整批拒、从此堵在待同步队列 —— 0.10.14 踩过。
      * 现在写日志之前就挡掉，坏事件根本进不了本地日志。
      */
-    const r = validateEvent(ev, { localWrite: true });
+    const r = validateEvent(
+      /**
+       * 更新已存在的卡时允许不带 title（0.11.14）：字段继承在 Hub 端做，
+       * 但 `validateEvent` 要求 task 必须有 title —— 拿 taskId 造个探针过校验，
+       * 通过后返回的仍是原事件（title 字段照旧不写）。
+       */
+      ev.kind === 'task' && ev.title === undefined
+        ? { ...ev, title: String(ev.taskId || '') }
+        : ev,
+      { localWrite: true },
+    );
     if (!r.ok) {
       const e = new Error(`事件不合法：${r.error.message}`);
       e.code = r.error.code || 'bad-param';
@@ -1934,14 +1944,25 @@ export function apply(ctx, rawConfig = {}) {
          * 标题/描述故意留空 —— 删掉的东西不该在本地日志里再写一遍。
          */
         const tombstone = input.deleted === true;
+        /**
+         * title 兜底分两种（0.11.14）：
+         *   - 新建卡没给标题 → 用 taskId 兜底，至少建得出来；
+         *   - **已存在的卡**没给标题 → 不写这个字段，让 Hub 从上一版继承。
+         *
+         * 以前一律兜底，于是「只改 status」会顺手把真标题改成 taskId
+         * （汐汐 2026-11-07 T01 实测：title 被冲成 `t-t01a1b2c`）。
+         */
+        const knownTask = latestTasks(viewEvents()).get(taskId);
         const ev = {
           ...base,
           taskId,
-          title: isText(input.title) ? input.title.trim().slice(0, 200) : (tombstone ? '' : taskId),
           status: ['pending', 'running', 'blocked', 'done', 'cancelled'].includes(input.status)
             ? input.status
             : (tombstone ? 'cancelled' : 'pending'),
         };
+        if (isText(input.title)) ev.title = input.title.trim().slice(0, 200);
+        else if (tombstone) ev.title = '';
+        else if (!knownTask) ev.title = taskId;
         if (tombstone) {
           ev.deleted = true;
           ev.deletedAt = isText(input.deletedAt) ? input.deletedAt : new Date().toISOString();

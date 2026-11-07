@@ -1394,6 +1394,25 @@ async function main() {
   // 自己起的 Hub 自己停，否则测试进程会挂着不退
   await hit(routes, '/collab-board/hub/stop', { method: 'POST' });
 
+  console.log('\n12n. 改状态不再顺手改标题（0.11.14）');
+  const postTitle = findTool(tools, 'collab_post');
+  await postTitle.execute({ kind: 'task', id: 't-title1', title: '真标题', status: 'pending' });
+  // 只改状态、不带 title —— 以前 buildEvent 会拿 taskId 兜底，把真标题盖掉
+  await postTitle.execute({ kind: 'task', id: 't-title1', status: 'running' });
+  const titleState = await hit(routes, '/collab-board/state');
+  const titleRows = (titleState.payload?.events || [])
+    .filter((e) => e.kind === 'task' && e.taskId === 't-title1');
+  const titleLatest = titleRows[titleRows.length - 1];
+  check('只改 status 的事件不带 title 字段（交给 Hub 继承）',
+    Boolean(titleLatest) && !('title' in titleLatest), JSON.stringify(titleLatest || null));
+
+  await postTitle.execute({ kind: 'task', id: 't-notitle', status: 'pending' });
+  const noTitleState = await hit(routes, '/collab-board/state');
+  const noTitleEv = (noTitleState.payload?.events || [])
+    .find((e) => e.kind === 'task' && e.taskId === 't-notitle');
+  check('新建卡没给 title 仍然用 taskId 兜底（不破坏建卡）',
+    noTitleEv?.title === 't-notitle', JSON.stringify(noTitleEv || null));
+
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
     try { c(); } catch { /* 卸载失败不该让测试挂 */ }
