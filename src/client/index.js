@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 33;
-    const VERSION = '0.11.18';
+    const BUILD = 34;
+    const VERSION = '0.11.19';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -601,6 +601,8 @@ window.__ModuleLoader__.load({
             leaseMs: 0,
             versions: [],
             createdTs: ev.ts,
+            /** 建卡那条事件的 origin —— 列表要显示「谁创建的」（0.11.19） */
+            creator: ev.origin,
             ev,
           };
           const status = STATUS_LABEL[ev.status] ? ev.status : (prev.status || 'pending');
@@ -621,6 +623,8 @@ window.__ModuleLoader__.load({
             claimedAt: typeof ev.claimedAt === 'string' ? ev.claimedAt : prev.claimedAt,
             leaseMs: Number.isFinite(Number(ev.leaseMs)) ? Number(ev.leaseMs) : prev.leaseMs,
             updatedTs: ev.ts,
+            /** 最后一条 task 事件的 origin —— 「谁最后标记 / 归档」（0.11.19） */
+            lastActor: ev.origin,
             ev,
             versions: prev.versions.concat([{
               ts: ev.ts,
@@ -723,12 +727,33 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 排序（0.11.19）：终态沉底、并按最后活动时间倒序。
+       *
+       * 原来是一把梭：优先级降序 → compareEvents 升序。于是「已完成 / 归档」
+       * 混在活任务里，而且老卡在上面 —— 爸爸 2026-11-07 要的是「已完成和归档里
+       * 按时间倒序，最近的在上」。活任务仍然优先级优先，同优先级按最近更新倒序。
+       */
+      const tsOf = (t) => {
+        const parsed = Date.parse(t.updatedTs || t.createdTs || '');
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const isTerminal = (t) => t.status === 'done' || t.status === 'cancelled' || t.archived === true;
+      const priOf = (t) => ({ high: 2, normal: 1, low: 0 }[t.priority] == null ? 1 : { high: 2, normal: 1, low: 0 }[t.priority]);
       const list = [...tasks.values()].sort((a, b) => {
-        const pa = { high: 2, normal: 1, low: 0 }[a.priority] == null ? 1 : { high: 2, normal: 1, low: 0 }[a.priority];
-        const pb = { high: 2, normal: 1, low: 0 }[b.priority] == null ? 1 : { high: 2, normal: 1, low: 0 }[b.priority];
+        const ta = isTerminal(a);
+        const tb = isTerminal(b);
+        if (ta !== tb) return ta ? 1 : -1;
+        if (ta) return tsOf(b) - tsOf(a); // 完成 / 归档：最近动过的在最上
+        const pa = priOf(a);
+        const pb = priOf(b);
         if (pa !== pb) return pb - pa;
-        return compareEvents(a.ev, b.ev);
+        return tsOf(b) - tsOf(a);
       });
+
+      /** origin → 显示名，列表上「谁创建 / 谁最后动」用 */
+      const names = new Map();
+      for (const m of members.values()) names.set(m.origin, m.name);
 
       const byTask = new Map();
       for (const m of messages) {
@@ -767,6 +792,7 @@ window.__ModuleLoader__.load({
         shown: ordered.length,
         tasks: list,
         byId: tasks,
+        names,
         deletedIds,
         messages,
         notes,
@@ -897,6 +923,22 @@ window.__ModuleLoader__.load({
       });
       const unsynced = props.showSync && !hasSyncStamp(task.ev);
 
+      /**
+       * 谁创建的、谁最后动的（0.11.19）。
+       *
+       * 爸爸 2026-11-07：「不知道是谁创建任务，谁最后标记或归档」。这些信息一直都在
+       * 事件流里（建卡那条的 origin、最后一条 task 事件的 origin），只是没画出来。
+       * 找不到名字（日志裁过、成员事件没落本机）就退短 origin，不装成「未知用户」。
+       */
+      const nameOf = (o) => {
+        if (!o) return '未知';
+        return model.names.get(o) || o.slice(0, 6) + '…';
+      };
+      const lastAction = task.archived
+        ? '归档'
+        : (task.status === 'done' ? '完成' : (task.status === 'cancelled' ? '取消' : ''));
+      const actionLine = lastAction && task.lastActor ? lastAction + ' ' + nameOf(task.lastActor) : '';
+
       const tags = task.tags.slice(0, 2);
       const moreTags = task.tags.length - tags.length;
       const dueSoon = task.dueAt
@@ -927,7 +969,8 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { className: 'cb-meta' },
-          h('span', { className: 'cb-meta-id' }, task.taskId),
+          h('span', { className: 'cb-meta-id', title: '创建者' }, '创建 ' + nameOf(task.creator)),
+          actionLine ? h('span', { className: 'cb-meta-text', title: '最后动作' }, actionLine) : null,
           h('span', {
             className: 'cb-meta-text',
             style: dueSoon ? { color: 'var(--dsw-alias-label-error)' } : undefined,
@@ -1076,6 +1119,14 @@ window.__ModuleLoader__.load({
       const artifacts = model.artifactsByTask.get(task.taskId) || [];
       /** 终态（done / cancelled）卡的评论锁死：任务结束就是结束，0.11.17 */
       const taskLocked = task.status === 'done' || task.status === 'cancelled';
+      /** origin → 名字（详情里也要显示谁建的 / 谁最后动的） */
+      const nameOf = (o) => {
+        if (!o) return '未知';
+        return model.names.get(o) || o.slice(0, 6) + '…';
+      };
+      const lastAction = task.archived
+        ? '归档'
+        : (task.status === 'done' ? '完成' : (task.status === 'cancelled' ? '取消' : ''));
       const now = Date.now();
 
       const deps = task.dependsOn.map((id) => {
@@ -1201,6 +1252,16 @@ window.__ModuleLoader__.load({
               ? h('div', { style: { fontSize: '11.5px', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, task.detail)
               : h('div', { className: 'cb-hint' }, '没有写描述。'),
             h('div', { style: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 } },
+              /**
+               * 创建者 / 最后动作 / taskId（0.11.19）。
+               *
+               * id 留在详情里而不是列表：agent 要它（评论、认领都靠它），
+               * 人对一串 `t-rpp5ng3` 没兴趣 —— 列表上那一栏换成了「创建 张三」。
+               */
+              h('div', { className: 'cb-hint' },
+                '创建 ' + nameOf(task.creator)
+                + (lastAction ? ' · ' + lastAction + ' ' + nameOf(task.lastActor) : '')
+                + ' · id ' + task.taskId),
               deps.length === 0
                 ? h('div', { className: 'cb-hint' }, '前置任务：无')
                 : deps.map((dep) => h('div', {

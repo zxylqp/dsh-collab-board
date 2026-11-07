@@ -666,13 +666,28 @@ async function main() {
       }],
     },
   });
-  check('owner 标 done 但夹带改标题 → 409', doneWithTitle.status === 409,
+  check('owner 标 done 但夹带改标题 → 放行（0.11.19 兜底）', doneWithTitle.ok === true,
     JSON.stringify(doneWithTitle.error));
-  const dtMsg = String(JSON.stringify(doneWithTitle.error || {}));
-  check('409 点名字段（改了标题）', dtMsg.includes('标题'), dtMsg.slice(0, 180));
-  check('409 明说 status=done 没记上', dtMsg.includes('done）也没记上') || dtMsg.includes('done 也没记上')
-    || dtMsg.includes('也没记上'), dtMsg.slice(0, 180));
-  check('409 给出重发写法（只带 status）', dtMsg.includes('只带'), dtMsg.slice(0, 220));
+
+  /**
+   * 兜底只丢正文，不能让非创建者借「标完成」改别人的卡（0.11.19）。
+   * 标题必须还是 A 建卡时的那个。
+   */
+  const afterStripped = await call(base, '/events?since=0', { token: tokenA });
+  const own3Latest = (afterStripped.data?.events || [])
+    .filter((e) => e.taskId === 'own3' && e.kind === 'task')
+    .sort((a, b) => a.seq - b.seq)
+    .pop();
+  check('完成生效（status=done）', own3Latest?.status === 'done', String(own3Latest?.status));
+  // 落盘的就是剥离后的事件：title 字段被删掉，折叠时沿用上一版的「A 的第三张卡」
+  check('正文改动没落盘（那条事件里没有 title）', own3Latest?.title === undefined,
+    String(own3Latest?.title));
+  check('B 改的标题没出现在任何事件里',
+    !JSON.stringify(afterStripped.data?.events || []).includes('B 顺手改的标题'));
+  const stripNote = (afterStripped.data?.events || []).find(
+    (e) => e.kind === 'note' && String(e.text).includes('own3') && String(e.text).includes('正文没改'),
+  );
+  check('落了一条 note 说明正文被丢', Boolean(stripNote), String(stripNote?.text || '没有 note'));
 
   const doneByB = await call(base, '/events', {
     method: 'POST',

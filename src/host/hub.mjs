@@ -1073,6 +1073,8 @@ export async function startHub(opts = {}) {
         }
         const accepted = [];
         const appended = [];
+        /** 标完成时被丢掉的正文改动，循环后统一落一条 note（0.11.19） */
+        const strippedComments = [];
         for (const ev of r.events) {
           // 幂等：同 id 已经收过就不重复编号（重投不该让 seq 涨）。
           // **但要把已存在的 epoch/seq 一起回给客户端** —— 否则对方拿不到序号，
@@ -1132,26 +1134,28 @@ export async function startHub(opts = {}) {
               if ('dependsOn' in ev
                 && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || [])) changed.push('依赖');
               if (changed.length > 0) {
-                /**
-                 * 拒绝必须说清「改了哪条」和「整条都没进去」（0.11.18）。
-                 *
-                 * 汐汐 2026-11-07 标 R01 完成时踩的就是这个：那条事件夹带了正文改动，
-                 * 整条 409，`status: done` 一起没记上。旧提示只说「不能改标题/描述/依赖」，
-                 * 她看不出 done 已经废了，没重发 —— 10 分钟后租约到期把卡退回待认领，
-                 * 爸爸看到的就是「任务结束了但没标完成」。
-                 * 现在点名字段、明说 done 没记、直接给重发写法。
-                 */
                 const wantsDone = ev.status === 'done';
-                const lost = wantsDone
-                  ? '这条里的 status=done 也没记上'
-                  : '这条的 status 也没记上';
-                return fail(res, 409, 'conflict',
-                  `任务 ${ev.taskId} 是 ${creator.slice(0, 6)}… 创建的，你这条改了${changed.join(' / ')}，`
-                  + `而别人不能改这张卡的正文 —— 整条被拒，${lost}。`
-                  + (wantsDone
-                    ? '要标完成，重发一条只带 {taskId, status:"done"} 的事件，别带 title / detail / dependsOn。'
-                    : '认领走 /tasks/claim；只想改状态就只发 status。'),
-                  { field: 'taskId' });
+                /**
+                 * 兜底（0.11.19）：非创建者标完成时夹带了正文改动 → **丢掉正文、留下 status**。
+                 *
+                 * 0.11.18 只把话说清楚了，人还得手动重发 —— 可「标完成」这件事本身
+                 * 没有歧义，没道理因为顺手带了个标题就整条作废。汐汐 2026-11-07 就是
+                 * 这么丢了一次 done：整条 409，10 分钟后租约到期，卡退回待认领，
+                 * 爸爸看到的是「任务结束了但没标完成」。
+                 *
+                 * 但正文改动**照样不许生效** —— 否则非创建者就能借标完成去改别人的卡。
+                 * 所以是「删字段」不是「放行」：只留 status，改了什么落一条 note。
+                 */
+                if (wantsDone) {
+                  for (const f of ['title', 'detail', 'dependsOn']) delete ev[f];
+                  strippedComments.push({ taskId: ev.taskId, fields: changed.slice() });
+                } else {
+                  return fail(res, 409, 'conflict',
+                    `任务 ${ev.taskId} 是 ${creator.slice(0, 6)}… 创建的，你这条改了${changed.join(' / ')}，`
+                    + '而别人不能改这张卡的正文 —— 整条被拒，这条的 status 也没记上。'
+                    + '认领走 /tasks/claim；只想改状态就只发 status。',
+                    { field: 'taskId' });
+                }
               }
             }
           }
@@ -1211,6 +1215,23 @@ export async function startHub(opts = {}) {
         }
         // 条件一：解锁只对本请求带进来的新事件触发（重放 / 重建 / 重启都不触发）
         afterAppended(appended);
+        /**
+         * 标完成时被丢掉的正文改动落一条 note（0.11.19）。
+         *
+         * 为什么不静默丢：正文没变是我们替它决定的，得让看板上有一句话说清楚 ——
+         * 否则「我明明改了标题，怎么没生效」会变成下一个查半天的问题。
+         */
+        for (const s of strippedComments) {
+          try {
+            systemWrite({
+              kind: 'note',
+              level: 'info',
+              taskId: s.taskId,
+              text: `任务 ${s.taskId} 标完成时带了${s.fields.join(' / ')}改动，`
+                + '正文没改（只有创建者能改），**完成已记上**。要改正文就让创建者改，或另发一条事件。',
+            });
+          } catch { /* 熔断了就别再刷 */ }
+        }
         return ok(res, { accepted, epoch, headSeq });
       }
 
