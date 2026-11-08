@@ -1107,11 +1107,25 @@ export async function startHub(opts = {}) {
          * `ev.detail !== ''` 又正好把空串当成「没改」，两头一夹就从中间漏过去了。
          */
         const explicitDetailIds = new Set();
+        /**
+         * 客户端**原始**事件里显式给了 `status` 的 id 集合（0.11.27）。
+         *
+         * 为什么不能直接看 `ev.status`：`TASK_CARRY` 把 `status` 也继承了，
+         * 于是「只想改标题、没带 status」的事件会被补成上一版的 `done`，
+         * 0.11.19 的兜底判据 `ev.status === 'done'` 就把它误当成「正在标完成」，
+         * 删掉正文放行 —— 而这条路径本该 409（改正文只有创建者能做）。
+         *
+         * 汐汐 V08 真机验出来的：不带 status、只带 title 的事件被接受（还每次落一条
+         * strip note），显式 `status: 'running'` + title 才正确 409。判据差异就在
+         * 「带没带 status」。所以 `wantsDone` 必须问原始事件，不能问继承后的值。
+         */
+        const explicitStatusIds = new Set();
         const prepped = Array.isArray(list)
           ? list.map((raw) => {
             if (!raw || raw.kind !== 'task') return raw;
             if (raw.deleted === true) return raw; // 墓碑就是要擦空，别往回填
             if ('detail' in raw && typeof raw.id === 'string' && raw.id) explicitDetailIds.add(raw.id);
+            if ('status' in raw && typeof raw.id === 'string' && raw.id) explicitStatusIds.add(raw.id);
             const id = String(raw.taskId || raw.id || '').trim();
             const prev = id ? tasks.get(id) : null;
             if (!prev) return raw;
@@ -1191,7 +1205,10 @@ export async function startHub(opts = {}) {
               if ('dependsOn' in ev
                 && JSON.stringify(ev.dependsOn || []) !== JSON.stringify(prevTask.dependsOn || [])) changed.push('依赖');
               if (changed.length > 0) {
-                const wantsDone = ev.status === 'done';
+                // 只认**原始事件**里显式的 status（0.11.27）：继承来的 done 说明
+                // 「这张卡原本就完成了」，不是「这条事件在标完成」。混用会把
+                // 「只想改标题」当成「标完成夹带正文」，让改动绕过 409 被静默丢掉。
+                const wantsDone = explicitStatusIds.has(ev.id) && ev.status === 'done';
                 /**
                  * 兜底（0.11.19）：非创建者标完成时夹带了正文改动 → **丢掉正文、留下 status**。
                  *

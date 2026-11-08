@@ -741,6 +741,104 @@ async function main() {
   });
   check('创建者改自己的卡 → 放行', renameByA.ok === true, JSON.stringify(renameByA.error));
 
+  /* ── 5b-2. 标完成兜底的判据只认**显式** status（0.11.27）────────────────
+   *
+   * 汐汐 V08 真机验出来的洞：卡已经是 done 之后，成员发一条**不带 status**、
+   * 只带 title 的事件，`TASK_CARRY` 会把 status 补成上一版的 done，
+   * 0.11.19 的兜底判据 `ev.status === 'done'` 就把它误当成「正在标完成」，
+   * 删掉正文放行 —— 而这条路径本该 409（改正文只有创建者能做）。
+   *
+   * 判据差异只在「带没带 status」：显式 status='running' + title 是正确 409 的。
+   */
+  console.log('\n5b-2. 标完成兜底的判据（0.11.27）');
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00020_aaa', origin: ORIGIN_A, name: 'A',
+        kind: 'task', taskId: 'own4', title: 'A 的第四张卡', detail: '原描述', status: 'pending',
+      }],
+    },
+  });
+  await call(base, '/tasks/claim', {
+    method: 'POST', token: tokenB, body: { taskId: 'own4', leaseMs: 0 },
+  });
+  const done4 = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00021_bbb', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', status: 'done',
+      }],
+    },
+  });
+  check('B 正常标 done（不带正文）→ 放行', done4.ok === true, JSON.stringify(done4.error));
+
+  // 坑本身：卡已是 done，不带 status 只改标题 —— 不许被继承出来的 done 放行
+  const sneaky = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00022_ccc', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', title: 'B 偷改的标题',
+      }],
+    },
+  });
+  check('不带 status 只改标题 → 409（不当成标完成）',
+    sneaky.status === 409 && sneaky.error.code === 'conflict',
+    JSON.stringify({ status: sneaky.status, error: sneaky.error }));
+
+  // 同一路径改描述：也算正文改动，同样 409
+  const sneakyDetail = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00023_ddd', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', detail: 'B 偷改的描述',
+      }],
+    },
+  });
+  check('不带 status 只改描述 → 409',
+    sneakyDetail.status === 409 && sneakyDetail.error.code === 'conflict',
+    JSON.stringify({ status: sneakyDetail.status, error: sneakyDetail.error }));
+
+  // 对照：显式 status='running' + title 也必须 409（V08 步骤5，本来就对）
+  const explicitRunning = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00024_eee', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', title: 'B running 时改的标题', status: 'running',
+      }],
+    },
+  });
+  check('显式 status=running + 改标题 → 409（对照）',
+    explicitRunning.status === 409 && explicitRunning.error.code === 'conflict',
+    JSON.stringify({ status: explicitRunning.status, error: explicitRunning.error }));
+
+  // 反向：**显式** status='done' + 改标题，兜底仍然要生效（0.11.19 不许被这次改动弄坏）
+  const explicitDone = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00025_fff', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', title: 'B 标完成时夹带的标题', status: 'done',
+      }],
+    },
+  });
+  check('显式 status=done + 夹带标题 → 放行（兜底还在）', explicitDone.ok === true,
+    JSON.stringify(explicitDone.error));
+  const own4Events = await call(base, '/events?since=0', { token: tokenA });
+  check('被拒的标题 / 描述没进事件流',
+    !JSON.stringify(own4Events.data?.events || []).includes('B 偷改的标题')
+    && !JSON.stringify(own4Events.data?.events || []).includes('B 偷改的描述'));
+
   console.log('\n5e. 租约续约（0.10.13）');
   // 纯算法：不依赖计时器，先把边界定死
   const t0 = '2026-01-01T00:00:00.000Z';
