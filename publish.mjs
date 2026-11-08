@@ -14,7 +14,7 @@
  *   node publish.mjs --dry      # 检查 + 测试 + 同步，不推送
  *   node publish.mjs --skip-tests
  */
-import { readFileSync, writeFileSync, cpSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, cpSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -155,10 +155,30 @@ const FILES = [
   'src/host/events.mjs', 'src/host/http-util.mjs', 'src/host/hub-client.mjs',
   'src/host/hub.mjs', 'src/host/identity.mjs', 'src/host/index.mjs',
   'src/host/ratelimit.mjs',
-  'src/host/selectable.mjs', 'src/host/settings.mjs', 'src/host/store.mjs', 'src/host/wake.mjs',
+  'src/host/selectable.mjs', 'src/host/settings.mjs', 'src/host/store.mjs',
+  'src/host/wake-target.mjs', 'src/host/wake.mjs', 'src/host/wakes.mjs',
   'test/host.test.mjs', 'test/hub.test.mjs', 'test/two-machine.test.mjs',
 ].filter((f) => existsSync(join(ROOT, f)));
 if (FILES.length === 0) die('没有可推送的文件');
+
+/**
+ * 新文件忘加进 FILES 的兜底。
+ *
+ * `base_tree` 是**叠加**语义（见下面 DELETED 那段）：漏一个源文件不会报错，
+ * 只会让远端少一个模块 —— 而 `index.mjs` 里 import 着它，clone 下来就是坏的。
+ * 0.11.30 的 `src/host/wake-target.mjs` 差一点就这么发出去了。
+ */
+const shipped = new Set(FILES);
+for (const dir of ['src', 'test']) {
+  const abs = join(ROOT, dir);
+  if (!existsSync(abs)) continue;
+  for (const f of readdirSync(abs, { recursive: true })) {
+    // 递归列出来的包含目录（src/client 这种），只要文件
+    if (!statSync(join(abs, String(f))).isFile()) continue;
+    const rel = `${dir}/${String(f).replace(/\\/g, '/')}`;
+    if (!shipped.has(rel)) die(`有文件没列进 FILES：${rel}（漏了它远端就少一个模块，clone 下来是坏的）`);
+  }
+}
 
 /**
  * 本地已删、远端还留着的文件。

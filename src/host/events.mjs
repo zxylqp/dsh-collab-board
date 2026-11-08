@@ -261,14 +261,36 @@ export function validateEvent(raw, opts = {}) {
       else if (raw.priority !== undefined && raw.priority !== '') {
         return bad('bad-param', `priority 不认识：${String(raw.priority)}`, 'priority');
       }
+      /**
+       * 收尾理由 `reason`（0.11.29）：标 done / cancelled / blocked 时留一句「为什么」。
+       *
+       * 以前只能塞进 `detail` 或 `title` —— 那两个是**正文**，非创建者一改就整条
+       * 409（汐汐 2026-11-08 连标三张 cancelled 全部被拒，理由一个字没落下；
+       * 而 cancelled 之后评论又锁了，想补也补不进去）。
+       *
+       * 给一个**自己的字段**，不进正文锁名单（Hub 的 `changed` 只算
+       * title / detail / dependsOn），权限跟 `status` 走：谁有权改状态，谁就能写理由。
+       *
+       * **有才写**：无条件写 `reason: ''` 会让后续任何一条普通事件把上一版的理由
+       * 擦掉 —— 和 title（0.11.14）、status（0.11.22）同一个判据。
+       */
+      const reason = isText(raw.reason) ? textOf(raw.reason, 500).trim() : '';
+      /**
+       * `...raw` 会把调用方带的 `reason: '   '` 一起带进来 —— 空白不算「给了理由」，
+       * 留着这个键会在 Hub / 客户端继承时把上一版的理由擦成空白。所以先规整，再展开。
+       */
+      const pre = { ...raw };
+      if (reason) pre.reason = reason;
+      else delete pre.reason;
       return {
         ok: true,
         event: {
-          ...raw,
+          ...pre,
           taskId,
           title: textOf(raw.title, 200),
           ...(status ? { status } : {}),
           ...(priority ? { priority } : {}),
+          ...(reason ? { reason } : {}),
           owner: isText(raw.owner) ? raw.owner.trim().slice(0, 64) : '',
           detail: textOf(raw.detail, 8192),
           dependsOn: strList(raw.dependsOn, 32, 64),

@@ -77,6 +77,11 @@ import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
 import { createWakes, freshClaimWake } from './wakes.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq, directedAway, WAKE_SKIP } from './wake.mjs';
+import {
+  createWakeRouter,
+  resolveWakeSubject,
+  rotateReasonText,
+} from './wake-target.mjs';
 import { validateEvent, noteTaskIdOf } from './events.mjs';
 
 export function apply(ctx, rawConfig = {}) {
@@ -181,18 +186,48 @@ export function apply(ctx, rawConfig = {}) {
   const WAKE_POSTPONE_MS = 60000;
 
   /**
-   * 挑一个能唤醒的会话。返回整条 summary（不只是 id）——
-   * `running` 是 0.11.21 新增的用途：自动续跑不能往一个正在跑一轮的会话里塞消息。
+   * 列一遍会话，挑出「能唤醒的」那些（最新在前）。
+   *
+   * 为什么整份 `items` 也返回：0.11.30 起唤醒要先问「设置里指定的那个工作会话在不在」，
+   * 它可能是冷会话（`agentAvailable === false`，prompt 会把它拉起来）——
+   * 只返回过滤后的 `alive` 就会把它漏掉，唤醒流量又打回人正在聊的那个会话。
    */
-  async function pickWakeSession() {
+  async function listWakeCandidates() {
     const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
-    if (!svc || typeof svc.list !== 'function') return null;
+    if (!svc || typeof svc.list !== 'function') return { svc: null, items: [], alive: [] };
     const out = await svc.list();
     const items = Array.isArray(out?.items) ? out.items : [];
     const alive = items.filter((s) => s && typeof s.sessionId === 'string' && s.agentAvailable !== false);
     alive.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
-    return alive[0] || null;
+    return { svc, items, alive };
   }
+
+  /**
+   * 唤醒该推到哪个会话（0.11.30）。
+   *
+   * 原来只有 `pickWakeSession()`：按 `updatedAt` 取最新会话 = 人正在聊的那个，
+   * 于是一次次唤醒把它推长（实测唤醒时 prompt 中位 159k、最大 663k / 1M 窗口）。
+   * 现在多一步「推送前动态路由」：
+   *
+   *   list() → pickTargetSummary（指定的工作会话优先） → decideRotation → 可能 create() → prompt()
+   *
+   * 判据是纯函数，副作用（create / 写回设置 / 记 note）全在 `wake-target.mjs`
+   * 的 `createWakeRouter` 里，测试可以直接注入假的 `create`，不用起宿主。
+   */
+  const wakeRouter = createWakeRouter({
+    getSettings,
+    patchSettings,
+    log: (level, msg) => hubLog(level, `唤醒路由：${msg}`),
+    onRotate: (route, metrics) => {
+      const note = buildEvent({
+        kind: 'note',
+        level: 'info',
+        text: `唤醒改推新会话 ${String(route.sessionId).slice(0, 8)}…`
+          + `（${rotateReasonText(route)}；原会话 ${String(metrics.sessionId).slice(0, 8)}… 留在原地可查）`,
+      });
+      if (note) appendEvent(note);
+    },
+  });
 
   /**
    * 叫醒本机 agent。
@@ -204,17 +239,40 @@ export function apply(ctx, rawConfig = {}) {
   async function wakeAgent(text, item) {
     const svc = typeof ctx.get === 'function' ? ctx.get('sessionController') : null;
     if (!svc || typeof svc.prompt !== 'function') throw new Error('宿主没有 sessionController.prompt');
-    const picked = await pickWakeSession();
-    if (!picked) throw new Error('找不到可唤醒的会话');
-    const sessionId = picked.sessionId;
+    const { items, alive } = await listWakeCandidates();
+    /**
+     * 从「最新可用」和「设置里指定的工作会话」里挑一个。指定的那个可能是冷会话
+     * （重启后人还没点开过）—— 认它，`prompt()` 会把它拉起来。细节在
+     * `wake-target.mjs` 的 `resolveWakeSubject()` 里（纯函数，能单测）。
+     */
+    const subject = resolveWakeSubject({
+      items,
+      alive,
+      configuredId: getSettings().wakeSessionId || '',
+    });
+    if (!subject.subject) throw new Error(subject.error);
+    const picked = subject.subject;
+    /**
+     * 0.11.30：推送前先决定「推哪儿」—— 复用当前工作会话，还是换一个新的。
+     * 判据看上下文绝对长度和缓存命中率（细节在 wake-target.mjs 的注释里）。
+     */
+    const route = await wakeRouter.resolve({ svc, items, picked });
+    if (route.rotated) {
+      hubLog('info', `唤醒改推新会话 ${String(route.sessionId).slice(0, 8)}…：`
+        + `${rotateReasonText(route)}${route.error ? `（${route.error}）` : ''}`);
+    }
+    const sessionId = route.sessionId;
     /**
      * 0.11.21：自动续跑不往正在跑的会话里塞。
      *
      * 原来只有一个来源：`mode: 'queue'`，宿主会把消息排进那一轮后面 —— 于是
      * 「会话在干活」和「续跑又推了一条」撞在一起，agent 干完手头的活还要再回一条
      * 插件自己排的空转消息，越跑越多。延后不算失败：账留在原处，60 秒后再看。
+     *
+     * 判的是**最终要推的那个会话**（可能是设置里指定的工作会话，也可能是刚建的），
+     * 不是「最新的那个」。
      */
-    if (item && item.kind === 'self' && picked.running === true) {
+    if (item && item.kind === 'self' && route.target && route.target.running === true) {
       throw new WakePostponed(`会话 ${String(sessionId).slice(0, 8)}… 正在跑一轮，自动续跑延后`, WAKE_POSTPONE_MS);
     }
     // requestId 是必填（SessionRequestId），mode 显式给 queue：看板消息不该打断正在跑的轮次。
@@ -429,7 +487,7 @@ export function apply(ctx, rawConfig = {}) {
    * 以前唤醒是「试一次，成功与否只写日志」：失败没人重试，重启全忘，
    * 正在唤醒时来的消息直接丢。现在先记账再投、失败按 `wakeRetries` 重试、
    * 重启后补投一次 —— 这一层是跟 DS Bot 的 resume.js 学的。
-   * 投递目标不变：还是本机最近活跃的那个会话。
+   * 投递目标：`wakeRouter.resolve()` 决定（0.11.30 起会换新会话，不再固定推最新那个）。
    */
   const delivery = createDelivery({
     file: join(dataDir, 'inflight.json'),
@@ -1296,6 +1354,24 @@ export function apply(ctx, rawConfig = {}) {
                 attempts: wake.attempts,
                 /** 队头那条的结构化理由（reason / cardIds / coalescedCount）。 */
                 payload: wake.payload || null,
+                /**
+                 * 上一次「推到哪个会话」的决定（0.11.30）。
+                 *
+                 * 换新会话之后，回复会出现在**另一个会话**里 —— 人会说「她怎么不在
+                 * 当前对话里回我」。这条就是答案：换了、什么时候、为什么、原来那个是哪个。
+                 */
+                wakeTarget: (() => {
+                  const r = wakeRouter.last();
+                  return {
+                    at: r.at || '',
+                    sessionId: r.sessionId || '',
+                    configured: getSettings().wakeSessionId || '',
+                    rotated: r.rotated === true,
+                    reason: r.reason || '',
+                    detail: r.detail || null,
+                    error: r.error || '',
+                  };
+                })(),
               },
               dataDir,
             });
@@ -1697,7 +1773,10 @@ export function apply(ctx, rawConfig = {}) {
           '**写进去 ≠ 别人看得见**（0.11.23）：工具只保证写进本机日志，经 Hub 收下才算送达。' +
           '判据是 `.synced.json` —— 那条事件的 id 在里头拿到 seq 才算真进去（**日志里没有 seq**，' +
           'Hub 分号只记在这个 sidecar 里）。被拒的话流里会多一条 warn note，' +
-          '`collab_state` 的 `rejected` 也会列出来。别把「已写进本机」当成「对方收到了」。',
+          '`collab_state` 的 `rejected` 也会列出来。别把「已写进本机」当成「对方收到了」。' +
+          '**要留一句「为什么」用 reason，别塞 detail / title**（0.11.29）：' +
+          'detail 和 title 是正文，非创建者一带就整条 409，status 也跟着丢 —— '
+          + 'reason 和 status 同权限，标 cancelled / done 时带上就行，卡片上直接显示。',
         parameters: {
           type: 'object',
           additionalProperties: false,
@@ -1721,6 +1800,12 @@ export function apply(ctx, rawConfig = {}) {
               description: '做这件事需要的能力标签，如 gpu / ffmpeg',
             },
             priority: { type: 'string', enum: ['high', 'normal', 'low'], description: 'task 优先级' },
+            reason: {
+              type: 'string',
+              description: 'task 的收尾理由（≤500 字）：标 done / cancelled / blocked 时写一句「为什么」。'
+                + '**这不是正文**，和 status 同权限 —— 谁有权改状态谁就能写，不会 409；'
+                + '卡片上直接显示（取消原因 / 完成说明）。不写就沿用上一版的理由。',
+            },
             tags: { type: 'array', items: { type: 'string' }, description: 'task 标签，最多显示 3 个' },
             dueAt: { type: 'string', description: '截止时间（ISO），只显示不提醒' },
             archived: { type: 'boolean', description: '归档后不进主视图' },
@@ -2241,6 +2326,16 @@ export function apply(ctx, rawConfig = {}) {
           if (Number.isFinite(t)) ev.dueAt = new Date(t).toISOString();
         }
         if (typeof input.archived === 'boolean') ev.archived = input.archived;
+        /**
+         * 收尾理由（0.11.29）：**有才写**。
+         *
+         * 无条件写 `ev.reason = ''` 就成了「改个状态顺手把上一版的理由擦掉」——
+         * 和 title（0.11.14）、status（0.11.22）同一个坑，这里一次踩够。
+         */
+        if (isText(input.reason)) {
+          const why = input.reason.trim().slice(0, 500);
+          if (why) ev.reason = why;
+        }
         return ev;
       }
       case 'progress': {

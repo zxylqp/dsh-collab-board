@@ -148,6 +148,46 @@ export function settingsSpec(maxEventsDefault = 5000) {
     wakeSelfContinue: { kind: 'bool', def: false },
     /** 同一张卡最多连续续跑几次。到了就写一条 warn note 停下，不无限刷。 */
     wakeSelfContinueMax: { kind: 'int', min: 1, max: 50, def: 8 },
+    /**
+     * 唤醒推到哪个会话（0.11.30）。
+     *
+     * 以前固定推「最近活跃的那个会话」，也就是人正在聊的那个 —— 唤醒消息一条条
+     * 把它推长（实测唤醒时 prompt 中位 159k、最大 663k / 1M 窗口）。从 0.11.30 起，
+     * 推送前先看上下文绝对长度和缓存命中率，太长就换一个新会话接这段活。
+     *
+     * **唤醒次数不变**：换的只是「推到哪儿」。关掉这个开关 = 退回旧行为。
+     */
+    wakeRotateEnabled: { kind: 'bool', def: true },
+    /**
+     * 软条件开关（缓存冷了才换）。
+     *
+     * 硬上限（防撑爆/防质量下降）**不看这个开关**。软条件只在「上下文已经很长
+     * 而且缓存明显不命中」时生效 —— 那时继续推要按全价付一大段 prompt，
+     * 换新只付地板价（约 34k）。默认开，但实测本机 89 个会话一次都不会触发。
+     */
+    wakeRotateSoft: { kind: 'bool', def: true },
+    /** 硬上限占窗口的比例（百分数）。和 `wakeHardLimitAbs` 取**小**。 */
+    wakeHardLimitPct: { kind: 'int', min: 10, max: 95, def: 60 },
+    /** 硬上限的绝对 token 数。超大窗口（1M）下防止 60% 太晚。 */
+    wakeHardLimitAbs: { kind: 'int', min: 10000, max: 2000000, def: 600000 },
+    /** 软条件：上下文短于这个长度就不折腾（换会话的分割成本 >> 省下的钱）。 */
+    wakeSoftLimitAbs: { kind: 'int', min: 10000, max: 2000000, def: 100000 },
+    /** 软条件：累计缓存命中率低于这个百分数才算「缓存冷了」。 */
+    wakeCacheHitPct: { kind: 'int', min: 1, max: 100, def: 85 },
+    /**
+     * 轮换防抖：刚换进去的会话，这段时间内不再因软条件被换出来。
+     *
+     * 为什么需要：缓存真坏的时候（换 provider、系统提示变了），软条件会每次唤醒
+     * 都触发 —— 一天能建出几十个会话。硬上限不受这个限制（那是安全阀）。
+     */
+    wakeRotateBackoffMs: { kind: 'int', min: 0, max: 86400000, def: 21600000 },
+    /**
+     * 当前的工作会话 id（空 = 还是按「最近活跃」挑）。
+     *
+     * 换过一次就会写死在这儿 —— 不写回的话，人只要在自己的对话里说一句，
+     * 唤醒流量就又回去了，换会话等于只生效一次。清空 = 退回跟随最新会话。
+     */
+    wakeSessionId: { kind: 'string', max: 100, def: '' },
   };
 }
 

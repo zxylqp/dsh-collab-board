@@ -337,6 +337,8 @@ export async function startHub(opts = {}) {
           dueAt: '',
           archived: false,
           status: 'cancelled',
+          // 删除就是把正文擦空，收尾理由也是正文（0.11.29）
+          reason: '',
         };
         folded.set(ev.taskId, shell);
         tasks.set(ev.taskId, shell);
@@ -377,7 +379,13 @@ export async function startHub(opts = {}) {
            * 这里多一份是因为**老数据**（0.11.21 及以前写的事件都自带 status）在
            * 事件本身上没有缺失，但 0.11.22 之后新写的可能缺，两种都要能读。
            */
-          for (const f of ['title', 'detail', 'owner', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+          /**
+           * `reason`（0.11.29）也在里面：标 cancelled 时写了理由，后面有人改个
+           * 优先级 / 加个标签，理由不能跟着没 —— 和 title 一样的继承语义。
+           * 本机 `selectable.mjs:latestTasks` 和客户端 `buildModel` 各有一份同样的
+           * 列表，改这里必须一起改（0.11.15 就是只改一处，标题在另一侧消失了）。
+           */
+          for (const f of ['title', 'detail', 'owner', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived', 'reason']) {
             if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
           }
         }

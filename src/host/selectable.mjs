@@ -58,7 +58,7 @@ export function latestTasks(events) {
        *
        * 显式写了（含空串）才算变更，判据是 `!== undefined`。
        */
-      for (const f of ['title', 'detail', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived']) {
+      for (const f of ['title', 'detail', 'status', 'priority', 'tags', 'dependsOn', 'requiredCapabilities', 'dueAt', 'archived', 'reason']) {
         if (next[f] === undefined && prev[f] !== undefined) next[f] = prev[f];
       }
       /**

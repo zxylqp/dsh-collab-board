@@ -15,9 +15,20 @@ import { createDelivery } from '../src/host/delivery.mjs';
 import { createWakes, freshClaimWake } from '../src/host/wakes.mjs';
 import { writeAtomic } from '../src/host/http-util.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq } from '../src/host/wake.mjs';
+import {
+  ROTATE_DEFAULTS,
+  ROTATE_REASON,
+  createWakeRouter,
+  decideRotation,
+  hardLimitOf,
+  pickTargetSummary,
+  readWakeMetrics,
+  resolveWakeSubject,
+  rotateConfigOf,
+} from '../src/host/wake-target.mjs';
 import { createStore } from '../src/host/store.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
-import { noteTaskIdOf } from '../src/host/events.mjs';
+import { noteTaskIdOf, validateEvent } from '../src/host/events.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -779,6 +790,312 @@ async function main() {
   check('唤醒成功后 lastAt 有值',
     Boolean(verAfterWake.payload?.wake?.lastAt) && verAfterWake.payload?.wake?.lastError === '',
     JSON.stringify(verAfterWake.payload?.wake));
+
+  console.log('\\n9d2. 唤醒路由：上下文太长就换新会话，并写回设置（0.11.30）');
+  /**
+   * 为什么要有这一节：换会话是**三个副作用串起来**才成立的（create → 写回设置 → 推新 id）。
+   * 少任何一环，表现都是「看起来换了、下次又回去了」，只有真跑一遍才看得出来。
+   */
+  const rotateCalls = { created: [], prompted: [] };
+  const bigSummary = {
+    sessionId: 'sess-big',
+    updatedAt: Date.now(),
+    agentAvailable: true,
+    running: false,
+    blank: false,
+    cwd: '/tmp/rotate-ws',
+    projections: {
+      kind: 'sequenced',
+      asOfSeq: 9,
+      values: {
+        contextPressure: { pressureTokens: 700000, projectedTokens: 700000, contextWindow: 1048576 },
+        tokenUsage: { uncachedInputTokens: 500, outputTokens: 10, cacheReadTokens: 100000, cacheWriteTokens: 0 },
+        agentPreset: 'default',
+      },
+    },
+  };
+  services.sessionController = {
+    list: async () => ({ items: [bigSummary] }),
+    create: async (request) => {
+      rotateCalls.created.push(request);
+      return { sessionId: 'sess-new-1' };
+    },
+    prompt: async (request, signal) => {
+      rotateCalls.prompted.push(request);
+      signal.throwIfAborted();
+      return { accepted: true };
+    },
+  };
+  const push9d2 = await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_wake03_ddd',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'msg',
+        taskId: 'wake3',
+        text: '会话太长了，这条该推到新会话里',
+      }],
+    }),
+  });
+  console.log(`  [9d2] push ${push9d2.status}`);
+  await new Promise((r) => setTimeout(r, 5000));
+  check('超硬上限（700k ≥ min(1M×60%, 600k)）触发了 create',
+    rotateCalls.created.length >= 1, `created=${rotateCalls.created.length}`);
+  check('create 带上了原会话的 cwd', rotateCalls.created[0]?.cwd === '/tmp/rotate-ws',
+    JSON.stringify(rotateCalls.created[0]));
+  check('唤醒推到了新会话', rotateCalls.prompted.some((r) => r.sessionId === 'sess-new-1'),
+    JSON.stringify(rotateCalls.prompted.map((r) => r.sessionId)));
+  const settingsAfterRotate = await hit(routes, '/collab-board/settings');
+  check('新 sessionId 写回了设置（不写回下次又挑回长会话）',
+    settingsAfterRotate.payload?.settings?.wakeSessionId === 'sess-new-1',
+    String(settingsAfterRotate.payload?.settings?.wakeSessionId));
+  const verAfterRotate = await hit(routes, '/collab-board/version');
+  check('/version 报出了换会话（原因 + 新 id）',
+    verAfterRotate.payload?.wake?.wakeTarget?.rotated === true
+    && verAfterRotate.payload.wake.wakeTarget.reason === ROTATE_REASON.HARD_LIMIT
+    && verAfterRotate.payload.wake.wakeTarget.sessionId === 'sess-new-1',
+    JSON.stringify(verAfterRotate.payload?.wake?.wakeTarget));
+  // 收尾：把假宿主和设置还原，别影响后面几节（9f 会裁日志，10 之后会重启）
+  services.sessionController = {
+    list: async () => ({ items: [{ sessionId: 'sess-wake-1', updatedAt: Date.now(), agentAvailable: true }] }),
+    prompt: async (request, signal) => { signal.throwIfAborted(); return { accepted: true }; },
+  };
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { patch: { wakeSessionId: '' } } });
+
+  console.log('\\n9d2b. 唤醒目标：冷会话（重启后还没点开过的）也要能推');
+  /**
+   * 真机场景：DSH 刚起来，人还没点开任何会话 —— `list()` 里每一条
+   * `agentAvailable === false`，被「可用会话」过滤全刷掉。这时候如果只认过滤后的
+   * 列表，唤醒会整段失效「找不到可唤醒的会话」，指定的工作会话也白配。
+   *
+   * 这里直接测判据（`resolveWakeSubject`），不走 Hub 投递 —— 投递要看轮询时机，
+   * 和这条规则无关。
+   */
+  {
+    const coldItems = [
+      { sessionId: 'sess-cold-work', agentAvailable: false },
+      { sessionId: 'sess-cold-other', agentAvailable: false },
+    ];
+    const coldAlive = coldItems.filter((s) => s.agentAvailable !== false);
+    const r = resolveWakeSubject({ items: coldItems, alive: coldAlive, configuredId: 'sess-cold-work' });
+    check('全是冷会话 + 指定了工作会话 → 认那个冷会话',
+      r.subject?.sessionId === 'sess-cold-work' && r.error === '', JSON.stringify(r));
+  }
+  {
+    const coldItems = [{ sessionId: 'sess-cold-work', agentAvailable: false }];
+    const r = resolveWakeSubject({ items: coldItems, alive: [], configuredId: '' });
+    check('全是冷会话又没指定 → 明说「找不到可唤醒的会话」（不是静默）',
+      r.subject === null && /找不到可唤醒的会话/.test(r.error), JSON.stringify(r));
+  }
+  {
+    const hot = { sessionId: 'sess-hot', agentAvailable: true };
+    const r = resolveWakeSubject({
+      items: [hot, { sessionId: 'sess-cold', agentAvailable: false }],
+      alive: [hot],
+      configuredId: 'sess-cold',
+    });
+    check('指定的冷会话和可用的热会话都在 → 优先可用最新的那个（不主动挑冷的）',
+      r.subject?.sessionId === 'sess-hot', JSON.stringify(r));
+  }
+
+  console.log('\\n9d3. 唤醒路由判据（唯一一份在 wake-target.mjs）');
+  const proj = (projectedTokens, contextWindow, buckets) => ({
+    sessionId: 'x',
+    projections: {
+      kind: 'sequenced',
+      values: {
+        contextPressure: {
+          ...(projectedTokens == null ? {} : { projectedTokens }),
+          ...(contextWindow == null ? {} : { contextWindow }),
+        },
+        ...(buckets ? { tokenUsage: buckets } : {}),
+      },
+    },
+  });
+  const cfg = { ...ROTATE_DEFAULTS };
+
+  check('硬上限 = min(窗口×60%, 60万)：1M 窗口算成 60 万',
+    hardLimitOf(1048576, 60, 600000) === 600000, String(hardLimitOf(1048576, 60, 600000)));
+  check('小窗口由占比兜住（128k → 78643）',
+    Math.round(hardLimitOf(131072, 60, 600000)) === 78643,
+    String(hardLimitOf(131072, 60, 600000)));
+  check('窗口量不到 → 硬上限 null（不猜）', hardLimitOf(null, 60, 600000) === null);
+
+  check('700k / 1M 窗口 → 硬上限触发',
+    decideRotation(readWakeMetrics(proj(700000, 1048576)), cfg).reason === ROTATE_REASON.HARD_LIMIT);
+  check('599999 差一个不触发',
+    decideRotation(readWakeMetrics(proj(599999, 1048576)), cfg).rotate === false);
+  check('量不到 prompt → 复用（宁可多花，也不能因缺字段乱开）',
+    decideRotation(readWakeMetrics({ sessionId: 'y' }), cfg).reason === ROTATE_REASON.NO_METRICS);
+  check('量不到窗口 → 硬上限不判，软条件仍然管用',
+    decideRotation(readWakeMetrics(proj(200000, null,
+      { uncachedInputTokens: 60000, cacheReadTokens: 40000, cacheWriteTokens: 0 })), cfg)
+      .reason === ROTATE_REASON.SOFT_LIMIT);
+  check('软条件：12 万 + 命中 40% → 换',
+    decideRotation(readWakeMetrics(proj(120000, 1048576,
+      { uncachedInputTokens: 60000, cacheReadTokens: 40000, cacheWriteTokens: 0 })), cfg)
+      .reason === ROTATE_REASON.SOFT_LIMIT);
+  check('软条件：12 万 + 命中 99% → 不换（缓存热的，继续推更便宜）',
+    decideRotation(readWakeMetrics(proj(120000, 1048576,
+      { uncachedInputTokens: 400, cacheReadTokens: 119600, cacheWriteTokens: 0 })), cfg)
+      .rotate === false);
+  check('软条件：8 万 + 命中 50% → 不换（短会话不值得切）',
+    decideRotation(readWakeMetrics(proj(80000, 1048576,
+      { uncachedInputTokens: 40000, cacheReadTokens: 40000, cacheWriteTokens: 0 })), cfg)
+      .rotate === false);
+  check('没有缓存数据 → 不猜「缓存坏了」',
+    decideRotation(readWakeMetrics(proj(120000, 1048576)), cfg).rotate === false);
+  check('总开关关掉 → 一律复用（退回旧行为）',
+    decideRotation(readWakeMetrics(proj(700000, 1048576)), { ...cfg, enabled: false })
+      .reason === ROTATE_REASON.OFF);
+  check('软条件关掉 → 硬上限照样触发',
+    decideRotation(readWakeMetrics(proj(700000, 1048576)), { ...cfg, soft: false })
+      .reason === ROTATE_REASON.HARD_LIMIT);
+  check('刚换进去的会话，软条件防抖（6 小时内不再换出来）',
+    decideRotation(readWakeMetrics(proj(120000, 1048576,
+      { uncachedInputTokens: 60000, cacheReadTokens: 40000, cacheWriteTokens: 0 })),
+    cfg, { recentlyRotated: true }).reason === ROTATE_REASON.BACKOFF);
+  check('防抖不影响硬上限（安全阀优先）',
+    decideRotation(readWakeMetrics(proj(700000, 1048576)), cfg, { recentlyRotated: true })
+      .reason === ROTATE_REASON.HARD_LIMIT);
+
+  /* 口径：输入三桶相加才是 prompt；inputTokens 只是没命中缓存的那部分 */
+  const mBig = readWakeMetrics(proj(150000, 1048576, {
+    uncachedInputTokens: 3000, cacheReadTokens: 147000, cacheWriteTokens: 0,
+  }));
+  check('缓存命中率按累计三桶算（147000 / 150000）',
+    Math.abs((mBig.cacheHitRate || 0) - 0.98) < 1e-9, String(mBig.cacheHitRate));
+  check('projectedTokens 就是下一次请求的 prompt 估算', mBig.promptTokens === 150000, String(mBig.promptTokens));
+  check('只有 pressureTokens 时用它兜底',
+    readWakeMetrics(proj(undefined, 1048576)).promptTokens == null
+    && readWakeMetrics({ projections: { values: { contextPressure: { pressureTokens: 160000 } } } })
+      .promptTokens === 160000);
+
+  check('设置里的 wakeSessionId 优先',
+    pickTargetSummary([{ sessionId: 'a' }, { sessionId: 'b' }], 'b', { sessionId: 'a' })?.sessionId === 'b');
+  check('指定的会话不在了 → 退回最新会话',
+    pickTargetSummary([{ sessionId: 'a' }], 'gone', { sessionId: 'a' })?.sessionId === 'a');
+  check('没指定 → 用最新会话',
+    pickTargetSummary([{ sessionId: 'a' }], '', { sessionId: 'a' })?.sessionId === 'a');
+  check('指定的会话是冷的（agentAvailable=false）也要认 —— prompt 会把它拉起来',
+    pickTargetSummary([{ sessionId: 'cold', agentAvailable: false }], 'cold', { sessionId: 'hot' })
+      ?.sessionId === 'cold');
+
+  /* 路由器：三个副作用缺一条都会留坑 */
+  const mkRouter = (over = {}) => {
+    const seen = { rotated: [] };
+    const patchedSettings = {};
+    const router = createWakeRouter({
+      getSettings: () => ({ ...ROTATE_DEFAULTS, ...(over.settings || {}) }),
+      patchSettings: (p) => {
+        if (over.patchThrows) throw new Error('盘满了');
+        Object.assign(patchedSettings, p);
+      },
+      log: () => {},
+      onRotate: (route) => seen.rotated.push(route),
+      now: over.now,
+    });
+    return { router, seen, patchedSettings };
+  };
+  const bigItems = [{
+    sessionId: 'old', agentAvailable: true, running: false, cwd: '/w', projections: {
+      kind: 'sequenced',
+      values: {
+        contextPressure: { projectedTokens: 700000, contextWindow: 1048576 },
+        agentPreset: 'default',
+      },
+    },
+  }];
+
+  {
+    const { router, seen, patchedSettings } = mkRouter();
+    const creates = [];
+    const route = await router.resolve({
+      svc: { create: async (r) => { creates.push(r); return { sessionId: 'fresh-1' }; } },
+      items: bigItems,
+      picked: bigItems[0],
+    });
+    check('路由器：换新 → 返回新 id', route.rotated === true && route.sessionId === 'fresh-1',
+      JSON.stringify(route));
+    check('路由器：create 带 cwd + agentPreset',
+      creates[0]?.cwd === '/w' && creates[0]?.agentPreset === 'default', JSON.stringify(creates[0]));
+    check('路由器：写回设置', patchedSettings.wakeSessionId === 'fresh-1', JSON.stringify(patchedSettings));
+    check('路由器：留了 onRotate 回调（写 note）', seen.rotated.length === 1);
+    check('路由器：last() 反映这次决定',
+      router.last().rotated === true && router.last().reason === ROTATE_REASON.HARD_LIMIT);
+  }
+  {
+    const { router, patchedSettings } = mkRouter();
+    const route = await router.resolve({
+      svc: { create: async () => { throw new Error('建不出来'); } },
+      items: bigItems,
+      picked: bigItems[0],
+    });
+    check('路由器：create 失败 → 降级复用原会话，不卡唤醒',
+      route.rotated === false && route.sessionId === 'old' && /建不出来/.test(route.error),
+      JSON.stringify(route));
+    check('路由器：降级时不写设置', patchedSettings.wakeSessionId === undefined);
+  }
+  {
+    const { router } = mkRouter();
+    const route = await router.resolve({
+      svc: { create: async () => ({}) },
+      items: bigItems,
+      picked: bigItems[0],
+    });
+    check('路由器：create 没返回 sessionId → 照样降级',
+      route.rotated === false && route.sessionId === 'old', JSON.stringify(route));
+  }
+  {
+    const { router } = mkRouter();
+    const route = await router.resolve({ svc: {}, items: bigItems, picked: bigItems[0] });
+    check('路由器：宿主没有 create → 降级（不是崩）',
+      route.rotated === false && route.sessionId === 'old'
+      && /没有 sessionController\.create/.test(route.error), JSON.stringify(route));
+  }
+  {
+    const { router } = mkRouter({ patchThrows: true });
+    const route = await router.resolve({
+      svc: { create: async () => ({ sessionId: 'fresh-2' }) },
+      items: bigItems,
+      picked: bigItems[0],
+    });
+    check('路由器：写回失败仍然认这条新会话（这一次要投对）',
+      route.rotated === true && route.sessionId === 'fresh-2' && /写回/.test(route.error),
+      JSON.stringify(route));
+  }
+  {
+    /**
+     * 防抖：软条件连续触发时，刚建出来的会话不能被立刻再换掉一次。
+     * 不做这一步，缓存一坏就是「每次唤醒建一个会话」—— 一天几十个。
+     */
+    let t = 1000;
+    const { router } = mkRouter({ now: () => t });
+    const softItems = [{
+      sessionId: 'soft', agentAvailable: true, running: true, projections: {
+        values: {
+          contextPressure: { projectedTokens: 120000, contextWindow: 1048576 },
+          tokenUsage: { uncachedInputTokens: 60000, cacheReadTokens: 40000, cacheWriteTokens: 0 },
+        },
+      },
+    }];
+    const made = [];
+    const svc = { create: async () => ({ sessionId: `made-${made.length + 1}` }) };
+    const first = await router.resolve({ svc, items: softItems, picked: softItems[0] });
+    check('防抖：第一次软条件换新', first.rotated === true && first.sessionId === 'made-1',
+      JSON.stringify(first));
+    // 下一次唤醒挑到的就是刚建的那个会话 —— 它还在软条件的范围里，靠防抖挡住
+    t += 1000;
+    const nextItems = [{ ...softItems[0], sessionId: 'made-1' }];
+    const second = await router.resolve({ svc, items: nextItems, picked: nextItems[0] });
+    check('防抖：刚换进去的会话不因软条件立刻再换',
+      second.rotated === false && second.reason === ROTATE_REASON.BACKOFF
+      && second.sessionId === 'made-1', JSON.stringify(second));
+  }
 
   console.log('\n9e. 唤醒判据（(epoch, seq)，唯一一份在 wake.mjs）');
   // 为什么不是测 ts：第一版按「10 分钟年龄」挡历史重放，被汐汐当场否掉 ——
@@ -1638,6 +1955,35 @@ async function main() {
   ], { selfOrigin: 'ffffffffffffffff' }).find((x) => x.task.taskId === 't-lt2');
   check('claimableTasks 也保住了标题', t1Pending?.task?.title === '待认领卡',
     JSON.stringify(t1Pending?.task || null));
+
+  console.log('\n12o-2. 收尾理由 reason 的继承与「有才写」（0.11.29）');
+  // 同一件事写在三处折叠里（Hub applyIndex / selectable / 客户端 buildModel），
+  // 0.11.15 就是只改一处导致标题在另一侧消失。这里钉住 selectable 这份。
+  const ltR = latestTasks([
+    { id: 'ev_a', kind: 'task', taskId: 't-rs', title: '带理由的卡', status: 'running', epoch: 1, seq: 1 },
+    { id: 'ev_b', kind: 'task', taskId: 't-rs', status: 'cancelled', reason: '验证计划叫停', epoch: 1, seq: 2 },
+    { id: 'ev_c', kind: 'task', taskId: 't-rs', priority: 'high', epoch: 1, seq: 3 },
+  ]);
+  check('latestTasks 继承 reason（后续无 reason 的事件不擦掉）',
+    ltR.get('t-rs')?.reason === '验证计划叫停', JSON.stringify(ltR.get('t-rs') || null));
+  check('reason 不影响 status 的判定', ltR.get('t-rs')?.status === 'cancelled',
+    String(ltR.get('t-rs')?.status));
+  // 墓碑：擦正文是 Hub 的 applyIndex 和客户端 buildModel 的职责（两处都擦），
+  // `latestTasks` 只管认领 / 状态判定、不擦正文 —— 这里不钉那条老边界，只钉 reason 的继承。
+  // 没有 reason 的事件不许落下 `reason: ''` 这个键 —— 有键就会在继承时擦掉上一版
+  const vr = validateEvent({ kind: 'task', taskId: 't-rs3', title: 'x', status: 'cancelled' },
+    { localWrite: true });
+  check('validateEvent 不带 reason 时不写这个键', vr.ok === true && !('reason' in vr.event),
+    JSON.stringify(vr.event || vr.error));
+  const vr2 = validateEvent({ kind: 'task', taskId: 't-rs3', title: 'x', reason: '  为什么  ' },
+    { localWrite: true });
+  check('validateEvent 给 reason → 去掉首尾空白后留下',
+    vr2.ok === true && vr2.event.reason === '为什么', JSON.stringify(vr2.event || vr2.error));
+  const vr3 = validateEvent({ kind: 'task', taskId: 't-rs3', title: 'x', reason: '   ' },
+    { localWrite: true });
+  check('validateEvent 只给空白 → 等价于没给（不落空串）',
+    vr3.ok === true && !('reason' in vr3.event), JSON.stringify(vr3.event || vr3.error));
+
 
   // 12p（unread 投影）需要事件带 seq，本机 Hub 已停时写的事件没有 seq，
   // 这条放到 two-machine.test.mjs 里验 —— 那边的事件都由 Hub 分配序号。

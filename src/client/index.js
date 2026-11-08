@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 37;
-    const VERSION = '0.11.28';
+    const BUILD = 38;
+    const VERSION = '0.11.30';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -59,6 +59,14 @@ window.__ModuleLoader__.load({
       wakeRetries: 3,
       wakeSelfContinue: false,
       wakeSelfContinueMax: 8,
+      wakeRotateEnabled: true,
+      wakeRotateSoft: true,
+      wakeHardLimitPct: 60,
+      wakeHardLimitAbs: 600000,
+      wakeSoftLimitAbs: 100000,
+      wakeCacheHitPct: 85,
+      wakeRotateBackoffMs: 21600000,
+      wakeSessionId: '',
     };
 
     const ROLE_LABEL = { solo: '单机', hub: 'Hub', member: '成员' };
@@ -253,6 +261,10 @@ window.__ModuleLoader__.load({
 .cb-errline{display:flex;align-items:flex-start;gap:5px;font-size:11px;line-height:16px;
   color:var(--dsw-alias-label-error);}
 .cb-hint{font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary);}
+/* 收尾理由（0.11.29）：取消 / 完成时写的那句「为什么」。左边一道竖线，和描述区分开 */
+.cb-reason{margin:2px 0 7px;padding:5px 8px;border-left:2px solid var(--dsw-alias-label-tertiary);
+  background:var(--dsw-alias-bg-overlay);border-radius:3px;font-size:11.5px;line-height:1.6;
+  white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-secondary);}
 .cb-kv{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:11.5px;line-height:1.6;
   padding:5px 0;border-top:1px solid var(--dsw-alias-border-l1);}
 .cb-kv:first-of-type{border-top:0;}
@@ -618,6 +630,8 @@ window.__ModuleLoader__.load({
               dueAt: '',
               archived: false,
               deleted: true,
+              // 正文擦空，收尾理由也擦（0.11.29）
+              reason: '',
               deletedAt: typeof ev.deletedAt === 'string' ? ev.deletedAt : ev.ts || '',
               claimedAt: '',
               leaseMs: 0,
@@ -640,6 +654,8 @@ window.__ModuleLoader__.load({
             tags: [],
             dueAt: '',
             archived: false,
+            /** 收尾理由（0.11.29）：标 done / cancelled / blocked 时写的一句「为什么」 */
+            reason: '',
             claimedAt: '',
             leaseMs: 0,
             versions: [],
@@ -663,6 +679,8 @@ window.__ModuleLoader__.load({
             tags: Array.isArray(ev.tags) ? textList(ev.tags, 8) : prev.tags,
             dueAt: typeof ev.dueAt === 'string' ? ev.dueAt : prev.dueAt,
             archived: typeof ev.archived === 'boolean' ? ev.archived : prev.archived,
+            /** 理由只在带了的时候覆盖 —— 空串不算「清空」，和 status / title 同一判据 */
+            reason: typeof ev.reason === 'string' && ev.reason !== '' ? ev.reason : prev.reason,
             claimedAt: typeof ev.claimedAt === 'string' ? ev.claimedAt : prev.claimedAt,
             leaseMs: Number.isFinite(Number(ev.leaseMs)) ? Number(ev.leaseMs) : prev.leaseMs,
             updatedTs: ev.ts,
@@ -1359,6 +1377,17 @@ window.__ModuleLoader__.load({
           /* 2. 任务信息 */
           h('div', { className: 'cb-card' },
             h('div', { className: 'cb-card-h' }, '任务信息'),
+            /**
+             * 收尾理由（0.11.29）：标 done / cancelled / blocked 时写的那句「为什么」。
+             * 放在描述上面 —— 取消一张卡之后，人第一个想知道的就是「为什么取消」，
+             * 而那时候评论已经锁了，理由只可能在这个字段里。
+             */
+            task.reason
+              ? h('div', { className: 'cb-reason' },
+                (task.status === 'cancelled'
+                  ? '取消原因：'
+                  : (task.status === 'done' ? '完成说明：' : '说明：')) + task.reason)
+              : null,
             task.detail
               ? h('div', { style: { fontSize: '11.5px', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, task.detail)
               : h('div', { className: 'cb-hint' }, '没有写描述。'),
@@ -2012,6 +2041,56 @@ window.__ModuleLoader__.load({
                 step: 1,
                 value: settings.wakeSelfContinueMax,
                 onCommit: (v) => saveSetting('wakeSelfContinueMax', v),
+              }),
+            }),
+            h(Field, {
+              label: '唤醒换新会话',
+              desc: '推送前看一眼上下文有多长：到硬上限（默认窗口 60%，或 60 万 token，取小的那个）就换一个新会话接这段活，不往你正在聊的这个里硬推。**换过去之后，唤醒的回话会出现在那个新会话里，不在当前这个对话**。关掉 = 永远推最近活跃的那个会话。唤醒次数不受影响。',
+              control: h(Toggle, {
+                on: Boolean(settings.wakeRotateEnabled),
+                onClick: (v) => saveSetting('wakeRotateEnabled', v),
+              }),
+            }),
+            h(Field, {
+              label: '硬上限占比',
+              desc: '上下文到窗口的百分之多少就换会话（10～95，默认 60%）。跟下面的绝对值**取小的那个** —— 1M 窗口下 60% 是 63 万，太晚会先用绝对值兜住。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 10,
+                max: 95,
+                step: 5,
+                value: settings.wakeHardLimitPct,
+                onCommit: (v) => saveSetting('wakeHardLimitPct', v),
+              }),
+            }),
+            h(Field, {
+              label: '硬上限绝对值',
+              desc: '上下文到多少 token 就一定换（10000～2000000，默认 60 万）。和占比取小的那个：换小窗口模型时由占比兜住，1M 窗口时由它兜住。',
+              control: h(DraftInput, {
+                numeric: true,
+                min: 10000,
+                max: 2000000,
+                step: 10000,
+                value: settings.wakeHardLimitAbs,
+                onCommit: (v) => saveSetting('wakeHardLimitAbs', v),
+              }),
+            }),
+            settings.wakeSessionId
+              ? h(Field, {
+                label: '唤醒工作会话',
+                desc: '唤醒现在固定推到这个会话（换过一次就记在这儿，人自己说话也不会把流量拉回去）。清掉就回到「跟着最新会话走」。id：' + String(settings.wakeSessionId).slice(0, 8) + '…',
+                control: h(Btn, {
+                  small: true,
+                  onClick: () => saveSetting('wakeSessionId', ''),
+                }, '跟随最新会话'),
+              })
+              : null,
+            h(Field, {
+              label: '缓存冷了才换',
+              desc: '软条件：上下文超过 10 万 **而且**缓存命中率低于 85% 才换（那时继续推要按全价付一大段 prompt）。正常情况缓存命中率是 99.8%，这条不会触发 —— 它是缓存坏掉时的保险。刚换进去的会话 6 小时内不因这条再被换出来。',
+              control: h(Toggle, {
+                on: Boolean(settings.wakeRotateSoft),
+                onClick: (v) => saveSetting('wakeRotateSoft', v),
               }),
             }),
             settings.hiddenMembers

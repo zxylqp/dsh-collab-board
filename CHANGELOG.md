@@ -4,6 +4,163 @@
 
 ---
 
+## 0.11.30
+
+**唤醒不再往「人正在聊的那个会话」里硬推：推送前先看上下文有多长，太长就换一个新会话接。**
+重启 DSH 生效（判据在新文件 `src/host/wake-target.mjs`，接线在 `index.mjs` 的 `wakeAgent`）。
+
+### 问题：一次唤醒推一次，长会话被推爆
+
+`pickWakeSession()` 按 `updatedAt` 取最新会话 —— 也就是人此刻正在聊的那个。
+于是每来一条看板消息，就往这条对话里插一条唤醒、跑一两步、把上下文推长一截。
+
+本机 79 个会话的实测（2026-11-08）：窗口 1M，首轮 prompt 中位 33.8k，
+**唤醒时 prompt 中位 159k，峰值最大 663k（占窗口 63%）**，唤醒后平均跑 2 步。
+
+**唤醒次数不能减** —— 唤醒是业务动作，不是成本项。能改的只有「推到哪儿」。
+
+### 改：推送前动态路由
+
+```text
+list() → pickTargetSummary（设置里指定的工作会话优先）
+      → decideRotation（看上下文绝对长度 + 缓存命中率）
+      → 可能 create() → prompt()
+```
+
+判据（`wake-target.mjs`，纯函数，零 I/O）：
+
+| 条件 | 动作 |
+| --- | --- |
+| 上下文 ≥ `min(窗口 × 60%, 60 万)` | **换新**（无条件，防撑爆/防质量下降） |
+| 上下文 ≥ 10 万 **且** 累计缓存命中率 < 85% | 换新（软条件，缓存真的冷了才换） |
+| 刚换进去的会话 6 小时内 | 软条件不换（防缓存坏时每次唤醒建一个会话） |
+| 其余 / 量不到 / create 失败 | **复用**（宁可多花 token，不能卡住唤醒） |
+
+三个副作用缺一条都会留坑：
+
+1. `create()` 带上原会话的 `cwd` 和 `agentPreset`；
+2. **新 id 写回 `wakeSessionId`** —— 不写回的话，人只要在自己的对话里说一句，
+   下一次又挑回长会话，换会话只生效一次；
+3. 写一条 `note` 说明为什么换（人只会看到「回复跑到另一个会话里了」）。
+
+### 数据从哪来：`list()` 里已经有了，不用另读日志
+
+一开始的方案是「宁可降级也要量准」：`inspect()` 读会话日志、解多帧 zstd、按
+`lastEventSeq` 做增量缓存、500ms 超时降级。核对完宿主投影后这些**全都不需要**：
+
+- `@deepseek-ai/dsh-token-meter` 的 `contextPressure` 投影给出 `contextWindow` /
+  `pressureTokens`（上次请求的 prompt）/ `projectedTokens`（下一次请求的 prompt 估算）；
+- `tokenUsage` 投影给出累计四桶（`uncachedInputTokens` / `cacheReadTokens` /
+  `cacheWriteTokens` / `outputTokens`）；
+- 两者都在 `sessionController.list()` 返回的 `item.projections.values` 里 ——
+  而 `list()` 本来每次唤醒就要调一次。
+
+所以没有超时、没有增量缓存、没有 zstd。**量不到就当没量到，复用。**
+
+### 口径（踩过的坑）
+
+```text
+promptTokens    = inputTokens + cacheReadTokens + cacheWriteTokens
+projectedTokens = pressureTokens + surfaceTokens - sampledSurfaceTokens
+cacheHitRate    = cacheReadTokens / promptTokens        （累计，不是最近一次）
+```
+
+`inputTokens` **只是没命中缓存的那部分**，单独拿它当 prompt 会少算 99%。
+「最近一次命中率」拿不到：`tokenUsage` 的 wire view 只给 `totals`，`last` 留在
+投影 state 里（`projections()` 访问不到）。所以软条件用**累计**命中率 ——
+有 10 万这道门槛兜着：累计命中率低的都是 1 轮的新会话，那种会话根本不到 10 万。
+
+实测本机 89 个会话：最近一次命中率最低 0.91（**没有一个低于 0.85**），
+累计命中率 < 0.85 的 3 个都是 1 轮、25k～57k。
+**软条件在真机上一次都不会触发** —— 它不是省钱杠杆，是「缓存真坏了」时的保险。
+
+### 参数（都在设置面板里）
+
+`wakeRotateEnabled`（总开关，关掉＝退回旧行为）、`wakeRotateSoft`、`wakeHardLimitPct`（60）、
+`wakeHardLimitAbs`（600000）、`wakeSoftLimitAbs`（100000）、`wakeCacheHitPct`（85）、
+`wakeRotateBackoffMs`（6 小时）、`wakeSessionId`（当前工作会话，空＝跟随最新会话）。
+
+### 顺带修：DSH 刚起来时唤醒整段失效
+
+`list()` 里的「可用会话」过滤掉 `agentAvailable === false`，而 DSH 刚启动时
+**人还没点开过的会话全是冷的**。于是重启后第一次唤醒必然报「找不到可唤醒的会话」，
+`wakeSessionId` 指定的工作会话也白配 —— 这一条是量真机数据时顺手发现的，
+不在原始需求里。现在冷会话也能当目标（`prompt()` 会把它拉起来），判据在
+`wake-target.mjs` 的 `resolveWakeSubject()`，有单测（含「全是冷的又没指定 →
+明说找不到」那种，不静默）。
+
+### 不做：每隔 N 次唤醒回到人的会话
+
+想过一版「粘性隔几次就回人的对话」，**决定不做**（2026-11-08 定）。
+那等于把唤醒流量定期塞回人正在看的地方 —— 正是这次要解决的事。要退出粘性，
+面板上有「跟随最新会话」，或把 `wakeSessionId` 清空。
+
+### 代价说清楚
+
+- **换过去之后，唤醒的回话出现在那个新会话里，不在你当前看的这个对话里。**
+  `/version` 的 `wake.wakeTarget` 报出上一次的决定（换没换、为什么、新 id），
+  不想要就把 `wakeRotateEnabled` 关掉。
+- 硬上限按本机实测只会命中 1/89（663k 那条）。**这次改动的收益是「不会推爆」，
+  不是「省了几成 token」**：缓存热的会话继续推更便宜，换新反而把便宜的缓存读
+  换成全价写。
+- 旧会话不删，留着可查。
+
+### 测试
+
+`test/host.test.mjs` 加 9d2（真链路：超硬上限 → create → 写回设置 → prompt 收到新 id →
+`/version` 报原因）、9d2b（冷会话目标三种情形）和 9d3（判据 30 项：阈值边界、量不到、
+降级、防抖、`wakeSessionId` 优先、三桶口径）。`316 通过 / 0 失败`；
+`hub.test.mjs` 178、`two-machine.test.mjs` 22，全绿。
+
+---
+
+## 0.11.29
+
+**收尾理由成一个字段：`reason`。权限跟 `status` 走，不进正文锁。**
+重启 DSH 生效（Hub 侧判据在 hub.mjs，工具参数在 index.mjs）。
+
+### 修：取消 / 完成时写不了理由
+
+现象（2026-11-08，seq 971–979）：
+
+```text
+汐汐标 cancelled 时把「验证计划叫停，转 0.11.29」塞进 detail
+→ 三条全是 409：「你这条改了描述，而别人不能改这张卡的正文 —— 整条被拒，这条的 status 也没记上」
+→ 去掉 detail 重发才成功（976 / 978 / 979）
+→ 卡一 cancelled，评论也锁了 —— 理由再也补不进去，点开只看到「任务已取消，评论已锁」
+```
+
+两堵墙叠在一起：**正文只有创建者能改**，**终态卡的评论锁死**。结果「取消」这个动作
+能记下来，「为什么取消」永远记不下来。
+
+### 改：给理由一个自己的字段
+
+- `task.reason`（≤500 字，`textOf` 截断）。**不进** Hub 的 `changed` 名单
+  （那里只算 `title` / `detail` / `dependsOn`）—— 所以非创建者标 `cancelled`
+  带 reason 不会被 409，`status` 跟着一起落盘。
+- **权限跟 status 走**：谁有权改状态，谁就能写理由。`done` 本来就只许 owner / 创建者写，
+  这条不变。
+- **有才写**：不给就沿用上一版。不带 reason 的事件不许落下 `reason: ''` 这个键 ——
+  有键就会在继承时把上一版擦掉（和 title 0.11.14、status 0.11.22 同一个坑）。
+- 三处折叠一起继承：Hub 的 `applyIndex`、本机 `selectable.latestTasks`、客户端 `buildModel`。
+  0.11.15 就是只改一处，标题在另一侧消失了 —— 这次一次改齐。
+- 墓碑（删除）把 reason 当正文一起擦空。
+- 卡片详情里显示：`cancelled` 写「取消原因：」、`done` 写「完成说明：」、其他写「说明：」。
+- `collab_post` 加了 `reason` 参数，描述里点明「要留一句为什么用 reason，别塞 detail」。
+
+### 不变（这条是重点）
+
+**正文锁一点没放宽。** 带 reason 顺便改 title / detail，照样整条 409。
+理由不是绕过权限的后门，它只是「状态变更的注解」。
+
+### 测试
+
+474 通过（host 274 + hub 178 + two-machine 22），新增 10 条：放行、落在卡上、
+status 一起记上、后续无 reason 时继承、带 reason 改标题仍 409、被拒那条不落盘、
+Hub 侧墓碑擦空、`latestTasks` 继承、`validateEvent` 不落空串 / 只给空白等价没给。
+
+---
+
 ## 0.11.28
 
 **无 id 事件直接拒（三个洞一个根因）+ 撤掉两个空配置。汐汐 2026-11-08 提的那条边界。**

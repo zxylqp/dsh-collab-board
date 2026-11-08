@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createSocket } from 'node:dgram';
 import { startHub, leaseEndAt, leaseRenewAt } from '../src/host/hub.mjs';
+import { latestTasks } from '../src/host/selectable.mjs';
 import { broadcastTargets, signPacket, createHubWatch, createDiscovery } from '../src/host/discovery.mjs';
 
 const GROUP = 'a1b2c3d4e5f60718';
@@ -921,6 +922,106 @@ async function main() {
   check('带 id + 不带 status + 改标题 → 409（0.11.27 的判据仍在）',
     withIdNoStatus.status === 409 && withIdNoStatus.error.code === 'conflict',
     JSON.stringify({ status: withIdNoStatus.status, error: withIdNoStatus.error }));
+
+  /* ── 5b-4. 收尾理由 reason（0.11.29）──────────────────────────────────
+   *
+   * 汐汐连标三张 cancelled 全被 409 拒（seq 971/972/973）：她把「验证计划叫停」
+   * 塞进了 `detail`，而 detail 是**正文** —— 非创建者一带就整条被拒，`status`
+   * 跟着一起没记上；重发成功之后评论又锁了，理由再也补不进去。
+   *
+   * `reason` 是独立字段：不进正文锁名单，权限跟 `status` 走。
+   * 但它**不能**变成绕过正文锁的后门 —— 带 reason 顺便改 title，照样 409。
+   */
+  console.log('\n5b-4. 收尾理由 reason（0.11.29）');
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00040_iii', origin: ORIGIN_A, name: 'A',
+        kind: 'task', taskId: 'own5', title: 'A 的第五张卡', detail: '原描述', status: 'pending',
+      }],
+    },
+  });
+  await call(base, '/tasks/claim', {
+    method: 'POST', token: tokenB, body: { taskId: 'own5', leaseMs: 0 },
+  });
+  const cancelWhy = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00041_jjj', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own5', status: 'cancelled', reason: '验证计划叫停，转 0.11.29',
+      }],
+    },
+  });
+  check('非创建者标 cancelled 带 reason → 放行（正文锁不拦它）',
+    cancelWhy.ok === true, JSON.stringify(cancelWhy.error));
+
+  /** 读全量事件，按成员那套折叠（和 Hub 的 applyIndex 是两份实现，一起验） */
+  const fold = async () => {
+    const r = await call(base, '/events?since=0', { token: tokenA });
+    return latestTasks(r.data?.events || []);
+  };
+  const t5 = await fold();
+  check('reason 落到卡上', t5.get('own5')?.reason === '验证计划叫停，转 0.11.29',
+    JSON.stringify(t5.get('own5')?.reason));
+  check('status 也跟着记上了（不再被整条拒掉）', t5.get('own5')?.status === 'cancelled',
+    String(t5.get('own5')?.status));
+
+  // 后续只改别的字段（不带 reason）：理由必须继承，不能被空值擦掉
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00042_kkk', origin: ORIGIN_A, name: 'A',
+        kind: 'task', taskId: 'own5', priority: 'high',
+      }],
+    },
+  });
+  const t5b = await fold();
+  check('后续没带 reason 的事件 → 理由继承（不被擦掉）',
+    t5b.get('own5')?.reason === '验证计划叫停，转 0.11.29',
+    JSON.stringify(t5b.get('own5')?.reason));
+
+  // 但它不是后门：带 reason 顺便改标题，照样整条 409
+  const whyPlusTitle = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00043_lll', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own5', status: 'running', title: 'B 借理由改标题',
+        reason: '想顺手改个标题',
+      }],
+    },
+  });
+  check('带 reason 顺便改标题 → 409（理由不是绕过正文锁的后门）',
+    whyPlusTitle.status === 409 && whyPlusTitle.error.code === 'conflict',
+    JSON.stringify({ status: whyPlusTitle.status, error: whyPlusTitle.error }));
+  const t5c = await fold();
+  check('被拒那条的 reason 也没落盘', t5c.get('own5')?.reason !== '想顺手改个标题',
+    JSON.stringify(t5c.get('own5')?.reason));
+
+  // 墓碑：删除把正文擦空，理由也算正文
+  await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{
+        id: 'ev_aaaaaa_t1k00044_mmm', origin: ORIGIN_A, name: 'A',
+        kind: 'task', taskId: 'own5', deleted: true, title: '',
+      }],
+    },
+  });
+  // 擦正文是 **Hub 的 applyIndex** 干的（客户端 buildModel 也擦），`latestTasks`
+  // 那份折叠本来就不擦——那是既有的分工，不在这次改动里。这里只看 Hub 侧。
+  const hubOwn5 = hub.controller.tasks().find((t) => t.taskId === 'own5');
+  check('Hub 侧墓碑把 reason 一起擦空', hubOwn5?.reason === '',
+    JSON.stringify(hubOwn5?.reason));
+
 
   console.log('\n5e. 租约续约（0.10.13）');
   // 纯算法：不依赖计时器，先把边界定死
