@@ -89,13 +89,35 @@ if (!SKIP_TESTS) {
 
 /* ── 3. 同步安装位 ── */
 
+/**
+ * 装了 DSH 的机器上，宿主进程正占着 `src/` 里的文件，`cpSync` 会报
+ * `EPIPE / EBUSY`（Windows 文件锁）。以前一崩就整轮退出 —— 测试跑完了、
+ * 却连推送都没做到（2026-11-08 实跑踩到，0.11.28 因此没推上去）。
+ *
+ * 所以改成逐个复制、失败只记一条警告：**同步不上最多是宿主还跑旧代码**，
+ * 不该拦住发版本身。
+ */
+const syncIssues = [];
+const tryCopy = (from, to, label) => {
+  try {
+    cpSync(from, to, { recursive: true });
+  } catch (e) {
+    syncIssues.push(`${label}（${e.code || e.message}）`);
+  }
+};
 if (!existsSync(INSTALL)) die(`安装位不存在：${INSTALL}`);
-cpSync(join(ROOT, 'src'), join(INSTALL, 'src'), { recursive: true });
-cpSync(join(ROOT, 'test'), join(INSTALL, 'test'), { recursive: true });
-for (const f of ['package.json', 'CHANGELOG.md', 'README.md']) {
-  cpSync(join(ROOT, f), join(INSTALL, f));
+tryCopy(join(ROOT, 'src'), join(INSTALL, 'src'), 'src/');
+tryCopy(join(ROOT, 'test'), join(INSTALL, 'test'), 'test/');
+for (const f of ['package.json', 'CHANGELOG.md', 'README.md', 'cordis.patch.yml', 'publish.mjs']) {
+  tryCopy(join(ROOT, f), join(INSTALL, f), f);
 }
-say(`  · 已同步到 ${INSTALL}`);
+if (syncIssues.length) {
+  say(`  ! 有 ${syncIssues.length} 处没同步上：`);
+  for (const s of syncIssues) say(`    - ${s}`);
+  say('  ! 宿主重启后再跑一次；安装位落后只会让宿主继续跑旧代码，不影响这次推送');
+} else {
+  say(`  · 已同步到 ${INSTALL}`);
+}
 say('  ! 宿主进程要重启才加载新代码；/collab-board/version 会报它实际加载的版本');
 
 if (DRY) { say('\n--dry：不推送。'); process.exit(0); }
@@ -210,6 +232,64 @@ say(`\n推送成功：${newCommit.sha.slice(0, 8)}  ${commitMsg.split('\n')[0]}`
 if (remoteVersion !== version) die(`推完校验失败：GitHub 上是 ${remoteVersion}，本地是 ${version}`);
 say(`校验通过：GitHub package.json = ${remoteVersion}`);
 say(`https://github.com/${OWNER}/${REPO}/commit/${newCommit.sha}`);
+
+/* ── 6. tag 与 GitHub Release ── */
+
+/**
+ * 以前这个脚本只推代码，tag 和 Release 全靠手动 —— 于是「版本页停在旧版」反复发生：
+ * 0.11.6 一次（README 里记着），0.11.27 和 0.11.28 又各一次，都是事后手动补的。
+ * 教训写在文档里没用，写进脚本才管用。
+ *
+ * 三件事按顺序做：tag 存在没 → 不存在就在新 commit 上建；Release 存在没 →
+ * 不存在就建、存在且正文不同就 PATCH、一致就跳过（重跑发布不该刷空改动）。
+ */
+const tagName = `v${version}`;
+let tagExists = false;
+try {
+  await api(`/repos/${OWNER}/${REPO}/git/ref/tags/${tagName}`);
+  tagExists = true;
+} catch { /* 404 = 还没有 */ }
+if (!tagExists) {
+  await api(`/repos/${OWNER}/${REPO}/git/refs`, {
+    method: 'POST',
+    body: { ref: `refs/tags/${tagName}`, sha: newCommit.sha },
+  });
+  say(`  · tag ${tagName} 已创建 → ${newCommit.sha.slice(0, 8)}`);
+} else {
+  say(`  · tag ${tagName} 已存在`);
+}
+
+/**
+ * Release 正文 = CHANGELOG 里这一版的正文（去掉 `## x.y.z` 行和尾部的 `---`）。
+ * 标题 = `vX.Y.Z：` + 段内第一句粗体，和以前手动建的格式保持一致。
+ */
+const releaseBody = (changelog.split(`## ${version}`)[1] || '').split(/\n---\n/)[0].trim();
+const releaseName = `${tagName}：${headline}`;
+let existingRelease = null;
+try {
+  existingRelease = await api(`/repos/${OWNER}/${REPO}/releases/tags/${tagName}`);
+} catch { /* 404 = 还没建 */ }
+if (!existingRelease) {
+  const created = await api(`/repos/${OWNER}/${REPO}/releases`, {
+    method: 'POST',
+    body: {
+      tag_name: tagName,
+      name: releaseName,
+      body: releaseBody,
+      draft: false,
+      prerelease: false,
+    },
+  });
+  say(`  · Release ${tagName} 已创建：${created.html_url}`);
+} else if ((existingRelease.body || '').trim() !== releaseBody) {
+  const updated = await api(`/repos/${OWNER}/${REPO}/releases/${existingRelease.id}`, {
+    method: 'PATCH',
+    body: { name: releaseName, body: releaseBody },
+  });
+  say(`  · Release ${tagName} 正文已更新：${updated.html_url}`);
+} else {
+  say(`  · Release ${tagName} 已是最新`);
+}
 
 /**
  * 本地 git 对齐远端。
