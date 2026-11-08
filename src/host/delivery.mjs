@@ -120,7 +120,17 @@ export function createDelivery({
 
     const notBefore = Number(item.notBefore) || 0;
     const taskId = typeof item.taskId === 'string' ? item.taskId : '';
-    const same = taskId
+    /**
+     * `noMerge`（0.11.26）：**只挡「这条新唤醒被并进同 taskId 的待投项」这一个方向**，
+     * 不改合并的其他行为。
+     *
+     * 多卡唤醒会用到它：它的 taskId 填第一张卡，若那张卡上正好压着一条待投评论，
+     * 合并分支会用唤醒正文覆盖那条评论的 text —— 评论的内容就没了。
+     *
+     * 代价要记着：合并兼职「同卡去重」，跳过它这一道就没了。调用方得自己用差集补
+     * （见 index.mjs 的 `scheduleClaimWake`），否则投递失败时每个 tick 都会重排一条。
+     */
+    const same = taskId && item.noMerge !== true
       ? state.items.find((it) => it.taskId === taskId && it.eventId !== item.eventId)
       : undefined;
 
@@ -168,9 +178,12 @@ export function createDelivery({
        * 唤醒由什么触发：
        *   - 缺省 / '' 别人发来的消息
        *   - 'self'   任务还没完成，插件自己排的续跑（见 index.mjs 的 maybeSelfContinue）
+       *   - 'claim'  自动认领之后排的「该开工了」（0.11.26）—— 正文在 offer 时就算好
        * send 靠它决定用账本里现成的 text，还是按 attempts/deferred 重新生成。
        */
-      kind: item.kind === 'self' ? 'self' : '',
+      kind: item.kind === 'self' ? 'self' : (item.kind === 'claim' ? 'claim' : ''),
+      /** 不参与合并（见 offer 顶部注释）。落盘，重启后还是这个语义。 */
+      noMerge: item.noMerge === true,
       deferred: item.deferred === true,
       attempts: 0,
       at: Date.now(),

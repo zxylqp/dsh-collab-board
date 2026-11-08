@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
     const BUILD = 36;
-    const VERSION = '0.11.25';
+    const VERSION = '0.11.26';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -196,6 +196,14 @@ window.__ModuleLoader__.load({
   background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 13%,transparent);}
 .cb-pill[data-tone="pending"]{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-overlay);}
 .cb-pill[data-tone="cancelled"]{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-fill-l1);}
+/**
+ * 「自动认领关着」的常驻提示（0.11.26）。
+ *
+ * 只在「有卡在等 + 认领关着」时出现：没有待认领的卡，这条就只是噪音。
+ */
+.cb-banner{display:flex;align-items:center;gap:8px;margin:0 4px 6px;padding:6px 9px;border-radius:7px;
+  font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);
+  background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l3);}
 .cb-pill[data-tone="high"]{color:var(--dsw-alias-state-error-primary);
   background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);}
 .cb-pill[data-tone="low"]{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-fill-l1);}
@@ -1127,6 +1135,20 @@ window.__ModuleLoader__.load({
             }, '归档 ' + counts.archived)
             : null,
         ),
+        /**
+         * 「自动认领关着」的常驻提示（0.11.26，P1 的界面半条）。
+         *
+         * 补的是那个洞：`tick` 首行发现 `autoClaim !== true` 就直接 return，
+         * 不写状态、不留痕 —— 卡躺在待认领里一动不动，用户记得自己开过，实际是关的。
+         * agent 那边能从 `collab_state.auto.claim` 看见；这半条是给**人**看的，
+         * 缺一边就是「一边看得见、一边瞎」。
+         */
+        (settings.role !== 'solo' && settings.autoClaim !== true && counts.pending > 0)
+          ? h('div', { className: 'cb-banner' },
+            h('span', { className: 'cb-grow' },
+              '自动认领已关闭：' + counts.pending + ' 张待认领的卡不会自己被人接。'
+              + '要自动接活，去设置里打开「自动认领」。'))
+          : null,
         model.truncated
           ? h('div', { className: 'cb-hint', style: { padding: '0 4px 6px' } },
             '只拉到最近 ' + model.shown + ' 条（总共 ' + model.total + ' 条）')

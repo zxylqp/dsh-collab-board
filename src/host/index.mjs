@@ -75,6 +75,7 @@ import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
 import { createSettings, hashCode, isHashedCode, publicSettings } from './settings.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
+import { createWakes } from './wakes.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq, directedAway, WAKE_SKIP } from './wake.mjs';
 import { validateEvent, noteTaskIdOf } from './events.mjs';
 
@@ -403,6 +404,26 @@ export function apply(ctx, rawConfig = {}) {
   /* ───────────────────── 投递账本 ───────────────────── */
 
   /**
+   * 「这张卡刚被叫过」的判重表（wakes.json，0.11.26）。
+   *
+   * 为什么需要它：依赖解锁会发一条系统 msg（本来就会唤醒），自动认领又排一条 ——
+   * 同一张卡被叫两次，第二条醒来时活可能已经干完了。
+   *
+   * 为什么不放 inflight.json：那份账本的 `load()` 会**重建 state 对象**，
+   * 未知字段直接丢掉；而且它的 catch 是「坏了当空的」，放一起会让判重表跟着账本一起清零。
+   *
+   * 读写语义全在 wakes.mjs，这里只说三件调用方要守的事：
+   *   1. **读在 offer 之前**（排之前先问「这张卡刚叫过没」）；
+   *   2. **写投递成功之后**（onDelivered），宁可漏记不可早记；
+   *   3. 判据是「比时间戳」，不是「键在不在」。
+   */
+  const wakes = createWakes({
+    file: join(dataDir, 'wakes.json'),
+    windowMs: () => getSettings().wakeCooldownMs,
+    log: (level, msg) => hubLog(level, `唤醒判重：${msg}`),
+  });
+
+  /**
    * 唤醒请求的落盘账本（inflight.json）。
    *
    * 以前唤醒是「试一次，成功与否只写日志」：失败没人重试，重启全忘，
@@ -414,19 +435,43 @@ export function apply(ctx, rawConfig = {}) {
     file: join(dataDir, 'inflight.json'),
     retries: () => getSettings().wakeRetries,
     send: (item) => {
-      // 续跑项的文本在 offer 时就算好了（要带任务标题和次数），直接用账里的那份；
-      // 别人发的消息才按 attempts / deferred 现生成。
-      const text = item.kind === 'self' && item.text
+      // 续跑 / 认领唤醒的正文在 offer 时就算好了（要带任务标题、次数、卡列表），
+      // 直接用账里的那份；别人发的消息才按 attempts / deferred 现生成。
+      const precomputed = (item.kind === 'self' || item.kind === 'claim') && item.text;
+      const text = precomputed
         ? item.text
         : wakeText({ taskId: item.taskId, from: item.from }, item.attempts, item.deferred);
       return wakeAgent(text, item).then((r) => {
-        // 冷却从「真正投出去」那一刻算：投递可能等一整轮，别让它占发起时刻
-        wakeState.lastAt.set(item.taskId || 'global', Date.now());
+        /**
+         * 冷却从「真正投出去」那一刻算：投递可能等一整轮，别让它占发起时刻。
+         *
+         * **认领唤醒不占冷却位**（0.11.26）：它是插件自己排的，占住之后紧接着
+         * 来的真消息会被延后一整个冷却窗（默认 5 分钟）才叫 —— 那比「多叫一次」糟得多。
+         * 它和消息撞车的概率本来也低：`scheduleClaimWake` 排之前已经减掉了
+         * 「有待投唤醒的卡」，而真消息进的队列就在这份账上。
+         */
+        if (item.kind !== 'claim') wakeState.lastAt.set(item.taskId || 'global', Date.now());
         return r;
       });
     },
     // 续跑要等这一条从账上摘掉、落了盘之后才排，否则会被合并逻辑并进本条（见 delivery.mjs）。
     onDelivered: (item) => {
+      /**
+       * 投递**成功后**才记判重表（0.11.26）。宁可漏记：漏记顶多多叫一次，
+       * 早记会让这张卡在冷却窗里再也不叫。
+       *
+       * 记的是 `cardIds` 整批 —— 多卡唤醒投出去一次，正文里的每张卡都算「叫过」。
+       */
+      try {
+        const cards = Array.isArray(item.cardIds) && item.cardIds.length
+          ? item.cardIds
+          : (item.taskId ? [item.taskId] : []);
+        if (cards.length) wakes.mark(cards);
+      } catch (e) {
+        hubLog('warn', `唤醒判重表记一笔失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+      // 认领唤醒本身就是叫它开工，别再叠一条续跑
+      if (item.kind === 'claim') return;
       try { maybeSelfContinue(item); } catch (e) {
         hubLog('warn', `自动续跑排期失败：${e instanceof Error ? e.message : String(e)}`);
       }
@@ -1113,6 +1158,20 @@ export function apply(ctx, rawConfig = {}) {
       .sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0))
       .slice(0, 10);
 
+    /**
+     * 自动认领 / 待办提醒的当前值（0.11.26）。
+     *
+     * 补的是「关着不吭声」那个洞：`tick` 首行 `if (s.autoClaim !== true) return`
+     * 直接返回，不写状态、不留痕。用户记得开过、实际是关的，卡就躺在 pending
+     * 一动不动，谁也不知道为什么没人接。值露出来，agent 一醒就看得见。
+     */
+    const st = getSettings();
+    const auto = {
+      claim: st.autoClaim === true,
+      claimEveryMs: Math.max(1000, Number(st.autoClaimMs) || 60000),
+      pendingWatch: st.pendingWatch === true,
+    };
+
     return {
       ok: true,
       me: { origin: identity.origin, name: displayName() },
@@ -1123,6 +1182,8 @@ export function apply(ctx, rawConfig = {}) {
       /** 别人正在跑的卡 + owner：知道该等谁、找谁，别以为没人接。 */
       others: others.slice(0, 50),
       pending,
+      /** 自动认领开没开。`claim:false` 就是「卡不会自己被人接」的原因。 */
+      auto,
       unread: shown,
       ...(unread.length > shown.length ? { truncated: unread.length - shown.length } : {}),
       /** 被 Hub 拒掉的事件（按 taskId 聚合，最新一条）：没写进去的东西，得让人看得见。 */
@@ -1131,6 +1192,52 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /* ───────────────────── HTTP 路由 ───────────────────── */
+
+  /**
+   * 设置改动落一条 note（0.11.26，P2）。
+   *
+   * 以前 PATCH 只写 `settings.json`：改了哪项、从什么改到什么，事件流与日志一个字没有，
+   * 只能靠文件 mtime 和旧备份 diff 反推「谁改了哪项」。
+   *
+   * 三条规矩：
+   *   - 只写**真的变了**的键（`before` 与 `after` 相等的不提，否则界面点一下就刷一条）；
+   *   - **口令单独一条**，只写「已改」：跟别的键混在同一条里，别人的 old/new 会把它捎带出来；
+   *   - 值截断，别让一条 note 把动态流撑爆。
+   */
+  function noteSettingsChange(before, after, patch) {
+    const keys = Object.keys(patch && typeof patch === 'object' ? patch : {});
+    if (keys.length === 0) return;
+    const shown = (v) => {
+      if (v === undefined || v === null) return '(空)';
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      return s.length > 40 ? `${s.slice(0, 40)}…` : s;
+    };
+    const parts = [];
+    let secretTouched = false;
+    for (const k of keys) {
+      const b = before ? before[k] : undefined;
+      const a = after ? after[k] : undefined;
+      if (JSON.stringify(b) === JSON.stringify(a)) continue;
+      if (k === 'hubCode') { secretTouched = true; continue; }
+      parts.push(`${k}: ${shown(b)} → ${shown(a)}`);
+    }
+    if (secretTouched) {
+      const note = buildEvent({
+        kind: 'note',
+        level: 'info',
+        text: '设置改动：hubCode 已改（口令不落日志）',
+      });
+      if (note) appendEvent(note);
+    }
+    if (parts.length === 0) return;
+    const note = buildEvent({
+      kind: 'note',
+      level: 'info',
+      text: `设置改动：${parts.join('；')}`,
+    });
+    if (note) appendEvent(note);
+  }
+
 
   ctx.inject(['webServer'], (scope) => {
     scope.effect(() => {
@@ -1311,7 +1418,10 @@ export function apply(ctx, rawConfig = {}) {
             try {
               const body = await readBody(req);
               const patch = body && typeof body === 'object' && body.patch ? body.patch : body;
+              const beforeSettings = getSettings();
               const out = patchSettings(patch);
+              // 改动留痕（0.11.26）：记日志失败不影响保存本身
+              try { noteSettingsChange(beforeSettings, out.settings, patch); } catch { /* 静默 */ }
               /**
                * 口令是热更新项（0.11.7）：Hub 正在跑就立刻换，不用停 Hub 重起。
                * 以前这里只写 settings.json，运行中的 Hub 仍拿旧的 code 比对 ——
@@ -2279,6 +2389,80 @@ export function apply(ctx, rawConfig = {}) {
     return list.filter((task) => !autoTried.has(task.taskId));
   }
 
+  /**
+   * 认领之后排一条唤醒（0.11.26）。
+   *
+   * 以前认领只写 owner，不叫醒本机 agent —— 卡停在 running，别人看「有人接了」
+   * 就不接，直到租约耗干退回 pending。补的正是这一环。
+   *
+   * 三件事必须一起成立，缺一条就是「叫了但叫歪了」：
+   *   1. **一轮 tick 只排一条**，正文列这轮新认领的卡。tick 里是 `for (const task of list)`，
+   *      一轮可能认下好几张；一卡一条会叫好几轮，而 agent 醒来读增量一次就看全了。
+   *   2. **排之前用差集**，不是交集：`fresh = claimed − 已有待投唤醒的卡 − 冷却窗内刚叫过的卡`。
+   *      「有交集就不排」会把没被叫过的卡一起漏掉（待投有 A、本轮认了 A+B，B 就没唤醒了）。
+   *   3. **正文带 taskId**，agent 醒来知道该开哪张，不用自己翻看板。
+   *
+   * 为什么不靠 `noMerge` 之外的合并去重：`noMerge` 跳过了 `offer` 的合并分支，
+   * 那道合并兼职「同卡去重」；这里用「已有待投项」的差集把那个职责接过来，
+   * 否则投递失败时每个 tick 都会重排一条同样的唤醒。
+   *
+   * @param {{taskId:string,title?:string}[]} claimed 本轮认领成功的卡
+   * @returns {number} 排进去几张卡的通知（0 = 没排）
+   */
+  function scheduleClaimWake(claimed) {
+    const rows = (Array.isArray(claimed) ? claimed : [])
+      .filter((r) => r && typeof r.taskId === 'string' && r.taskId !== '');
+    if (rows.length === 0) return 0;
+    if (getSettings().autoClaim !== true) return 0;
+
+    const now = Date.now();
+
+    // 账上所有待投项涉及的卡 —— 不分来源（一条待投评论也算「这张卡会被叫到」）
+    const queued = new Set();
+    for (const it of delivery.state().items) {
+      const cards = Array.isArray(it.cardIds) && it.cardIds.length
+        ? it.cardIds
+        : (it.taskId ? [it.taskId] : []);
+      for (const c of cards) if (typeof c === 'string' && c !== '') queued.add(c);
+    }
+
+    const fresh = [];
+    const titleOf = new Map();
+    for (const row of rows) {
+      const id = row.taskId;
+      if (!titleOf.has(id)) titleOf.set(id, typeof row.title === 'string' ? row.title : '');
+      if (fresh.includes(id)) continue;
+      if (queued.has(id)) continue;        // 已经有唤醒在排队，它到点会叫到这张卡
+      if (wakes.recent(id, now)) continue; // 冷却窗内刚叫过
+      fresh.push(id);
+    }
+    if (fresh.length === 0) return 0;
+
+    // 全局冷却只防连发：刚叫过别的消息，这条延后到冷却结束（延后不是丢弃）。
+    // 冷却是「上次唤醒到现在的间隔」，wakes 是「这张卡上次被投递的时间」，两个语义别混。
+    const cooldown = Math.max(1000, Number(getSettings().wakeCooldownMs) || 300000);
+    let lastWake = 0;
+    for (const ts of wakeState.lastAt.values()) if (ts > lastWake) lastWake = ts;
+    const wait = lastWake > 0 ? Math.max(0, cooldown - (now - lastWake)) : 0;
+
+    const lines = fresh.map((id) => (titleOf.get(id) ? `${id}「${titleOf.get(id)}」` : id));
+    const text = `【看板】自动认领了 ${fresh.length} 张卡：${lines.join('、')}。`
+      + '先调 collab_state 读增量，挑一张开工；干完标 done，别空转。';
+
+    delivery.offer({
+      eventId: `ev_claim_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      taskId: fresh[0],
+      cardIds: fresh,
+      from: displayName(),
+      kind: 'claim',
+      text,
+      noMerge: true,
+      notBefore: wait > 0 ? now + wait : 0,
+    });
+    hubLog('info', `自动认领唤醒：${fresh.join('、')}${wait > 0 ? `（${Math.round(wait / 1000)} 秒后投）` : ''}`);
+    return fresh.length;
+  }
+
   ctx.effect(() => {
     let timer = null;
     let lastScan = 0;
@@ -2299,10 +2483,13 @@ export function apply(ctx, rawConfig = {}) {
         if (list.length === 0) return;
 
         busy = true;
+        /** 本轮认领成功的卡。循环结束才排唤醒：一轮只排一条（见 scheduleClaimWake）。 */
+        const claimed = [];
         for (const task of list) {
           try {
             await claimTask(task.taskId, {});
             autoTried.add(task.taskId);
+            claimed.push({ taskId: task.taskId, title: task.title || '' });
             // 一张卡只写一条（0.11.5）：租约到期再认、重连再认，都别重复刷
             if (!hasAutoClaimNote(task.taskId)) {
               const note = buildEvent({
@@ -2320,6 +2507,15 @@ export function apply(ctx, rawConfig = {}) {
             if (e.code !== 'conflict' && e.code !== 'blocked') {
               hubLog('warn', `自动认领 ${task.taskId} 失败：${e.message}`);
             }
+          }
+        }
+        /**
+         * 认领 ≠ 开干（0.11.26）。认下来之后排一条本机唤醒，否则卡就停在这儿
+         * 等租约耗干 —— 别人看「有人接了」也不接。
+         */
+        if (claimed.length > 0) {
+          try { scheduleClaimWake(claimed); } catch (e) {
+            hubLog('warn', `自动认领唤醒排期失败：${e instanceof Error ? e.message : String(e)}`);
           }
         }
       } catch { /* 扫描本身炸了不影响下一轮 */ } finally {

@@ -12,6 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
 import { createDelivery } from '../src/host/delivery.mjs';
+import { createWakes } from '../src/host/wakes.mjs';
+import { writeAtomic } from '../src/host/http-util.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq } from '../src/host/wake.mjs';
 import { createStore } from '../src/host/store.mjs';
 import { claimableTasks, earliestByTask, latestTasks } from '../src/host/selectable.mjs';
@@ -189,14 +191,19 @@ async function main() {
   const logPath = join(dataDir, 'events.jsonl');
   check('日志文件已生成', existsSync(logPath));
   const raw = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  const first = raw[0];
+  /**
+   * 0.11.26：`raw[0]` 不一定是那条 task 了 —— 上面改过两次设置端口，
+   * 设置改动现在会落一条 note（P2），note 在 task 之前。按 kind 找，别按「第一条」。
+   */
+  const first = raw.find((e) => e && e.kind === 'task') || raw[0];
   check('事件补了信封 eventVersion', first?.eventVersion === 2);
   check('事件补了 origin', /^[0-9a-f]{16}$/.test(String(first?.origin)));
   check('事件 id 是 ev_ 开头（不再被任务 id 占用）', String(first?.id).startsWith('ev_'), String(first?.id));
   check('任务标识在 taskId 里', first?.taskId === 't1');
 
   const state = await hit(routes, '/collab-board/state');
-  check('/state 读得到', state.payload?.total === 1, String(state.payload?.total));
+  check('/state 读得到', (state.payload?.events || []).some((e) => e && e.kind === 'task' && e.taskId === 't1'),
+    `total=${state.payload?.total}`);
 
   const ver = await hit(routes, '/collab-board/version');
   check('/version 200', ver.status === 200);
@@ -743,15 +750,31 @@ async function main() {
   });
   console.log(`  [9d] push ${push9d.status} ${JSON.stringify(await push9d.clone().json().catch(() => null)).slice(0, 160)}`);
   await new Promise((r) => setTimeout(r, 4000));
-  check('唤醒真的调到 prompt', wakeCalls.length === 1, `calls=${wakeCalls.length}`);
+  /**
+   * 0.11.26：不能再断言 `wakeCalls.length === 1`。
+   * 自动认领现在认下卡之后会自己排一条唤醒（P3），测试里 fill1/2/3 那几张
+   * 待认领的卡会被认走 —— 多出来的那次是「自动认领了 N 张卡」，是设计不是 bug。
+   * 判据改成「这条消息确实被投递过」，按卡号找那一次。
+   *
+   * 注意唤醒正文是**紧凑一行**（0.11.6 压的），不含消息原文，
+   * 只有「谁 · 在哪 · 干什么」—— 所以按 taskId（wake2）找，别按消息正文找。
+   */
+  const WAKE_CARD = 'wake2';
+  const wakeMsg = wakeCalls.find((c) => String(c?.request?.content?.[0]?.text || '').includes(WAKE_CARD))
+    || wakeCalls[0];
+  check('唤醒真的调到 prompt', Boolean(wakeMsg), `calls=${wakeCalls.length}`);
+  const tail = wakeCalls.slice(-1)[0];
   check('第二个参数是 AbortSignal',
-    Boolean(wakeCalls[0]?.signal) && typeof wakeCalls[0].signal.throwIfAborted === 'function',
-    String(wakeCalls[0]?.signal));
+    Boolean(tail?.signal) && typeof tail.signal.throwIfAborted === 'function',
+    String(tail?.signal));
   check('request 带 requestId / mode / content',
-    Boolean(wakeCalls[0]?.request?.requestId)
-    && wakeCalls[0].request.mode === 'queue'
-    && wakeCalls[0].request.content?.[0]?.type === 'text',
-    JSON.stringify(wakeCalls[0]?.request));
+    Boolean(wakeMsg?.request?.requestId)
+    && wakeMsg.request.mode === 'queue'
+    && wakeMsg.request.content?.[0]?.type === 'text',
+    JSON.stringify(wakeMsg?.request));
+  check('投递的正文指向这张卡',
+    String(wakeMsg?.request?.content?.[0]?.text || '').includes(WAKE_CARD),
+    String(wakeMsg?.request?.content?.[0]?.text || '').slice(0, 80));
   const verAfterWake = await hit(routes, '/collab-board/version');
   check('唤醒成功后 lastAt 有值',
     Boolean(verAfterWake.payload?.wake?.lastAt) && verAfterWake.payload?.wake?.lastError === '',
@@ -926,7 +949,7 @@ async function main() {
   const calls = [];
   const given = [];
   let failOnce = true;
-  const d = createDelivery({
+  const dlv = createDelivery({
     file: df,
     delayMs: 20,
     retries: () => 3,
@@ -937,24 +960,24 @@ async function main() {
     },
     onGiveUp: (item) => given.push(item.eventId),
   });
-  d.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' });
-  check('第一次入账成功', d.snapshot().queued === 1 || calls.includes('ev_a'),
-    JSON.stringify(d.snapshot()));
-  check('同一条再 offer 不会重复入账', d.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' }) === false);
+  dlv.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' });
+  check('第一次入账成功', dlv.snapshot().queued === 1 || calls.includes('ev_a'),
+    JSON.stringify(dlv.snapshot()));
+  check('同一条再 offer 不会重复入账', dlv.offer({ eventId: 'ev_a', taskId: 't1', from: '姐', text: 'x' }) === false);
   await waitFor(() => calls.includes('ev_a'));
-  check('失败后账本还留着（不是只写日志）', d.snapshot().queued === 1, JSON.stringify(d.snapshot()));
-  check('失败信息进了账本', d.snapshot().lastError === '宿主忙', d.snapshot().lastError);
+  check('失败后账本还留着（不是只写日志）', dlv.snapshot().queued === 1, JSON.stringify(dlv.snapshot()));
+  check('失败信息进了账本', dlv.snapshot().lastError === '宿主忙', dlv.snapshot().lastError);
 
   // 坏项不该堵住后面的：ev_b 立刻能投
-  d.offer({ eventId: 'ev_b', taskId: 't2', from: '姐', text: 'y' });
+  dlv.offer({ eventId: 'ev_b', taskId: 't2', from: '姐', text: 'y' });
   await waitFor(() => calls.includes('ev_b'));
   check('坏项在队头也不堵后面的消息', calls.includes('ev_b'), JSON.stringify(calls));
 
   await waitFor(() => calls.filter((x) => x === 'ev_a').length === 2, 1000);
   check('到点自动重试并成功', calls.filter((x) => x === 'ev_a').length === 2, JSON.stringify(calls));
-  await waitFor(() => d.snapshot().queued === 0, 1000);
-  check('投完账本清空', d.snapshot().queued === 0);
-  d.close();
+  await waitFor(() => dlv.snapshot().queued === 0, 1000);
+  check('投完账本清空', dlv.snapshot().queued === 0);
+  dlv.close();
 
   const df2 = join(mkdtempSync(join(tmpdir(), 'collab-delivery2-')), 'inflight.json');
   const given2 = [];
@@ -1716,6 +1739,97 @@ async function main() {
   });
   check('不带 taskId 的全局消息不受影响', globalMsg.status === 200,
     `${globalMsg.status} ${JSON.stringify(globalMsg.payload)}`);
+
+  console.log('\n14. 自动认领的可见性与唤醒（0.11.26）');
+
+  /**
+   * P1：关着要吭声。
+   *
+   * 以前 tick 首行 `if (s.autoClaim !== true) return` 直接返回，不写状态、不留痕 ——
+   * 卡躺在待认领里一动不动，用户记得开过、实际是关的。值必须能被 agent 看见。
+   */
+  const stateToolAcv = findTool(tools, 'collab_state');
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { autoClaim: false } });
+  const offState = JSON.parse((await stateToolAcv.execute({ advance: false })).text);
+  check('P1 autoClaim 关着时 collab_state 看得见', offState.auto && offState.auto.claim === false,
+    JSON.stringify(offState.auto));
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { autoClaim: true } });
+  const onState = JSON.parse((await stateToolAcv.execute({ advance: false })).text);
+  check('P1 autoClaim 开着时也看得见', onState.auto && onState.auto.claim === true,
+    JSON.stringify(onState.auto));
+
+  /**
+   * P2：设置改动留痕。以前 PATCH 只写 settings.json，事件流一个字没有。
+   */
+  const notesOf = () => readFileSync(join(dataDir, 'events.jsonl'), 'utf8').trim().split('\n')
+    .filter((l) => l.trim() !== '').map((l) => JSON.parse(l)).filter((e) => e && e.kind === 'note');
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { pendingWatch: true } });
+  const changeNotes = notesOf().filter((n) => String(n.text || '').startsWith('设置改动'));
+  check('P2 设置改动落了一条 note', changeNotes.length > 0, JSON.stringify(changeNotes.slice(-2).map((n) => n.text)));
+  check('P2 note 带 key 和 old→new',
+    changeNotes.some((n) => String(n.text).includes('pendingWatch') && String(n.text).includes('→')),
+    changeNotes.slice(-1)[0]?.text);
+  check('P2 没改的键不写 note',
+    !changeNotes.some((n) => String(n.text).includes('selfName')),
+    changeNotes.slice(-1)[0]?.text);
+
+  /**
+   * P2：口令单独一条、只写「已改」。跟别的键混在一条里，别人的 old/new 会把它捎带出来。
+   */
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { hubCode: 'secret-abc-123', pendingWatch: false } });
+  const codeNotes = notesOf().filter((n) => String(n.text || '').includes('hubCode'));
+  check('P2 口令单独一条 note', codeNotes.length > 0, JSON.stringify(codeNotes.map((n) => n.text).slice(-2)));
+  check('P2 口令值不落事件流',
+    codeNotes.every((n) => !String(n.text).includes('secret-abc-123')),
+    JSON.stringify(codeNotes.map((n) => n.text).slice(-2)));
+  await hit(routes, '/collab-board/settings', { method: 'PATCH', body: { hubCode: '' } });
+  const codeCleared = notesOf().filter((n) => String(n.text || '').includes('hubCode')).slice(-1)[0];
+  check('P2 清空口令也只写「已改」', String(codeCleared?.text || '').includes('已改'),
+    String(codeCleared?.text || ''));
+
+  /**
+   * 投递账本：`noMerge` 不吞待投消息的正文。
+   *
+   * 多卡唤醒的 taskId 填第一张卡；那张卡上若压着一条待投评论，合并分支会用唤醒正文
+   * 覆盖它的 text —— 评论内容就没了。`noMerge` 只挡这一个方向。
+   */
+  const dFile = join(dataDir, 'inflight-t14.json');
+  const dSent = [];
+  const d = createDelivery({ file: dFile, send: async (it) => { dSent.push(it); }, retries: () => 1 });
+  const far = Date.now() + 600000;
+  dlv.offer({ eventId: 'ev_t14_comment', taskId: 'tA', text: '评论正文', notBefore: far });
+  dlv.offer({
+    eventId: 'ev_t14_claim', taskId: 'tA', cardIds: ['tA', 'tB'], kind: 'claim',
+    text: '认领了 tA、tB', noMerge: true, notBefore: far,
+  });
+  const dItems = dlv.state().items;
+  check('noMerge 不吞待投评论的正文',
+    dItems.find((i) => i.eventId === 'ev_t14_comment')?.text === '评论正文',
+    JSON.stringify(dItems.map((i) => [i.eventId, i.text])));
+  check('noMerge 的唤醒单独占一条', dItems.some((i) => i.eventId === 'ev_t14_claim'));
+  check('noMerge 记下了整批 cardIds',
+    (dItems.find((i) => i.eventId === 'ev_t14_claim')?.cardIds || []).join(',') === 'tA,tB');
+  // 反证：不带 noMerge 时会被合并（正文被换、旧 eventId 进 done）
+  dlv.offer({ eventId: 'ev_t14_comment2', taskId: 'tC', text: '另一条评论', notBefore: far });
+  dlv.offer({ eventId: 'ev_t14_claim2', taskId: 'tC', text: '认领了 tC', notBefore: far });
+  const merged = dlv.state().items.find((i) => i.taskId === 'tC');
+  check('不带 noMerge 时按老规矩合并（正文换成新那条）', merged?.text === '认领了 tC',
+    JSON.stringify(merged && [merged.eventId, merged.text]));
+  dlv.close();
+
+  /**
+   * 判重表本身：读的时候比时间戳，不是「键在不在」。
+   */
+  const wFile = join(dataDir, 'wakes-t14.json');
+  const w = createWakes({ file: wFile, windowMs: () => 1000 });
+  check('没记过 → 不算刚叫过', w.recent('tA') === false);
+  w.mark(['tA', 'tB']);
+  check('记过 → 刚叫过', w.recent('tA') === true);
+  check('没记的卡不算刚叫过', w.recent('tC') === false);
+  check('冷却窗过了 → 不算刚叫过（比时间戳）', w.recent('tA', Date.now() + 5000) === false);
+  writeAtomic(wFile, '{ 坏掉的 json');
+  const wBroken = createWakes({ file: wFile, windowMs: () => 1000 });
+  check('文件坏了当空表，不抛', wBroken.recent('tA') === false);
 
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
