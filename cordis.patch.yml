@@ -10,10 +10,8 @@
       config:
         # 数据目录。留空 = ~/.dsh/collab（每台机器各自一份，不互相覆盖）
         dataDir: ''
-        # 把 dsh-lan-share 收到的消息自动搬进看板日志。
-        # 关掉的话，就只剩 agent 自己写的那部分。
-        syncLanInbox: true
-        # 轮询间隔（毫秒）。lan-share 的 state.json 每 2 秒看一次。
-        syncIntervalMs: 2000
+        # 注意：`syncLanInbox` / `syncIntervalMs` 已于 0.10.0 删掉（lan-share 收件搬运
+        # 那条路废弃了），0.11.28 把这两行配置也撤了。写进来不会有任何效果：
+        # 代码里没有地方读它们，`SETTINGS_SPEC` 里也没有这两个键。
         # 日志保留条数上限（超过按行裁剪，只留最近这些）
         maxEvents: 5000

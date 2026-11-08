@@ -4,6 +4,51 @@
 
 ---
 
+## 0.11.28
+
+**无 id 事件直接拒（三个洞一个根因）+ 撤掉两个空配置。汐汐 2026-11-08 提的那条边界。**
+重启 DSH 生效。
+
+### 修：事件必须带 id
+
+Hub 侧有三处判定拿 `ev.id`，而没 id 的事件一路放行 —— 三个洞同一个根因：
+
+1. **`explicitStatusIds` 失效**（0.11.27 的兜底判据）→ 显式标完成夹带正文时兜底不生效。
+2. **`explicitDetailIds` 失效**（0.11.20 的改描述判据）→ 无 id 事件里显式改 `detail`
+   不算「改动」，**非创建者能直接覆盖别人的描述**。这是放行级口子，比第 1 条严重。
+3. **幂等坏掉**：无 id 事件首次落盘后没有 `id` 字段，下一条无 id 事件的
+   `events.find(e => e.id === ev.id)` 是 `undefined === undefined`，直接命中 ——
+   被当成重复静默丢弃，回执还写 `duplicate: true`。
+
+**为什么是「拒绝」不是「补一个 id」**：补了之后同一条事件重投会生成新 id、两份都入库，
+而且长得像两条独立事件，事后认不出是重投（比吞更难查）。而实测 **647 条本机事件 /
+643 条 Hub 事件里 0 条无 id** —— 所有真实客户端本来就带 id，这一刀砍不到活人。
+
+**校验放 `validateBatch`，不放 `validateEvent`**。第一版放进了 `validateEvent`，本机
+`buildEvent` 当场炸：它拿 `validateEvent` 做写前自检，而那一刻 id 还没生成
+（`stampLocal` / `appendEvent` 才补）。`validateBatch` 只有一个调用点（Hub 的
+`POST /events`），这才是入账层；Hub 自己生成的三处事件都走 `makeEventId()`，不受影响。
+
+### 删：`syncLanInbox` / `syncIntervalMs`
+
+`cordis.patch.yml` 里还配着 `true` / `2000`，代码里一个字都不读 —— 功能 0.10.0
+（commit `8f31f49`）就删了，配置漏撤。看配置的人以为它开着，实际什么都不做。
+同一条 commit 里一起撤掉，并留一行注释说明为什么不要写回来。
+
+**教训**（汐汐提的）：删功能跟配置放同一个 commit。写在 CHANGELOG 里只是给翻历史的人看，
+而看配置的人永远只翻配置。
+
+### 补：`client/index.js` 的 VERSION
+
+0.11.27 发版时漏改，`VERSION` 还停在 `0.11.26`，和 `package.json` 对不上（测试
+「客户端 VERSION 与 package.json 一致」抓着）。这次一起补到 `0.11.28`，`BUILD` +1。
+
+**测试**：**462 全绿**（host 269 + hub 171 + two-machine 22），新增 7 项
+（`5b-3. 事件必须带 id`：无 id 的 task / msg / 显式 done / 显式 running 四种 → 400，
+外加带 id 的两种老路径不回退）。
+
+---
+
 ## 0.11.27
 
 **兜底判据只认显式 status（t-v08fix）。汐汐 V08 真机验出来的，卡是涟涟接的。**

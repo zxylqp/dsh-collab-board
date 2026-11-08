@@ -161,6 +161,18 @@ export function validateEvent(raw, opts = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return bad('bad-param', '事件要是个对象');
   }
+  /**
+   * 注意：**id 不在这里校验**，在 `validateBatch` 里（0.11.28）。
+   *
+   * 为什么分开：`validateEvent` 有两个调用方 ——
+   * - Hub 入账（`validateBatch` → 逐条）；
+   * - **本机 `buildEvent`**（`index.mjs:2104`）拿它做写前自检，而那一刻 `id`
+   *   还没生成（`stampLocal` / `appendEvent` 才补）。
+   *
+   * 第一版把 `if (!id) 400` 放进这里，本机建卡当场炸：
+   * 「事件不合法：事件必须带 id」—— 因为本机自己就是先校验后补 id 的。
+   * 汐汐 2026-11-08 说的就是「放 `validateBatch`，别放路由层」，我一开始放错了层。
+   */
   const kind = raw.kind;
   if (!KINDS.includes(kind)) {
     return bad('bad-param', `kind 不认识：${String(kind)}`, 'kind');
@@ -341,6 +353,26 @@ export function validateBatch(list, opts = {}) {
   }
   const out = [];
   for (const raw of list) {
+    /**
+     * 入账层强制要求 id（0.11.28）。**这一层才是对的地方**：
+     * `validateEvent` 同时被本机 `buildEvent` 拿去做写前自检，那一刻 id 还没生成
+     * （`stampLocal` / `appendEvent` 才补），放那里会把本机建卡当场打死。
+     *
+     * 守的是什么：Hub 侧三处判定都拿 `ev.id`——
+     * ① `explicitStatusIds`（0.11.27 的兜底判据）；
+     * ② `explicitDetailIds`（0.11.20 的改描述判据，失效 = 非创建者能覆盖别人的描述）；
+     * ③ `events.find(e => e.id === ev.id)` 的幂等（`undefined === undefined` 会把
+     *    后续无 id 事件当成重复静默吞掉）。
+     *
+     * 为什么拒绝而不是补一个 id（和汐汐 2026-11-08 核过）：补了之后重投会生成新 id、
+     * 两份都入库，而且长得像两条独立事件，事后认不出。而实测 647 条本机事件 /
+     * 643 条 Hub 事件里 **0 条无 id** —— 所有真实客户端本来就带 id，这一刀砍不到活人。
+     */
+    if (!isText(raw?.id)) {
+      return bad('bad-param',
+        '事件必须带 id（形如 ev_<origin前6位>_…）。Hub 靠它判重投，不带就没法保证同一件事只记一次',
+        'id');
+    }
     const r = validateEvent(raw, opts);
     if (!r.ok) return r;
     out.push(r.event);

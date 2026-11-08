@@ -839,6 +839,89 @@ async function main() {
     !JSON.stringify(own4Events.data?.events || []).includes('B 偷改的标题')
     && !JSON.stringify(own4Events.data?.events || []).includes('B 偷改的描述'));
 
+  /* ── 5b-3. 事件必须带 id（0.11.28）────────────────────────────────────
+   *
+   * 三个洞共用一个根因：Hub 拿 `ev.id` 做判定，而没 id 的事件一路放行。
+   * ① `explicitStatusIds` 失效（兜底降级）② `explicitDetailIds` 失效（非创建者能
+   * 覆盖别人的描述，放行级口子）③ 无 id 事件落盘后没有 id 字段，下一条无 id 事件的
+   * `find(e => e.id === ev.id)` 是 undefined === undefined，被当重复静默吞掉。
+   *
+   * 处置是**拒绝**不是补 id：补了之后重投会有新 id、两份都入库，且长得像两条独立事件。
+   */
+  console.log('\n5b-3. 事件必须带 id（0.11.28）');
+  const noIdTask = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: {
+      events: [{ origin: ORIGIN_A, name: 'A', kind: 'task', taskId: 'noid1', title: '没 id 的卡' }],
+    },
+  });
+  check('无 id 的普通 task 事件 → 400（不是 409）',
+    noIdTask.status === 400 && noIdTask.error.code === 'bad-param',
+    JSON.stringify({ status: noIdTask.status, error: noIdTask.error }));
+  check('400 指到 field=id', noIdTask.error.field === 'id', String(noIdTask.error.field));
+
+  // 无 id + 显式 done + 夹带标题：格式问题先报，别让人以为是权限问题
+  const noIdDone = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{ origin: ORIGIN_B, name: 'B', kind: 'task', taskId: 'own4', title: '无 id 夹带标题', status: 'done' }],
+    },
+  });
+  check('无 id + 显式 done + 夹带标题 → 400（不走兜底、也不报 409）',
+    noIdDone.status === 400 && noIdDone.error.code === 'bad-param',
+    JSON.stringify({ status: noIdDone.status, error: noIdDone.error }));
+
+  // 无 id + 显式 running + 改标题：同样先撞格式
+  const noIdRunning = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{ origin: ORIGIN_B, name: 'B', kind: 'task', taskId: 'own4', title: '无 id running 标题', status: 'running' }],
+    },
+  });
+  check('无 id + 显式 running + 改标题 → 400',
+    noIdRunning.status === 400 && noIdRunning.error.code === 'bad-param',
+    JSON.stringify({ status: noIdRunning.status, error: noIdRunning.error }));
+
+  // 无 id 的 msg 也一样（校验在 kind 之前，不分类型）
+  const noIdMsg = await call(base, '/events', {
+    method: 'POST',
+    token: tokenA,
+    body: { events: [{ origin: ORIGIN_A, name: 'A', kind: 'msg', text: '没 id 的评论' }] },
+  });
+  check('无 id 的 msg → 400（校验不分 kind）',
+    noIdMsg.status === 400 && noIdMsg.error.code === 'bad-param',
+    JSON.stringify({ status: noIdMsg.status, error: noIdMsg.error }));
+
+  // 反向：带 id 的老路径不许被这次改动误伤（兜底与 409 都照 0.11.27 的行为）
+  const withIdDone = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00030_ggg', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', title: '带 id 标完成夹带的标题', status: 'done',
+      }],
+    },
+  });
+  check('带 id + 显式 done + 夹带标题 → 放行（老路径没回退）', withIdDone.ok === true,
+    JSON.stringify(withIdDone.error));
+  const withIdNoStatus = await call(base, '/events', {
+    method: 'POST',
+    token: tokenB,
+    body: {
+      events: [{
+        id: 'ev_bbbbbb_t1k00031_hhh', origin: ORIGIN_B, name: 'B',
+        kind: 'task', taskId: 'own4', title: '带 id 不带 status 的标题',
+      }],
+    },
+  });
+  check('带 id + 不带 status + 改标题 → 409（0.11.27 的判据仍在）',
+    withIdNoStatus.status === 409 && withIdNoStatus.error.code === 'conflict',
+    JSON.stringify({ status: withIdNoStatus.status, error: withIdNoStatus.error }));
+
   console.log('\n5e. 租约续约（0.10.13）');
   // 纯算法：不依赖计时器，先把边界定死
   const t0 = '2026-01-01T00:00:00.000Z';
