@@ -30,6 +30,34 @@ import { writeAtomic } from './http-util.mjs';
 export const WAKES_LIMIT = 200;
 
 /**
+ * 认领唤醒该通知哪些卡：`claimed − 账上已有待投项的卡 − 冷却窗内刚叫过的卡`。
+ *
+ * **用差集，不是交集。** 「有交集就不排」会把没被叫过的卡一起漏掉：
+ * 账上待投有 A、本轮认了 A+B，按交集整条不排 —— B 就再也没有唤醒了。
+ * 反过来，待投有 A、本轮只认了 A，差集是空，也自然不会重排（不刷屏）。
+ *
+ * 抽成纯函数是为了能直接测：这条判据在 0.11.26 的讨论里被改过两次。
+ *
+ * @param {string[]} claimed           本轮认领的卡
+ * @param {object} ctx
+ * @param {string[]} [ctx.queued]      账上已有待投唤醒项涉及的卡
+ * @param {(id:string)=>boolean} [ctx.recent] 这张卡是不是冷却窗内刚叫过
+ * @returns {string[]} 需要排进唤醒的卡（去重、保序）
+ */
+export function freshClaimWake(claimed, { queued = [], recent = () => false } = {}) {
+  const queuedSet = new Set(Array.isArray(queued) ? queued : []);
+  const out = [];
+  for (const raw of Array.isArray(claimed) ? claimed : []) {
+    const id = typeof raw === 'string' ? raw : '';
+    if (id === '' || out.includes(id)) continue;
+    if (queuedSet.has(id)) continue;
+    if (recent(id)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/**
  * @param {object} opts
  * @param {string} opts.file                  wakes.json 绝对路径
  * @param {()=>number|number} [opts.windowMs] 冷却窗，运行时读设置（`wakeCooldownMs`）

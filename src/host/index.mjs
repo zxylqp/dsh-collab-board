@@ -75,7 +75,7 @@ import { json as jsonReply, readBody, writeAtomic } from './http-util.mjs';
 import { createSettings, hashCode, isHashedCode, publicSettings } from './settings.mjs';
 import { createStore } from './store.mjs';
 import { createDelivery } from './delivery.mjs';
-import { createWakes } from './wakes.mjs';
+import { createWakes, freshClaimWake } from './wakes.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq, directedAway, WAKE_SKIP } from './wake.mjs';
 import { validateEvent, noteTaskIdOf } from './events.mjs';
 
@@ -2426,17 +2426,16 @@ export function apply(ctx, rawConfig = {}) {
       for (const c of cards) if (typeof c === 'string' && c !== '') queued.add(c);
     }
 
-    const fresh = [];
+    const fresh = freshClaimWake(rows.map((r) => r.taskId), {
+      queued: [...queued],
+      recent: (id) => wakes.recent(id, now),
+    });
+    if (fresh.length === 0) return 0;
+
     const titleOf = new Map();
     for (const row of rows) {
-      const id = row.taskId;
-      if (!titleOf.has(id)) titleOf.set(id, typeof row.title === 'string' ? row.title : '');
-      if (fresh.includes(id)) continue;
-      if (queued.has(id)) continue;        // 已经有唤醒在排队，它到点会叫到这张卡
-      if (wakes.recent(id, now)) continue; // 冷却窗内刚叫过
-      fresh.push(id);
+      if (!titleOf.has(row.taskId)) titleOf.set(row.taskId, typeof row.title === 'string' ? row.title : '');
     }
-    if (fresh.length === 0) return 0;
 
     // 全局冷却只防连发：刚叫过别的消息，这条延后到冷却结束（延后不是丢弃）。
     // 冷却是「上次唤醒到现在的间隔」，wakes 是「这张卡上次被投递的时间」，两个语义别混。

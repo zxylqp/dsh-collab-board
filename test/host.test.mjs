@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply } from '../src/host/index.mjs';
 import { createDelivery } from '../src/host/delivery.mjs';
-import { createWakes } from '../src/host/wakes.mjs';
+import { createWakes, freshClaimWake } from '../src/host/wakes.mjs';
 import { writeAtomic } from '../src/host/http-util.mjs';
 import { shouldWake, maxSeenOf, newerSeen, resumeSeq } from '../src/host/wake.mjs';
 import { createStore } from '../src/host/store.mjs';
@@ -1830,6 +1830,20 @@ async function main() {
   writeAtomic(wFile, '{ 坏掉的 json');
   const wBroken = createWakes({ file: wFile, windowMs: () => 1000 });
   check('文件坏了当空表，不抛', wBroken.recent('tA') === false);
+
+  /**
+   * 差集不是交集 —— 这条判据在 0.11.26 讨论里被改过两次，必须钉住：
+   * 「有交集就不排」会把没被叫过的卡一起漏掉。
+   */
+  check('待投有 A、本轮认了 A+B → 只排 B（不漏卡）',
+    JSON.stringify(freshClaimWake(['A', 'B'], { queued: ['A'] })) === '["B"]',
+    JSON.stringify(freshClaimWake(['A', 'B'], { queued: ['A'] })));
+  check('待投有 A、本轮只认了 A → 一条都不排（不刷屏）',
+    JSON.stringify(freshClaimWake(['A'], { queued: ['A'] })) === '[]');
+  check('冷却窗内刚叫过的卡不重排',
+    JSON.stringify(freshClaimWake(['A', 'B'], { recent: (id) => id === 'A' })) === '["B"]');
+  check('重复的卡只排一次', JSON.stringify(freshClaimWake(['A', 'A', 'B'])) === '["A","B"]');
+  check('空输入不炸', JSON.stringify(freshClaimWake(null)) === '[]');
 
   console.log('\n13. 卸载');
   for (const c of cleanups.reverse()) {
