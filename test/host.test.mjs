@@ -401,6 +401,7 @@ async function main() {
         kind: 'task',
         taskId: 'auto1',
         title: '自动认领测试卡',
+        detail: '需求：把这张卡跑起来',
         status: 'pending',
         priority: 'normal',
       }],
@@ -426,6 +427,56 @@ async function main() {
   const autoNote = afterAuto.find((e) => e.kind === 'note' && String(e.text).includes('自动认领'));
   check('自动认领提示带 taskId（删卡时跟着消失）',
     autoNote?.taskId === 'auto1', JSON.stringify(autoNote?.taskId));
+
+  // 0.11.31：没写需求的卡不该被自动抓走，但补上需求之后必须照常认领
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_auto03_aaa',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'task',
+        taskId: 'auto3',
+        title: '还没写需求的卡',
+        status: 'pending',
+        priority: 'normal',
+      }],
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 3000));
+  const afterNoDetail = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const noDetailCard = afterNoDetail.filter((e) => e.taskId === 'auto3' && e.kind === 'task').pop();
+  check('空需求的卡不被自动认领',
+    Boolean(noDetailCard) && noDetailCard.status === 'pending' && !noDetailCard.owner,
+    JSON.stringify({ status: noDetailCard?.status, owner: noDetailCard?.owner }));
+
+  await fetch(`http://127.0.0.1:${hubPort}/collab/v1/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${otherToken}` },
+    body: JSON.stringify({
+      events: [{
+        eventVersion: 2,
+        id: 'ev_abcdef_auto03_bbb',
+        origin: otherOrigin,
+        name: '另一个成员',
+        kind: 'task',
+        taskId: 'auto3',
+        detail: '需求补上了，接吧',
+      }],
+    }),
+  });
+  // 8 秒：认领事件先落 Hub，本机靠增量同步拉回来，3 秒有时候还没轮到
+  await new Promise((r) => setTimeout(r, 8000));
+  const afterDetail = readFileSync(logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const auto3All = afterDetail.filter((e) => e.taskId === 'auto3' && e.kind === 'task')
+    .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const claimedCard = auto3All.pop();
+  check('写了需求之后才被认领',
+    Boolean(claimedCard) && claimedCard.status === 'running' && claimedCard.owner === identity.origin,
+    JSON.stringify({ status: claimedCard?.status, owner: claimedCard?.owner, n: auto3All.length }));
 
   // 自己建的卡不该被自己抢（否则「我派给别人的活我自己接了」）
   await hit(routes, '/collab-board/post', {
