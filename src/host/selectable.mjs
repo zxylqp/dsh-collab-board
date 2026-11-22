@@ -84,15 +84,18 @@ export function latestTasks(events) {
  * @param {string}   [opts.selfOrigin]    本机 origin（判「自己建的」）
  * @param {boolean}  [opts.excludeOwn]    true = 自己建的卡不算可接（默认 true）
  * @param {boolean}  [opts.includeArchived] true = 归档的也返回（只用于展示）
+ * @param {boolean}  [opts.requireDetail] true = 没写需求的卡不算可接（自动认领专用）
  * @returns {Array<{ task: any, ok: boolean, reason: string }>}
- *   reason: '' | 'not-pending' | 'owned' | 'archived' | 'own' | 'deps'
+ *   reason: '' | 'not-pending' | 'owned' | 'archived' | 'own' | 'no-detail' | 'deps'
  */
 export function claimableTasks(events, opts = {}) {
   const selfOrigin = typeof opts.selfOrigin === 'string' ? opts.selfOrigin : '';
   const excludeOwn = opts.excludeOwn !== false;
   const includeArchived = opts.includeArchived === true;
+  const requireDetail = opts.requireDetail === true;
 
   const tasks = latestTasks(events);
+
   const creators = earliestByTask(events);
   const out = [];
 
@@ -113,6 +116,14 @@ export function claimableTasks(events, opts = {}) {
       out.push({ task, ok: false, reason: 'own' });
       continue;
     }
+    /**
+     * 没写需求的卡不自动接（0.11.31）。建卡只要一个标题，人往往先建后写需求，
+     * 而自动认领最快 1 秒一轮 —— 需求还没落盘，卡已经被抢走，人回来只看到「卡没了」。
+     */
+    if (requireDetail && String(task.detail || '').trim() === '') {
+      out.push({ task, ok: false, reason: 'no-detail' });
+      continue;
+    }
     const deps = Array.isArray(task.dependsOn) ? task.dependsOn : [];
     const depsOk = deps.every((d) => {
       const dep = tasks.get(d);
@@ -129,7 +140,12 @@ export function claimableTasks(events, opts = {}) {
 
 /** 只留能接的，返回任务事件本身（调用方常用的形状）。 */
 export function claimableOnly(events, opts = {}) {
-  return claimableTasks(events, opts).filter((x) => x.ok).map((x) => x.task);
+  /**
+   * 自动认领走这个入口（host/index.mjs pickClaimable）—— 把 requireDetail 定在这儿，
+   * 免得三处消费方各传各的：展示和「有活等人接」的提醒都还要看没写需求的卡。
+   */
+  return claimableTasks(events, { ...opts, requireDetail: true })
+    .filter((x) => x.ok).map((x) => x.task);
 }
 
 /**

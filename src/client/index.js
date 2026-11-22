@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 38;
-    const VERSION = '0.11.30';
+    const BUILD = 39;
+    const VERSION = '0.11.31';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1200,6 +1200,11 @@ window.__ModuleLoader__.load({
 
     function NewTask(props) {
       const [title, setTitle] = useState('');
+      /**
+       * 需求可以先写也可以后写（0.11.31）。以前这里只有一个标题框 ——
+       * 建完卡，需求根本没处写：详情页是只读文本，除评论框外没有输入控件。
+       */
+      const [detail, setDetail] = useState('');
       const [busy, setBusy] = useState(false);
       const ref = useRef(null);
       useEffect(() => { if (ref.current) ref.current.focus(); }, []);
@@ -1207,8 +1212,9 @@ window.__ModuleLoader__.load({
         const text = title.trim();
         if (text === '' || busy) return;
         setBusy(true);
-        try { await props.onSubmit(text); } finally { setBusy(false); }
+        try { await props.onSubmit(text, detail.trim()); } finally { setBusy(false); }
       };
+      const blank = detail.trim() === '';
       return h('div', { className: 'cb-card', style: { padding: '9px 10px', marginBottom: 4 } },
         h('input', {
           ref,
@@ -1222,7 +1228,23 @@ window.__ModuleLoader__.load({
             if (e.key === 'Escape') props.onCancel();
           },
         }),
-        h('div', { className: 'cb-hint', style: { paddingTop: 4 } }, '创建后是「待认领」。认领要走 Hub，下一轮接。'),
+        h('textarea', {
+          className: 'cb-input',
+          placeholder: '需求：要做什么、要什么结果（可留空，之后在详情里补）',
+          value: detail,
+          rows: 3,
+          disabled: busy,
+          style: { marginTop: 4, width: '100%', resize: 'vertical', lineHeight: 1.6, fontFamily: 'inherit' },
+          onChange: (e) => setDetail(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
+            if (e.key === 'Escape') props.onCancel();
+          },
+        }),
+        h('div', { className: 'cb-hint', style: { paddingTop: 4 } },
+          blank
+            ? '没写需求的卡不会被自动认领 —— 建完进详情补也行。'
+            : '需求一起发出，认领的人接了就看得见。'),
       );
     }
 
@@ -1238,6 +1260,14 @@ window.__ModuleLoader__.load({
       const artifacts = model.artifactsByTask.get(task.taskId) || [];
       /** 终态（done / cancelled）卡的评论锁死：任务结束就是结束，0.11.17 */
       const taskLocked = task.status === 'done' || task.status === 'cancelled';
+      /**
+       * 需求可编辑到哪一步（0.11.31）：终态卡锁死；判不出本机 origin 就不拦，
+       * 让宿主去拒 —— 非创建者改「正文」会整条 409，patchTask 会 toast 出来。
+       */
+      const selfOrigin = props.hub && typeof props.hub.origin === 'string' ? props.hub.origin : '';
+      const canEditDetail = !taskLocked && (!selfOrigin || task.creator === selfOrigin);
+      /** null = 没在编辑；字符串 = 正在改的内容。 */
+      const [detailDraft, setDetailDraft] = useState(null);
       /** origin → 名字（详情里也要显示谁建的 / 谁最后动的） */
       const nameOf = (o) => {
         if (!o) return '未知';
@@ -1290,11 +1320,21 @@ window.__ModuleLoader__.load({
             ...patch,
           });
           toast(note === 'done' ? '已标记完成' : '已更新');
+          return true;
         } catch (e) {
           toast('没写进去：' + e.message, 'error');
+          return false;
         } finally {
           setBusy('');
         }
+      };
+
+      /** 保存需求：成功才退出编辑态；失败留在原地，别让写了一半的字消失。 */
+      const saveDetail = async () => {
+        if (detailDraft === null) return;
+        const text = detailDraft.trim();
+        const ok = await patchTask({ detail: text }, 'detail');
+        if (ok) setDetailDraft(null);
       };
 
       /** 能不能认领：得连上 Hub（认领是 Hub 的串行 CAS，本地做不了）。 */
@@ -1388,9 +1428,38 @@ window.__ModuleLoader__.load({
                   ? '取消原因：'
                   : (task.status === 'done' ? '完成说明：' : '说明：')) + task.reason)
               : null,
-            task.detail
-              ? h('div', { style: { fontSize: '11.5px', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, task.detail)
-              : h('div', { className: 'cb-hint' }, '没有写描述。'),
+            detailDraft !== null
+              ? h('div', null,
+                h('textarea', {
+                  className: 'cb-input',
+                  value: detailDraft,
+                  rows: 6,
+                  placeholder: '要做什么、要什么结果、怎么算完成。',
+                  style: { width: '100%', resize: 'vertical', lineHeight: 1.65, fontFamily: 'inherit' },
+                  onChange: (e) => setDetailDraft(e.target.value),
+                  onKeyDown: (e) => {
+                    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveDetail(); }
+                    if (e.key === 'Escape') setDetailDraft(null);
+                  },
+                }),
+                h('div', { style: { display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' } },
+                  h(Btn, { small: true, primary: true, disabled: busy === 'detail', onClick: saveDetail },
+                    busy === 'detail' ? '保存中…' : '保存需求'),
+                  h(Btn, { small: true, ghost: true, disabled: busy === 'detail', onClick: () => setDetailDraft(null) }, '取消'),
+                  h('span', { className: 'cb-hint' }, 'Ctrl+Enter 保存 · Esc 取消'),
+                ),
+              )
+              : h('div', null,
+                task.detail
+                  ? h('div', { style: { fontSize: '11.5px', lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, task.detail)
+                  : h('div', { className: 'cb-hint' },
+                    canEditDetail ? '还没写需求。写一句「要做什么」，认领的人才知道干什么。' : '没有写描述。'),
+                canEditDetail
+                  ? h('div', { style: { marginTop: 6 } },
+                    h(Btn, { small: true, ghost: true, disabled: Boolean(busy), onClick: () => setDetailDraft(task.detail || '') },
+                      task.detail ? '改需求' : '写需求'))
+                  : null,
+              ),
             h('div', { style: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3 } },
               /**
                * 创建者 / 时间 / 最后动作 / taskId（0.11.19 起定形，0.11.21 补时间戳）。
@@ -2872,21 +2941,25 @@ window.__ModuleLoader__.load({
       const narrow = width < WIDE_AT;
       const selectedTask = selectedId ? model.byId.get(selectedId) : null;
 
-      const createTask = useCallback(async (title) => {
+      const createTask = useCallback(async (title, detail) => {
         // 不再从共享视图里「取最大 tN + 1」—— 两台机器在同一个轮询窗口里
         // 会数到同一个 N，发出同一个 taskId，后推的那条把前一张卡整条覆盖
         // （R5 真机撞号：两边各建一张 t10，板上只剩后到的那张）。
         // 改成随机短 id：不依赖板上已有卡片，撞号概率可忽略。
         const id = 't-' + Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 4);
+        /** 空需求不发 detail：发空串等于把「没写」写成「写了空」，卡片上看不出区别。 */
+        const text = typeof detail === 'string' ? detail.trim() : '';
         try {
-          await post({
+          const body = {
             kind: 'task',
             id,
             taskId: id,
             title,
             status: 'pending',
             priority: 'normal',
-          });
+          };
+          if (text !== '') body.detail = text;
+          await post(body);
           setCreating(false);
           setSelectedId(id);
           toast('已创建 ' + id);
