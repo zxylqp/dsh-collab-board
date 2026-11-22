@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
     /** 宿主接口前缀，与 host 半边的 PANEL_BASE 必须对得上。 */
     const API = '/collab-board';
     /** 面板构建号：改一次 client 就 +1，用来判断浏览器是不是还在用旧 bundle。 */
-    const BUILD = 40;
-    const VERSION = '0.11.32';
+    const BUILD = 41;
+    const VERSION = '0.11.33';
     /** 宽到这个值以上才用「左列表 + 右详情」；窄了改成列表 → 点开全屏详情。 */
     const WIDE_AT = 620;
 
@@ -1793,6 +1793,15 @@ window.__ModuleLoader__.load({
             onError: (e) => toast('没发出去：' + e.message, 'error'),
           }),
         ),
+        /**
+         * 全局输入框下面这一行是给「发错地方」兜底的（0.11.33）。
+         *
+         * 这里发的 msg 天生没有 taskId：落在「动态」、所有成员都看得见，
+         * 而且会按 wakeOnMessage 叫醒别人的 agent；要回某张卡只能进卡里发
+         * —— 卡内评论会定向投给当前 owner（宿主 events 里 to=owner），不打扰别人。
+         */
+        h('div', { className: 'cb-hint', style: { paddingTop: 4 } },
+          '这里发的是全局消息，所有成员都看得见、也会叫醒对方的 agent。要回某张任务卡，请进卡里发。'),
       );
     }
 
